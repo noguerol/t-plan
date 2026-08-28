@@ -18,11 +18,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/noguerol/plan"
+    "url": "https://github.com/noguerol/t-plan"
   },
-  "homepage": "https://github.com/noguerol/plan",
+  "homepage": "https://github.com/noguerol/t-plan",
   "bugs": {
-    "url": "https://github.com/noguerol/plan/issues"
+    "url": "https://github.com/noguerol/t-plan/issues"
   },
   "pi": {
     "extensions": [

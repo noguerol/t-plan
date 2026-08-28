@@ -33,21 +33,21 @@ t-plan is a [pi package](https://pi.dev/packages): one extension (`src/index.ts`
 
 ```bash
 # From GitHub
-pi install git:github.com/noguerol/plan
+pi install git:github.com/noguerol/t-plan
 
 # Pin a tag/commit (refs are never moved by `pi update`)
-pi install git:github.com/noguerol/plan@v1.0.0
+pi install git:github.com/noguerol/t-plan@v3.0.0
 
 # Local checkout (development)
-pi install /path/to/plan
+pi install /path/to/t-plan
 
 # Try it for one run only, without installing
-pi -e git:github.com/noguerol/plan
+pi -e git:github.com/noguerol/t-plan
 ```
 
 ```bash
 pi list                    # show installed packages
-pi remove git:github.com/noguerol/plan
+pi remove git:github.com/noguerol/t-plan
 ```
 
 > **Security:** pi packages run with full system access — extensions execute arbitrary code. Install only packages you trust and review the source.
@@ -254,7 +254,7 @@ Global preferences persist across sessions in `~/.pi/agent/t-plan/config.json` (
 ## Repository Layout
 
 ```
-plan/
+t-plan/
 ├── package.json        # pi package manifest (pi-package)
 ├── LICENSE             # MIT
 ├── README.md
