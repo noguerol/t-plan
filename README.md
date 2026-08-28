@@ -8,6 +8,13 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 **Trimegisto integration:** with Trimegisto mode enabled, every task is classified by complexity and assigned a tier — **t1** (complex → deep thinking), **t2** (medium → solver), **t3** (simple → mechanical) — so the model launches each task on the right agent tier. Task timers show a live `HH:MM:SS` counter for every in-progress task.
 
+## What's new
+
+- **Mandarin Chinese support** — automatic language detection now recognizes Mandarin/Chinese text and localizes auto-generated plan titles as `{project} 计划`.
+- **Chinese plan parsing** — t-plan detects headings and task formats such as `## 计划`, `1、任务`, `## 步骤 1：...`, and status groups like `已完成`, `进行中`, `待办`, and `阻塞`.
+- **Trilingual fuzzy progress detection** — Mandarin completion/start/removal/conclusion phrases like `已完成`, `正在`, `移除`, `不再需要`, and `全部完成` now work alongside English and Spanish.
+- **Trimegisto tier classification in Chinese** — Mandarin task keywords feed the `t1`/`t2`/`t3` heuristic too.
+
 ---
 
 ## Features
