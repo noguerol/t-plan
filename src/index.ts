@@ -1,5 +1,5 @@
 /**
- * Plan Extension for pi
+ * t-plan Extension for pi
  *
  * Manages implementation plans with task tracking, parallel agent support,
  * and persistent plan.md file generation.
@@ -9,7 +9,10 @@
  * - Persistent plan.md file in working directory
  * - TUI widget showing task progress
  * - Parallel agent task tracking
- * - /plan command family for management
+ * - Trimegisto mode: classifies tasks into t1 (complex) / t2 (medium) /
+ *   t3 (simple) tiers and shows which agent will run each one
+ * - Elapsed-time counters (HH:MM:SS) for in-progress tasks
+ * - /t-plan command family for management
  * - Manual task editing (add, remove, edit, reorder)
  */
 
@@ -19,8 +22,20 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Key, truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
-import type { PlanTask, PlanState, PlanConfig, TaskStatus } from "./types.ts";
+import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
+import {
+  classifyTask,
+  completedTimerText,
+  formatElapsed,
+  isTierAvailable,
+  readTrimegistoConfig,
+  resolveEffectiveTier,
+  TIER_ROLES,
+  tierToToolValue,
+  toolValueToTier,
+  type TrimegistoFileConfig,
+} from "./tiers.ts";
 import {
   extractPlanTasks,
   containsPlan,
@@ -37,8 +52,9 @@ import {
   shouldRemoveMissingTasksFromPlan,
   generateId,
 } from "./utils.ts";
-import { readFile, writeFile, access, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, writeFile, access, unlink, mkdir } from "node:fs/promises";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
 
 // Type guard for assistant messages
 function isAssistantMessage(m: AgentMessage): m is AssistantMessage {
@@ -63,6 +79,35 @@ export default function planExtension(pi: ExtensionAPI): void {
   let spinnerFrame = 0;
   const highlightedTasks = new Map<string, number>();
   const highlightTimers = new Set<NodeJS.Timeout>();
+  // Cached trimegisto config (tier availability) — refreshed on session start
+  // and whenever Trimegisto mode is toggled.
+  let tgConfig: TrimegistoFileConfig | null = null;
+  // Global (cross-session) preferences from ~/.pi/agent/t-plan/config.json
+  let globalConfigPartial: Partial<PlanConfig> = {};
+
+  // ─── Global config file ───────────────────────────────────────────────
+
+  const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "t-plan", "config.json");
+
+  async function loadGlobalConfig(): Promise<Partial<PlanConfig>> {
+    try {
+      const raw = await readFile(GLOBAL_CONFIG_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.config === "object" && parsed.config !== null) {
+        return parsed.config as Partial<PlanConfig>;
+      }
+    } catch {
+      // missing or corrupt file — start from defaults
+    }
+    return {};
+  }
+
+  function saveGlobalConfig(): void {
+    // Sticky settings across sessions (session entries still override these
+    // when newer). Best-effort: never throws.
+    mkdir(dirname(GLOBAL_CONFIG_PATH), { recursive: true }).catch(() => {});
+    writeFile(GLOBAL_CONFIG_PATH, JSON.stringify({ config }, null, 2), "utf-8").catch(() => {});
+  }
 
   // ─── Persistence ──────────────────────────────────────────────────────
 
@@ -71,6 +116,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       config,
       state,
     });
+    saveGlobalConfig();
   }
 
   function restoreState(entries: any[]): void {
@@ -80,7 +126,8 @@ export default function planExtension(pi: ExtensionAPI): void {
 
     if (planEntry?.data) {
       if (planEntry.data.config) {
-        config = { ...DEFAULT_CONFIG, ...planEntry.data.config };
+        // Precedence: session entry (newest) > global file > defaults.
+        config = { ...DEFAULT_CONFIG, ...globalConfigPartial, ...planEntry.data.config };
       }
       if (planEntry.data.state) {
         state = { ...DEFAULT_STATE, ...planEntry.data.state };
@@ -94,7 +141,14 @@ export default function planExtension(pi: ExtensionAPI): void {
     if (!config.enabled || state.tasks.length === 0) return;
 
     const filePath = join(cwd, config.planFileName);
-    const content = generatePlanMarkdown(state);
+    // plan.md shows the EFFECTIVE tier (after availability fallback).
+    const displayState: PlanState = config.trimegisto
+      ? { ...state, tasks: state.tasks.map((t) => ({ ...t, tier: resolveEffectiveTier(t.tier, tgConfig) })) }
+      : state;
+    const content = generatePlanMarkdown(displayState, {
+      trimegisto: config.trimegisto,
+      showTimers: config.showTimers,
+    });
 
     try {
       await writeFile(filePath, content, "utf-8");
@@ -125,11 +179,13 @@ export default function planExtension(pi: ExtensionAPI): void {
   // ─── UI Updates ───────────────────────────────────────────────────────
 
   function startWidgetAnimation(ctx: ExtensionContext): void {
-    const shouldAnimate =
-      config.enabled &&
-      config.showWidget &&
-      config.animateWidget &&
-      (state.tasks.some((t) => t.status === "in_progress") || highlightedTasks.size > 0);
+    const anyInProgress = state.tasks.some((t) => t.status === "in_progress");
+    const anyActivity = anyInProgress || highlightedTasks.size > 0;
+    const wantSpin = config.animateWidget;
+    const wantTimer = config.showTimers && anyInProgress;
+    // Animate when spinners/highlights want frames, or when timers need
+    // 1-second refreshes (even with widget animation disabled).
+    const shouldAnimate = config.enabled && config.showWidget && anyActivity && (wantSpin || wantTimer);
 
     if (!shouldAnimate) {
       stopWidgetAnimation();
@@ -137,15 +193,16 @@ export default function planExtension(pi: ExtensionAPI): void {
     }
     if (widgetAnimationTimer) return; // already running
 
+    const interval = wantSpin ? 160 : 1000;
     widgetAnimationTimer = setInterval(() => {
       try {
-        spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+        if (wantSpin) spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
         updateUI(ctx);
       } catch {
         // The session was replaced/reloaded; drop the stale timer.
         stopWidgetAnimation();
       }
-    }, 160);
+    }, interval);
   }
 
   function stopWidgetAnimation(): void {
@@ -186,8 +243,8 @@ export default function planExtension(pi: ExtensionAPI): void {
   function updateUI(ctx: ExtensionContext): void {
     if (!config.enabled || !config.showWidget) {
       stopWidgetAnimation();
-      ctx.ui.setStatus("plan", undefined);
-      ctx.ui.setWidget("plan-tasks", undefined);
+      ctx.ui.setStatus("t-plan", undefined);
+      ctx.ui.setWidget("t-plan-tasks", undefined);
       widgetVisible = false;
       return;
     }
@@ -200,9 +257,9 @@ export default function planExtension(pi: ExtensionAPI): void {
     if (total > 0) {
       const progress = `${done}/${total}`;
       const active = inProgress > 0 ? ` ${SPINNER_FRAMES[spinnerFrame]}${inProgress}` : "";
-      ctx.ui.setStatus("plan", ctx.ui.theme.fg("accent", `📋 ${progress}${active}`));
+      ctx.ui.setStatus("t-plan", ctx.ui.theme.fg("accent", `📋 ${progress}${active}`));
     } else {
-      ctx.ui.setStatus("plan", ctx.ui.theme.fg("muted", "📋 no plan"));
+      ctx.ui.setStatus("t-plan", ctx.ui.theme.fg("muted", "📋 no plan"));
     }
 
     // Widget with task list
@@ -214,29 +271,52 @@ export default function planExtension(pi: ExtensionAPI): void {
 
       const maxVisible = 5;
 
+      // Effective tier: the tier a task will ACTUALLY run on (after
+      // availability fallback), or undefined when trimegisto mode is off.
+      const withTier = (t: PlanTask): PlanTask =>
+        config.trimegisto ? { ...t, tier: resolveEffectiveTier(t.tier, tgConfig) } : t;
+
       // In-progress first (with spinner), then blocked, then upcoming in
       // priority (order) — matching how the user wants to read the plan.
       const active = state.tasks
         .filter((t) => t.status === "in_progress" || t.status === "blocked")
-        .sort((a, b) => a.order - b.order);
+        .sort((a, b) => a.order - b.order)
+        .map(withTier);
 
       const upcoming = state.tasks
         .filter((t) => t.status === "pending")
-        .sort((a, b) => a.order - b.order);
+        .sort((a, b) => a.order - b.order)
+        .map(withTier);
 
       // Recently completed tasks flash briefly at the bottom before fading out.
       const completed = state.tasks
         .filter((t) => t.status === "done" && highlightedTasks.has(t.id))
         .sort((a, b) => (highlightedTasks.get(b.id) ?? 0) - (highlightedTasks.get(a.id) ?? 0))
-        .slice(0, maxVisible);
+        .slice(0, maxVisible)
+        .map(withTier);
 
       const visibleTasks = [...active, ...upcoming, ...completed].slice(0, maxVisible);
       const remainingCount = Math.max(0, active.length + upcoming.length + completed.length - visibleTasks.length);
 
+      // Compact per-tier distribution of open (non-done) tasks.
+      let tierSummary = "";
+      if (config.trimegisto) {
+        const counts: Partial<Record<Tier, number>> = {};
+        for (const t of state.tasks) {
+          if (t.status === "done") continue;
+          const tier = resolveEffectiveTier(t.tier, tgConfig);
+          counts[tier] = (counts[tier] ?? 0) + 1;
+        }
+        const parts = (["t1", "t2", "t3", "t0"] as Tier[])
+          .filter((tier) => (counts[tier] ?? 0) > 0)
+          .map((tier) => `${tier}×${counts[tier]}`);
+        if (parts.length > 0) tierSummary = ` • ${parts.join(" ")}`;
+      }
+
       const lines: string[] = [
         truncateToWidth(
           ctx.ui.theme.bold(ctx.ui.theme.fg("accent", `📋 ${state.title}`)) +
-            `  ${ctx.ui.theme.fg("muted", `${done}/${total} done${inProgress > 0 ? ` • ${inProgress} active` : ""}`)}`,
+            `  ${ctx.ui.theme.fg("muted", `${done}/${total} done${inProgress > 0 ? ` • ${inProgress} active` : ""}${tierSummary}`)}`,
           78,
           "…"
         ),
@@ -248,32 +328,48 @@ export default function planExtension(pi: ExtensionAPI): void {
         lines.push("");
         const lineBudget = 75;
         for (const task of visibleTasks) {
-          lines.push(formatTaskForWidget(ctx, task, { lineBudget, highlight: highlightedTasks.has(task.id), spinnerFrame, compact: config.compactTaskLines }));
+          lines.push(
+            formatTaskForWidget(ctx, task, {
+              lineBudget,
+              highlight: highlightedTasks.has(task.id),
+              spinnerFrame,
+              compact: config.compactTaskLines,
+              showTier: config.trimegisto,
+              showTimers: config.showTimers,
+              now,
+            })
+          );
         }
         if (remainingCount > 0) {
           lines.push(truncateToWidth(ctx.ui.theme.fg("muted", `  ... ${remainingCount} more`), 78, "…"));
         }
       }
 
-      ctx.ui.setWidget("plan-tasks", lines, { placement: config.widgetPlacement });
+      ctx.ui.setWidget("t-plan-tasks", lines, { placement: config.widgetPlacement });
       widgetVisible = true;
       startWidgetAnimation(ctx);
     } else {
       stopWidgetAnimation();
-      ctx.ui.setWidget("plan-tasks", undefined);
+      ctx.ui.setWidget("t-plan-tasks", undefined);
       widgetVisible = false;
     }
   }
 
   // ─── Task Management ──────────────────────────────────────────────────
 
-  function addTask(text: string, status: TaskStatus = "pending", order?: number): PlanTask {
+  function addTask(text: string, status: TaskStatus = "pending", order?: number, tier?: Tier): PlanTask {
     const task: PlanTask = {
       id: generateId(),
       text,
       status,
       order: order ?? state.tasks.length + 1,
     };
+    if (tier) {
+      task.tier = tier;
+    } else if (config.trimegisto) {
+      // Trimegisto mode: auto-classify complexity (t1 complex / t2 medium / t3 simple).
+      task.tier = classifyTask(text);
+    }
     state.tasks.push(task);
     state.updatedAt = Date.now();
     return task;
@@ -367,9 +463,9 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   // ─── Commands ─────────────────────────────────────────────────────────
 
-  // Main /plan command - toggle or show status
-  pi.registerCommand("plan", {
-    description: "Toggle plan tracking or show plan status",
+  // Main /t-plan command - toggle or show status
+  pi.registerCommand("t-plan", {
+    description: "Toggle t-plan tracking or show plan status",
     handler: async (args, ctx) => {
       const subcommand = args?.trim().toLowerCase();
 
@@ -695,6 +791,54 @@ export default function planExtension(pi: ExtensionAPI): void {
         return;
       }
 
+      if (action === "tier") {
+        const identifier = parts[1];
+        const rawTier = parts[2];
+        const task = identifier ? findTaskByIdentifier(identifier) : undefined;
+
+        const pickTier = async (): Promise<Tier | undefined> => {
+          if (rawTier) {
+            const parsed = toolValueToTier(rawTier);
+            if (!parsed) {
+              ctx.ui.notify("Invalid tier. Use t0 (active), t1, t2 or t3.", "error");
+              return undefined;
+            }
+            return parsed;
+          }
+          const pick = await ctx.ui.select("Trimegisto tier:", ["t0 (active)", "t1 (complex)", "t2 (medium)", "t3 (simple)"]);
+          if (!pick) return undefined;
+          return toolValueToTier(pick.split(" ")[0]);
+        };
+
+        if (task) {
+          const tier = await pickTier();
+          if (tier) {
+            updateTask(task.id, { tier });
+            ctx.ui.notify(`Task ${task.order} → ${tier}${tier === "t0" ? " (active)" : ""}`, "info");
+          }
+        } else {
+          const choice = await ctx.ui.select(
+            "Set tier for task:",
+            state.tasks.map((t) => `${t.order}. ${t.text}`)
+          );
+          if (choice) {
+            const order = parseInt(choice);
+            const t = state.tasks.find((x) => x.order === order);
+            if (t) {
+              const tier = await pickTier();
+              if (tier) {
+                updateTask(t.id, { tier });
+                ctx.ui.notify(`Task ${t.order} → ${tier}${tier === "t0" ? " (active)" : ""}`, "info");
+              }
+            }
+          }
+        }
+        updateUI(ctx);
+        persistState();
+        await writePlanFile(ctx.cwd);
+        return;
+      }
+
       // Show help
       ctx.ui.notify(
         `Usage: /task <action> [args]
@@ -704,7 +848,8 @@ export default function planExtension(pi: ExtensionAPI): void {
   edit [id]      - Edit task text
   move [id] [n]  - Move task to position
   start [id]     - Mark as in progress
-  block [id] [reason] - Mark as blocked`,
+  block [id] [reason] - Mark as blocked
+  tier [id] [t0-t3]   - Set trimegisto tier (t0=active, t1=complex, t2=medium, t3=simple)`,
         "info"
       );
     },
@@ -717,6 +862,7 @@ export default function planExtension(pi: ExtensionAPI): void {
         { value: "move", label: "move", description: "Reorder task" },
         { value: "start", label: "start", description: "Start task" },
         { value: "block", label: "block", description: "Block task" },
+        { value: "tier", label: "tier", description: "Set trimegisto tier (t0/t1/t2/t3)" },
       ];
       const filtered = actions.filter((a) => a.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -752,6 +898,8 @@ export default function planExtension(pi: ExtensionAPI): void {
       `📐 Widget placement: ${config.widgetPlacement}`,
       `📄 Plan filename: ${config.planFileName}`,
       `${config.trackAgents ? "✅" : "❌"} Track agents: ${config.trackAgents ? "ON" : "OFF"}`,
+      `${config.trimegisto ? "✅" : "❌"} Trimegisto mode: ${config.trimegisto ? "ON" : "OFF"}`,
+      `${config.showTimers ? "✅" : "❌"} Task timers: ${config.showTimers ? "ON" : "OFF"}`,
       `${config.animateWidget ? "✅" : "❌"} Animate widget: ${config.animateWidget ? "ON" : "OFF"}`,
       `${config.compactTaskLines ? "✅" : "❌"} Compact task lines: ${config.compactTaskLines ? "ON" : "OFF"}`,
       `${config.highlightCompleted ? "✅" : "❌"} Highlight completed: ${config.highlightCompleted ? "ON" : "OFF"}`,
@@ -783,6 +931,30 @@ export default function planExtension(pi: ExtensionAPI): void {
       if (name) config.planFileName = name;
     } else if (choice.includes("Track agents")) {
       config.trackAgents = !config.trackAgents;
+    } else if (choice.includes("Trimegisto mode")) {
+      config.trimegisto = !config.trimegisto;
+      if (config.trimegisto) {
+        tgConfig = readTrimegistoConfig();
+        let assigned = 0;
+        for (const t of state.tasks) {
+          if (!t.tier) {
+            t.tier = classifyTask(t.text);
+            assigned++;
+          }
+        }
+        const available = (["t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
+        const tierList = available.length > 0 ? available.join(", ") : "none (everything falls back to t0/active)";
+        ctx.ui.notify(
+          assigned > 0
+            ? `Trimegisto mode ON — ${assigned} task(s) classified. Available tiers: ${tierList}`
+            : `Trimegisto mode ON. Available tiers: ${tierList}`,
+          "info"
+        );
+      } else {
+        ctx.ui.notify("Trimegisto mode OFF", "info");
+      }
+    } else if (choice.includes("Task timers")) {
+      config.showTimers = !config.showTimers;
     } else if (choice.includes("Animate widget")) {
       config.animateWidget = !config.animateWidget;
     } else if (choice.includes("Compact task lines")) {
@@ -883,7 +1055,17 @@ export default function planExtension(pi: ExtensionAPI): void {
         .map((t) => {
           const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? "🔄" : t.status === "blocked" ? "🚫" : "⏳";
           const agent = t.agentName ? ` [${t.agentName}]` : "";
-          return `${icon} ${t.order}. ${t.text}${agent}`;
+          const tier = config.trimegisto ? ` → ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
+          let timer = "";
+          if (config.showTimers) {
+            if (t.status === "in_progress" && t.startedAt) {
+              timer = ` ⏱ ${formatElapsed(Date.now() - t.startedAt)}`;
+            } else if (t.status === "done") {
+              const took = completedTimerText(t.startedAt, t.completedAt);
+              if (took) timer = ` (${took})`;
+            }
+          }
+          return `${icon} ${t.order}. ${t.text}${timer}${tier}${agent}`;
         }),
     ];
 
@@ -907,7 +1089,11 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   // Session start - restore state
   pi.on("session_start", async (_event, ctx) => {
+    globalConfigPartial = await loadGlobalConfig();
+    tgConfig = readTrimegistoConfig();
     const entries = ctx.sessionManager.getEntries();
+    // Global prefs form the base; session entries (if any) override.
+    config = { ...DEFAULT_CONFIG, ...globalConfigPartial };
     restoreState(entries);
 
     // Try to load plan.md if no tasks
@@ -928,13 +1114,30 @@ export default function planExtension(pi: ExtensionAPI): void {
       const inProgress = state.tasks.filter((t) => t.status === "in_progress");
       const done = state.tasks.filter((t) => t.status === "done");
 
+      const tierTag = (t: PlanTask) =>
+        config.trimegisto ? ` (→ ${resolveEffectiveTier(t.tier, tgConfig)})` : "";
+
       let planContext = "[PLAN TRACKING ACTIVE]\n\n";
+
+      if (config.trimegisto) {
+        const available = (["t0", "t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
+        planContext += "[TRIMEGISTO DISTRIBUTION]\n\n";
+        planContext += "Each task below carries a trimegisto tier (→ tN): launch it on that tier with the trimegisto tool.\n";
+        planContext += "Tier roles:\n";
+        for (const tier of ["t1", "t2", "t3", "t0"] as Tier[]) {
+          planContext += `- ${tierToToolValue(tier)}: ${TIER_ROLES[tier]}\n`;
+        }
+        planContext += `\nTiers available right now: ${available.map(tierToToolValue).join(", ")}.\n`;
+        planContext += `If a task's assigned tier is NOT in that list, launch it on tier "active" instead (the → tag already shows the effective tier).\n`;
+        planContext += "Batch independent tasks in ONE trimegisto call (tasks array) to run them in parallel, respecting per-tier capacity.\n";
+        planContext += "When a launched task finishes, mark it done with plan_manager (action=complete).\n\n";
+      }
 
       if (inProgress.length > 0) {
         planContext += "Currently in progress:\n";
         for (const t of inProgress) {
           const agent = t.agentName ? ` (assigned to: ${t.agentName})` : "";
-          planContext += `- 🔄 ${t.order}. ${t.text}${agent}\n`;
+          planContext += `- 🔄 ${t.order}. ${t.text}${tierTag(t)}${agent}\n`;
         }
         planContext += "\n";
       }
@@ -942,7 +1145,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       if (pending.length > 0) {
         planContext += "Pending tasks:\n";
         for (const t of pending.slice(0, 10)) {
-          planContext += `- ⏳ ${t.order}. ${t.text}\n`;
+          planContext += `- ⏳ ${t.order}. ${t.text}${tierTag(t)}\n`;
         }
         if (pending.length > 10) {
           planContext += `- ... and ${pending.length - 10} more\n`;
@@ -981,6 +1184,11 @@ export default function planExtension(pi: ExtensionAPI): void {
       const tasks = extractPlanTasks(text);
       if (tasks.length >= 3) {
         state.tasks = tasks;
+        if (config.trimegisto) {
+          for (const t of state.tasks) {
+            if (!t.tier) t.tier = classifyTask(t.text);
+          }
+        }
         state.updatedAt = Date.now();
         ctx.ui.notify(`Detected plan with ${tasks.length} tasks`, "info");
         updateUI(ctx);
@@ -1023,6 +1231,12 @@ export default function planExtension(pi: ExtensionAPI): void {
           });
           if (refresh.changed) {
             state.tasks = refresh.tasks;
+            if (config.trimegisto) {
+              // Newly added tasks arrive without a tier — classify them.
+              for (const t of state.tasks) {
+                if (!t.tier) t.tier = classifyTask(t.text);
+              }
+            }
             state.updatedAt = Date.now();
             changed = true;
             const parts = [
@@ -1179,8 +1393,11 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "plan_manager",
-    label: "Plan Manager",
-    description: "Manage the implementation plan. Use this to add, remove, update, start, block, complete, or list tasks in the project plan.",
+    label: "T-Plan Manager",
+    description:
+      "Manage the implementation plan. Use this to add, remove, update, start, block, complete, or list tasks in the project plan. " +
+      "When trimegisto mode is ON, tasks are assigned a trimegisto tier (t1 complex / t2 medium / t3 simple; t0 = active fallback) " +
+      "either explicitly via the tier parameter or auto-classified from the task text.",
     promptSnippet: "Manage implementation plan tasks (add, remove, complete, update, start, block, list)",
     promptGuidelines: [
       "Use plan_manager to track implementation progress when working on multi-step projects.",
@@ -1194,6 +1411,13 @@ export default function planExtension(pi: ExtensionAPI): void {
       task_id: Type.Optional(Type.String({ description: "Task ID or order number (for complete/update/remove/start/block)" })),
       status: Type.Optional(StringEnum(["pending", "in_progress", "done", "blocked"] as const)),
       notes: Type.Optional(Type.String({ description: "Additional notes" })),
+      tier: Type.Optional(
+        StringEnum(["t0", "t1", "t2", "t3", "active"] as const, {
+          description:
+            "Trimegisto tier for this task: t1 = complex/deep thinking, t2 = medium/solver, t3 = simple/mechanical, t0 = active default worker. " +
+            "Only meaningful when trimegisto mode is ON; auto-classified from the task text when omitted.",
+        })
+      ),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (!config.enabled) {
@@ -1208,12 +1432,14 @@ export default function planExtension(pi: ExtensionAPI): void {
           if (!params.task_text) {
             return { content: [{ type: "text", text: "task_text is required for add action" }], details: {} };
           }
-          const task = addTask(params.task_text);
+          const tier = params.tier ? toolValueToTier(params.tier) : undefined;
+          const task = addTask(params.task_text, "pending", undefined, tier);
           updateUI(ctx);
           persistState();
           await writePlanFile(ctx.cwd);
+          const tierNote = config.trimegisto && task.tier ? ` [${task.tier}]` : "";
           return {
-            content: [{ type: "text", text: `Added task ${task.order}: ${task.text}` }],
+            content: [{ type: "text", text: `Added task ${task.order}: ${task.text}${tierNote}` }],
             details: { task },
           };
         }
@@ -1285,6 +1511,10 @@ export default function planExtension(pi: ExtensionAPI): void {
           if (params.task_text) updates.text = params.task_text;
           if (params.status) updates.status = params.status;
           if (params.notes) updates.notes = params.notes;
+          if (params.tier) {
+            const tier = toolValueToTier(params.tier);
+            if (tier) updates.tier = tier;
+          }
           updateTask(task.id, updates);
           updateUI(ctx);
           persistState();
@@ -1317,6 +1547,7 @@ export default function planExtension(pi: ExtensionAPI): void {
           const total = state.tasks.length;
           const done = state.tasks.filter((t) => t.status === "done").length;
           const inProgress = state.tasks.filter((t) => t.status === "in_progress").length;
+          const now = Date.now();
 
           const lines = [
             `📋 ${state.title} (${done}/${total} completed)`,
@@ -1325,7 +1556,17 @@ export default function planExtension(pi: ExtensionAPI): void {
               .sort((a, b) => a.order - b.order)
               .map((t) => {
                 const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? "🔄" : t.status === "blocked" ? "🚫" : "⏳";
-                return `${icon} ${t.order}. ${t.text}`;
+                const tier = config.trimegisto ? ` → ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
+                let timer = "";
+                if (config.showTimers) {
+                  if (t.status === "in_progress" && t.startedAt) {
+                    timer = ` ⏱ ${formatElapsed(now - t.startedAt)}`;
+                  } else if (t.status === "done") {
+                    const took = completedTimerText(t.startedAt, t.completedAt);
+                    if (took) timer = ` (${took})`;
+                  }
+                }
+                return `${icon} ${t.order}. ${t.text}${timer}${tier}`;
               }),
           ];
 
