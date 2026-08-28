@@ -36,7 +36,7 @@ t-plan is a [pi package](https://pi.dev/packages): one extension (`src/index.ts`
 pi install git:github.com/noguerol/t-plan
 
 # Pin a tag/commit (refs are never moved by `pi update`)
-pi install git:github.com/noguerol/t-plan@v3.0.0
+pi install git:github.com/noguerol/t-plan@v1.0.0
 
 # Local checkout (development)
 pi install /path/to/t-plan
