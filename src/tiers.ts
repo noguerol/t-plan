@@ -98,10 +98,10 @@ export function resolveEffectiveTier(assigned: Tier | undefined, tg: TrimegistoF
 
 // ─── Complexity classification ──────────────────────────────────────────
 //
-// Bilingual (EN/ES) weighted keyword scoring. Defaults to t2 (medium), the
-// natural landing spot for implementation work. Distinctive signals move a
-// task up to t1 (complex) or down to t3 (mechanical). Ties resolve to the
-// most distinctive tier (t1 > t3 > t2) since t2 is the catch-all.
+// Trilingual (EN/ES/ZH Mandarin) weighted keyword scoring. Defaults to t2
+// (medium), the natural landing spot for implementation work. Distinctive
+// signals move a task up to t1 (complex) or down to t3 (mechanical). Ties
+// resolve to the most distinctive tier (t1 > t3 > t2) since t2 is the catch-all.
 
 interface TierSignal {
   tier: Tier;
@@ -111,17 +111,17 @@ interface TierSignal {
 
 const SIGNALS: TierSignal[] = [
   // ── t1 — complex: planning, architecture, hard analysis ──
-  { tier: "t1", weight: 3, re: /\b(?:root\s+cause|causa\s+ra[íi]z|trade[-\s]?offs?|threat\s+model|proof\s+of\s+concept|prueba\s+de\s+concepto)\b/gi },
-  { tier: "t1", weight: 2, re: /\b(?:architect\w*|arquitectur\w*|redesign\w*|redise[ñn]\w*|refactor\w*|refactoriz\w*|migrat\w*|migraci\w*|migrar|secur\w*|segur\w*|scal(?:e|ing|ability)\b|escalabil\w*|investigat\w*|investig\w*|strateg\w*|estrategi\w*|algorithm\w*|algoritm\w*|distribute\w*|distribuid\w*|concurren\w*|concurrencia|bottleneck|cuello\s+de\s+botella|optimi[sz]\w*|optimiz\w*|planific\w*)\b/gi },
-  { tier: "t1", weight: 1, re: /\b(?:design|dise[ñn]o|dise[ñn]a)\b/gi },
+  { tier: "t1", weight: 3, re: /\b(?:root\s+cause|causa\s+ra[íi]z|trade[-\s]?offs?|threat\s+model|proof\s+of\s+concept|prueba\s+de\s+concepto)\b|(?:根因|权衡|威胁模型|概念验证|原型验证)/gi },
+  { tier: "t1", weight: 2, re: /\b(?:architect\w*|arquitectur\w*|redesign\w*|redise[ñn]\w*|refactor\w*|refactoriz\w*|migrat\w*|migraci\w*|migrar|secur\w*|segur\w*|scal(?:e|ing|ability)\b|escalabil\w*|investigat\w*|investig\w*|strateg\w*|estrategi\w*|algorithm\w*|algoritm\w*|distribute\w*|distribuid\w*|concurren\w*|concurrencia|bottleneck|cuello\s+de\s+botella|optimi[sz]\w*|optimiz\w*|planific\w*)\b|(?:架构|重新设计|重构|迁移|安全|可扩展|调查|研究|策略|算法|分布式|并发|瓶颈|优化|规划)/gi },
+  { tier: "t1", weight: 1, re: /\b(?:design|dise[ñn]o|dise[ñn]a)\b|(?:设计)/gi },
 
   // ── t3 — simple: mechanical transforms ──
-  { tier: "t3", weight: 2, re: /\b(?:renam\w*|renombr\w*|translat\w*|traduc\w*|traducir|find\s+and\s+replace|buscar\s+y\s+(?:reemplazar|sustituir)|convert\w*\s+(?:to|a|into)\s+(?:json|csv|yaml|xml|markdown)|documentation|documentaci[oó]n|documenta\w*|readme|changelog)\b/gi },
-  { tier: "t3", weight: 1, re: /\b(?:format\w*|formate\w*|formato|pars\w*|parsea\w*|extract\w*|extrae\w*|extraer|count\w*|cuent\w*|sort\w*|ordena\w*|filter\w*|filtra\w*|cop\w*\s+files?|copia\w*|mueve\w*|lint\w*|typo\w*|erratas?|spell\w*|ortogra\w*|comment\w*|comenta\w*|regex\w*|expresi[oó]n\s+regular|lista\w*\s+(?:los\s+)?archivos?)\b/gi },
+  { tier: "t3", weight: 2, re: /\b(?:renam\w*|renombr\w*|translat\w*|traduc\w*|traducir|find\s+and\s+replace|buscar\s+y\s+(?:reemplazar|sustituir)|convert\w*\s+(?:to|a|into)\s+(?:json|csv|yaml|xml|markdown)|documentation|documentaci[oó]n|documenta\w*|readme|changelog)\b|(?:重命名|翻译|查找替换|查找并替换|转换为|转成|文档|说明文档|自述|更新日志)/gi },
+  { tier: "t3", weight: 1, re: /\b(?:format\w*|formate\w*|formato|pars\w*|parsea\w*|extract\w*|extrae\w*|extraer|count\w*|cuent\w*|sort\w*|ordena\w*|filter\w*|filtra\w*|cop\w*\s+files?|copia\w*|mueve\w*|lint\w*|typo\w*|erratas?|spell\w*|ortogra\w*|comment\w*|comenta\w*|regex\w*|expresi[oó]n\s+regular|lista\w*\s+(?:los\s+)?archivos?)\b|(?:格式化|解析|提取|抽取|统计|计数|排序|筛选|过滤|复制|移动|检查|拼写|错别字|注释|正则|列出文件|列出)/gi },
 
   // ── t2 — medium: implementation work (mostly the default anyway) ──
-  { tier: "t2", weight: 2, re: /\b(?:implement\w*|implementa\w*|debug\w*|depura\w*|code\s+review|revisi[oó]n\s+de\s+c[oó]digo|integrat\w*|integraci[oó]n)\b/gi },
-  { tier: "t2", weight: 1, re: /\b(?:fix\w*|arregl\w*|corrige?\w*|bug|bugs|test\w*|prueba\w*|review|revisa\w*|endpoint\w*|api\b|apis\b|feature|features|component\w*|module|modules|config\w*|configura\w*|update|updates|actualiza\w*|add|adds|a[ñn]ad\w*|create|crea\w*|write|escribe\w*|build|deploy|despleg\w*|install\w*|instala\w*|analyz\w*|analiza\w*|script|ui\b|css)\b/gi },
+  { tier: "t2", weight: 2, re: /\b(?:implement\w*|implementa\w*|debug\w*|depura\w*|code\s+review|revisi[oó]n\s+de\s+c[oó]digo|integrat\w*|integraci[oó]n)\b|(?:实现|实施|调试|代码审查|审查代码|集成)/gi },
+  { tier: "t2", weight: 1, re: /\b(?:fix\w*|arregl\w*|corrige?\w*|bug|bugs|test\w*|prueba\w*|review|revisa\w*|endpoint\w*|api\b|apis\b|feature|features|component\w*|module|modules|config\w*|configura\w*|update|updates|actualiza\w*|add|adds|a[ñn]ad\w*|create|crea\w*|write|escribe\w*|build|deploy|despleg\w*|install\w*|instala\w*|analyz\w*|analiza\w*|script|ui\b|css)\b|(?:修复|错误|缺陷|测试|验证|审查|端点|接口|功能|组件|模块|配置|更新|添加|新增|创建|编写|构建|部署|安装|分析|脚本|界面|样式)/gi },
 ];
 
 /** Classify a task description into a trimegisto tier. Never returns t0:

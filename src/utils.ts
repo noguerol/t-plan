@@ -26,19 +26,21 @@ export function slugify(text: string): string {
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "") // strip accents
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 40)
     .replace(/-+$/g, "");
 }
 
 /** Title → project name, dropping the localized "Plan" wrapper
- *  ("myapp Plan" → "myapp", "Plan de myapp" → "myapp"). */
+ *  ("myapp Plan" → "myapp", "Plan de myapp" → "myapp", "myapp 计划" → "myapp"). */
 export function titleToProjectName(title: string): string {
   const stripped = title
     .replace(/^plan\s+de\s+/i, "")
     .replace(/^plan\s+/i, "")
     .replace(/\s+plan$/i, "")
+    .replace(/^计划[：:\s]+/u, "")
+    .replace(/\s*计划$/u, "")
     .trim();
   return stripped || title;
 }
@@ -83,23 +85,33 @@ export function deslugTitle(slug: string): string {
 // The extension UI is English, but plan titles and tasks follow the language
 // the user and the model are using.
 
+export type PlanLanguage = "en" | "es" | "zh";
+
 const ES_ACCENTS = /[áéíóúñü¿¡]/gi;
 const ES_WORDS = /\b(?:el|la|los|las|un|una|unos|unas|del|al|por|para|con|sin|que|como|pero|más|mas|ya|es|son|ser|este|esta|esto|tarea|tareas|paso|pasos|implementar|implementación|crear|creación|añadir|añadido|configurar|configuración|actualizar|revisar|arreglar|corregir|diseñar|arquitectura|autenticación|documento|documentación)\b/gi;
 const EN_WORDS = /\b(?:the|and|for|with|from|that|this|these|those|of|to|into|task|tasks|step|steps|plan|implement|implementation|create|adding|add|update|review|fix|fixing|design|architecture|authentication|document|documentation|endpoint)\b/gi;
+const ZH_CHARS = /[\u3400-\u9FFF]/g;
+const ZH_WORDS = /(?:计划|任务|步骤|待办|完成|实现|添加|新增|创建|更新|修复|设计|架构|文档|配置|测试|接口|端点|模块|组件|审查|分析|调试|部署|安装|普通话|国语|中文|汉语)/g;
 
-/** Best-effort language detection of plan/task text ("es" | "en"). */
-export function detectLanguage(text: string): "en" | "es" {
+/** Best-effort language detection of plan/task text ("en" | "es" | "zh"). */
+export function detectLanguage(text: string): PlanLanguage {
   if (!text) return "en";
   const accents = (text.match(ES_ACCENTS)?.length ?? 0) * 2;
   const esWords = text.match(ES_WORDS)?.length ?? 0;
   const enWords = text.match(EN_WORDS)?.length ?? 0;
+  const zhChars = text.match(ZH_CHARS)?.length ?? 0;
+  const zhWords = (text.match(ZH_WORDS)?.length ?? 0) * 2;
+  const zhScore = zhChars + zhWords;
+  if (zhScore >= 2 && zhScore > accents + esWords && zhScore > enWords) return "zh";
   return accents + esWords > enWords ? "es" : "en";
 }
 
 /** Localized default plan title for a project (directory) name. */
-export function planTitle(projectName: string, lang: "en" | "es"): string {
+export function planTitle(projectName: string, lang: PlanLanguage): string {
   const name = projectName.trim() || "project";
-  return lang === "es" ? `Plan de ${name}` : `${name} Plan`;
+  if (lang === "es") return `Plan de ${name}`;
+  if (lang === "zh") return `${name} 计划`;
+  return `${name} Plan`;
 }
 
 /**
@@ -108,7 +120,7 @@ export function planTitle(projectName: string, lang: "en" | "es"): string {
  * - Numbered lists: "1. Task description"
  * - Checkbox style: "- [ ] Task" or "- [x] Task"
  * - Dash lists: "- Task description"
- * - Headers with steps: "## Step 1: Description"
+ * - Headers with steps: "## Step 1: Description" or "## 步骤 1：描述"
  */
 export function extractPlanTasks(text: string): PlanTask[] {
   const tasks: PlanTask[] = [];
@@ -116,12 +128,12 @@ export function extractPlanTasks(text: string): PlanTask[] {
   
   // Patterns to match plan items
   const patterns = [
-    // Numbered: "1. Task" or "1) Task"
-    /^\s*(\d+)[.)]\s+(.+)$/,
+    // Numbered: "1. Task", "1) Task", or "1、任务"
+    /^\s*(\d+)[.)、．]\s*(.+)$/,
     // Checkbox: "- [ ] Task" or "- [x] Task" or "- [X] Task"
     /^\s*[-*]\s+\[([ xX])\]\s+(.+)$/,
-    // Step header: "## Step 1: Description" or "### Step 1 - Description"
-    /^#{1,4}\s+Step\s+(\d+)[:\s-]+(.+)$/i,
+    // Step header: "## Step 1: Description", "### 步骤 1 - 描述", or "## 第1步：描述"
+    /^#{1,4}\s+(?:(?:Step|步骤)\s*(\d+)|第\s*(\d+)\s*步)[:：\s-]+(.+)$/i,
     // Plan header followed by items
     /^\s*[-*]\s+(.+)$/,
   ];
@@ -151,8 +163,8 @@ export function extractPlanTasks(text: string): PlanTask[] {
     }
 
     // Stop at the next unrelated major section.
-    if (inPlanSection && /^#{1,2}\s+(?!Step)/i.test(line) && planSectionFound) {
-      if (!/^#{1,4}\s+Step\s+\d+/i.test(line)) {
+    if (inPlanSection && /^#{1,2}\s+(?!(?:Step|步骤|第\s*\d+\s*步))/i.test(line) && planSectionFound) {
+      if (!/^#{1,4}\s+(?:(?:Step|步骤)\s*\d+|第\s*\d+\s*步)/i.test(line)) {
         inPlanSection = false;
         currentStatus = "pending";
       }
@@ -193,8 +205,8 @@ export function extractPlanTasks(text: string): PlanTask[] {
     // Try step header pattern
     const stepMatch = line.match(patterns[2]);
     if (stepMatch) {
-      const step = parseInt(stepMatch[1]);
-      const text = cleanTaskText(stepMatch[2]);
+      const step = parseInt(stepMatch[1] ?? stepMatch[2] ?? "0");
+      const text = cleanTaskText(stepMatch[3] ?? "");
       if (text.length > 3 && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
@@ -247,30 +259,34 @@ function headingText(line: string): string | undefined {
   const match = line.match(/^#{1,6}\s+(.+)$/);
   if (!match) return undefined;
   return match[1]
-    .replace(/^[^A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ]+/, "")
+    .replace(/^[^\p{L}\p{N}]+/u, "")
     .trim();
 }
 
 function isPlanSectionHeading(line: string): boolean {
   const heading = headingText(line);
   if (!heading) return false;
-  return /^(?:Project\s+Plan|Plan|Implementation\s+Plan|Task\s+List|TODO|Steps|Action\s+Plan|Updated\s+Plan|Revised\s+Plan|Current\s+Plan|Remaining\s+Tasks|Pending\s+Tasks|Next\s+Steps|Backlog|Roadmap|Status|Estado|Plan\s+actualizado|Plan\s+revisado|Plan\s+actual|Tareas|Tareas\s+pendientes|Pr[oó]ximos\s+pasos)/i.test(heading);
+  return /^(?:Project\s+Plan|Plan|Implementation\s+Plan|Task\s+List|TODO|Steps|Action\s+Plan|Updated\s+Plan|Revised\s+Plan|Current\s+Plan|Remaining\s+Tasks|Pending\s+Tasks|Next\s+Steps|Backlog|Roadmap|Status|Estado|Plan\s+actualizado|Plan\s+revisado|Plan\s+actual|Tareas|Tareas\s+pendientes|Pr[oó]ximos\s+pasos|项目计划|计划|实施计划|任务列表|待办|步骤|行动计划|更新计划|修订计划|当前计划|剩余任务|待办任务|下一步|路线图|状态)/iu.test(heading);
 }
 
 function statusFromHeading(line: string): TaskStatus | undefined {
   const heading = headingText(line);
   if (!heading) return undefined;
 
-  // "## Status: 3/7 completed" is a summary heading, not a completed-task section.
-  if (/^(?:Status|Estado)\b/i.test(heading)) return undefined;
+  // "## Status: 3/7 completed" / "## 状态：3/7 已完成" are summary headings,
+  // not completed-task sections.
+  if (/^(?:Status|Estado)\b/i.test(heading) || /^状态[:：\s]?/u.test(heading)) return undefined;
 
-  if (/\b(?:done|completed|complete|finished|hech[oa]s?|completad[oa]s?|terminad[oa]s?)\b/i.test(heading)) {
+  if (/(?:待办|待处理|未完成|剩余|下一步|接下来)/u.test(heading)) {
+    return "pending";
+  }
+  if (/\b(?:done|completed|complete|finished|hech[oa]s?|completad[oa]s?|terminad[oa]s?)\b/i.test(heading) || /(?:已完成|完成|已办|办完|结束)/u.test(heading)) {
     return "done";
   }
-  if (/\b(?:in[-\s]?progress|doing|active|started|en\s+progreso|en\s+curso|en\s+marcha)\b/i.test(heading)) {
+  if (/\b(?:in[-\s]?progress|doing|active|started|en\s+progreso|en\s+curso|en\s+marcha)\b/i.test(heading) || /(?:进行中|处理中|正在|已开始|开始)/u.test(heading)) {
     return "in_progress";
   }
-  if (/\b(?:blocked|stuck|deferred|waiting|bloquead[oa]s?|atascad[oa]s?|aplazad[oa]s?|esperando)\b/i.test(heading)) {
+  if (/\b(?:blocked|stuck|deferred|waiting|bloquead[oa]s?|atascad[oa]s?|aplazad[oa]s?|esperando)\b/i.test(heading) || /(?:已阻塞|阻塞|卡住|搁置|等待)/u.test(heading)) {
     return "blocked";
   }
   if (/\b(?:pending|remaining|todo|next|upcoming|pendientes?|restantes?|pr[oó]xim[oa]s?)\b/i.test(heading)) {
@@ -446,8 +462,9 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
   const spacer = task.status === "in_progress" ? " " : "";
 
   const showTier = options.showTier === true;
-  const rawTier = showTier && task.tier ? ` ${tierBadge(task.tier)}` : "";
-  const tier = rawTier ? theme.fg?.(tierColor(task.tier), rawTier) ?? rawTier : "";
+  const tierValue = showTier ? task.tier : undefined;
+  const rawTier = tierValue ? ` ${tierBadge(tierValue)}` : "";
+  const tier = tierValue ? theme.fg?.(tierColor(tierValue), rawTier) ?? rawTier : "";
 
   const showTimers = options.showTimers !== false;
   const rawTimer =
@@ -526,14 +543,14 @@ export function parseDoneMarkers(text: string, tasks: PlanTask[]): string[] {
 
 /**
  * Skip "summary" lines that appear inside generated plan.md files
- * (e.g. "- ✅ Completed: 3", "- 🔄 In progress: 2"). These are status
- * counters, not tasks, and pollute the task list when the file is loaded.
+ * (e.g. "- ✅ Completed: 3", "- 🔄 In progress: 2", "- ✅ 已完成：3").
+ * These are status counters, not tasks, and pollute the task list when the file is loaded.
  */
 function isSummaryLine(text: string): boolean {
-  if (/^(?:🔄|⏳|🚫|✅|📋|📈|⚡)\s*(?:In progress|Pending|Blocked|Completed|Progress|Status)/i.test(text)) {
+  if (/^(?:🔄|⏳|🚫|✅|📋|📈|⚡)\s*(?:In progress|Pending|Blocked|Completed|Progress|Status|进行中|待办|阻塞|已完成|完成|进度|状态)/iu.test(text)) {
     return true;
   }
-  if (/^\d+\/\d+\s+completed/i.test(text)) {
+  if (/^\d+\/\d+\s+(?:completed|已完成|完成)/iu.test(text)) {
     return true;
   }
   return false;
@@ -576,13 +593,16 @@ export function detectAgentTasks(text: string): Array<{ agentId: string; agentNa
 //   - Tool calls whose names/arguments contain the task's distinctive words
 //     → task marked in_progress
 
-const COMPLETION_PATTERN = /\b(?:done|complete|completed|finished|implemented|added|created|fixed|resolved|closed|landed|ready|accomplished|wrapped|pass(?:es|ed|ing)?|terminad[oa]|completad[oa]|hech[oa]|implementad[oa]|agregad[oa]|cread[oa]|arreglad[oa]|resuelt[oa]|a\u00f1adid[oa]|incluid[oa]|conseguid[oa]|listo)\b/i;
+const COMPLETION_PATTERN = /(?:\b(?:done|complete|completed|finished|implemented|added|created|fixed|resolved|closed|landed|ready|accomplished|wrapped|pass(?:es|ed|ing)?|terminad[oa]|completad[oa]|hech[oa]|implementad[oa]|agregad[oa]|cread[oa]|arreglad[oa]|resuelt[oa]|a\u00f1adid[oa]|incluid[oa]|conseguid[oa]|listo)\b|(?:已完成|完成了|(?<!未)完成|做完|搞定|实现了|已实现|添加了|已添加|新增了|已新增|创建了|已创建|修复了|已修复|解决了|已解决|通过了|已通过|准备好了|就绪))/i;
 
-const START_PATTERN = /\b(?:start(?:ed|ing)?|working\s+on|work\s+on|in\s+progress|begin(?:ning)?|began|on\s+it|empezad[oa]|trabajando\s+en|en\s+progreso|comenzand[oa])\b/i;
+const START_PATTERN = /(?:\b(?:start(?:ed|ing)?|working\s+on|work\s+on|in\s+progress|begin(?:ning)?|began|on\s+it|empezad[oa]|trabajando\s+en|en\s+progreso|comenzand[oa])\b|(?:开始|已开始|正在|着手|处理中|进行中|我来做|我在做))/i;
 
-const TASK_NUMBER_REF = /\b(?:task|step|item|point|tarea|paso)\s*#?\s*(\d+)\b/gi;
+const TASK_NUMBER_REF = /(?:\b(?:task|step|item|point|tarea|paso)\s*#?\s*(\d+)\b|(?:任务|步骤|第)\s*#?\s*(\d+)\s*(?:项|步|条|点)?)/gi;
 
-const DONE_LINE_PREFIX = /^\s*(?:[-*]\s+\[[xX]\]\s*|✅\s*|✔️\s*|☑️\s*|✓\s*)(.+)$/;
+const DONE_LINE_PREFIX = /^\s*(?:[-*]\s+\[[xX]\]\s*|✅\s*|✔️\s*|☑️\s*|✓\s*|完成[:：]\s*|已完成[:：]\s*)(.+)$/;
+
+const CJK_TEXT_RE = /[\u3400-\u9FFF]/u;
+const WORD_OR_CJK_RE = /[a-z0-9áéíóúñü]+|[\u3400-\u9FFF]+/giu;
 
 const STOPWORDS = new Set([
   // English
@@ -606,11 +626,15 @@ const STOPWORDS = new Set([
   "haber", "tener", "hacer", "otro", "otra", "otros", "otras", "mas", "ya",
   "les", "sus", "mis", "tus", "nos", "vamos", "voy", "ver", "decir", "quiero",
   "puedo", "podemos", "vamos", "estoy", "esta", "estan", "tenemos", "hace",
+  // Mandarin / Chinese function words (used when short CJK chunks are tokenized)
+  "的", "了", "和", "与", "及", "在", "是", "我", "我们", "你", "你们", "他", "她", "它",
+  "这", "这个", "这些", "那", "那个", "那些", "就", "也", "都", "很", "更", "还", "要",
+  "把", "被", "给", "对", "从", "到", "为", "并", "或", "而", "但", "如果", "然后",
 ]);
 
-/** Light stemming: strip common English/Spanish suffixes. */
+/** Light stemming: strip common English/Spanish suffixes. Mandarin tokens are left intact. */
 function stem(w: string): string {
-  if (w.length <= 4) return w;
+  if (CJK_TEXT_RE.test(w) || w.length <= 4) return w;
   let s = w
     .replace(/(ingly|edly)$/, "")
     .replace(/(ing|ed|es|s)$/, "")
@@ -620,8 +644,8 @@ function stem(w: string): string {
 }
 
 /**
- * Common ES↔EN vocabulary so bilingual responses still match English tasks.
- * Keys are the stemmed token; values the canonical English stem.
+ * Common ES/ZH↔EN vocabulary so trilingual responses still match English tasks.
+ * Keys are the stemmed token or exact Mandarin phrase; values the canonical English stem.
  */
 const SYNONYMS: Record<string, string> = {
   purga: "purge", purgar: "purge", purgado: "purge",
@@ -645,19 +669,56 @@ const SYNONYMS: Record<string, string> = {
   buscar: "search", b\u00fasqueda: "search",
   corregir: "fix", corregido: "fix",
   actualizar: "update", actualizado: "update",
+  完成: "complete", 已完成: "complete", 做完: "complete", 完毕: "complete", 搞定: "complete", 就绪: "ready",
+  实现: "implement", 已实现: "implement", 实施: "implement",
+  添加: "add", 新增: "add", 加入: "add", 增加: "add",
+  创建: "create", 建立: "create", 编写: "write", 写入: "write",
+  修复: "fix", 解决: "resolve", 更正: "fix", 纠正: "fix",
+  更新: "update", 配置: "config", 设置: "config", 加载: "load", 保存: "save",
+  删除: "remove", 移除: "remove", 去掉: "remove", 丢弃: "remove", 取消: "remove",
+  查找: "search", 搜索: "search", 检索: "search",
+  测试: "test", 验证: "test", 通过: "pass",
+  任务: "task", 步骤: "step", 计划: "plan", 待办: "todo",
+  文档: "document", 说明文档: "document", 架构: "architecture", 设计: "design",
+  认证: "auth", 身份验证: "auth", 登录: "auth", 接口: "api", 端点: "endpoint",
+  模块: "module", 组件: "component", 功能: "feature", 错误: "bug", 缺陷: "bug",
+  模糊: "fuzzy", 匹配: "match", 检测: "detect", 识别: "detect",
+  中文: "mandarin", 汉语: "mandarin", 普通话: "mandarin", 国语: "mandarin", 曼达林: "mandarin",
 };
+
+const ZH_SYNONYM_PHRASES = Object.keys(SYNONYMS).filter((key) => CJK_TEXT_RE.test(key)).sort((a, b) => b.length - a.length);
 
 function normalizeToken(w: string): string {
   return SYNONYMS[w] ?? w;
 }
 
-/** Tokenize + stem + remove stopwords, keeping tokens with 3+ chars. */
+function addCjkToken(tokens: Set<string>, chunk: string): void {
+  const chars = [...chunk];
+  if (chars.length >= 2 && !STOPWORDS.has(chunk)) tokens.add(normalizeToken(chunk));
+  for (const phrase of ZH_SYNONYM_PHRASES) {
+    if (chunk.includes(phrase)) tokens.add(SYNONYMS[phrase]);
+  }
+  // Small shingles make Mandarin task text match even when particles split phrases
+  // differently between the task and the assistant's progress sentence.
+  for (const size of [2, 3]) {
+    if (chars.length < size) continue;
+    for (let i = 0; i <= chars.length - size; i++) {
+      const gram = chars.slice(i, i + size).join("");
+      if (!STOPWORDS.has(gram)) tokens.add(normalizeToken(gram));
+    }
+  }
+}
+
+/** Tokenize + stem + remove stopwords, keeping Latin tokens with 3+ chars and Mandarin chunks/shingles. */
 function tokenize(text: string): Set<string> {
   const tokens = new Set<string>();
-  for (const w of text
-    .toLowerCase()
-    .replace(/[^a-z0-9áéíóúñü\s]/gi, " ")
-    .split(/\s+/)) {
+  const lower = text.toLowerCase();
+  for (const match of lower.matchAll(WORD_OR_CJK_RE)) {
+    const w = match[0];
+    if (CJK_TEXT_RE.test(w)) {
+      addCjkToken(tokens, w);
+      continue;
+    }
     if (w.length < 3) continue;
     const s = stem(w);
     if (s.length < 3 || STOPWORDS.has(s)) continue;
@@ -732,11 +793,13 @@ export interface PlanReconcileResult {
 }
 
 export function hasPlanRefreshCue(text: string): boolean {
-  return /\b(?:updated|revised|current|new|remaining|pending|next\s+steps|todo|backlog|roadmap|replace|replan(?:ned)?|discard(?:ed|ing)?|drop(?:ped|ping)?|remove(?:d|ing)?|delete(?:d|ing)?|eliminate(?:d|ing)?|actualizad[oa]s?|actual|revisad[oa]s?|restantes?|pendientes?|pr[oó]ximos\s+pasos|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?)\b/i.test(text);
+  return /\b(?:updated|revised|current|new|remaining|pending|next\s+steps|todo|backlog|roadmap|replace|replan(?:ned)?|discard(?:ed|ing)?|drop(?:ped|ping)?|remove(?:d|ing)?|delete(?:d|ing)?|eliminate(?:d|ing)?|actualizad[oa]s?|actual|revisad[oa]s?|restantes?|pendientes?|pr[oó]ximos\s+pasos|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?)\b/i.test(text)
+    || /(?:更新|修订|当前|新的?|剩余|待办|待处理|下一步|接下来|路线图|替换|重新计划|丢弃|删除|移除|去掉|取消)/u.test(text);
 }
 
 export function shouldRemoveMissingTasksFromPlan(text: string): boolean {
-  return /\b(?:updated|revised|current|remaining|replace|replan(?:ned)?|clean\s+plan|backlog|roadmap|actualizad[oa]s?|actual|revisad[oa]s?|restantes?|pendientes?|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?|no\s+longer|out\s+of\s+scope|fuera\s+de\s+alcance|ya\s+no)\b/i.test(text);
+  return /\b(?:updated|revised|current|remaining|replace|replan(?:ned)?|clean\s+plan|backlog|roadmap|actualizad[oa]s?|actual|revisad[oa]s?|restantes?|pendientes?|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?|no\s+longer|out\s+of\s+scope|fuera\s+de\s+alcance|ya\s+no)\b/i.test(text)
+    || /(?:更新|修订|当前|剩余|替换|重新计划|清理计划|路线图|丢弃|删除|移除|去掉|取消|不再需要|不需要|超出范围|范围之外)/u.test(text);
 }
 
 export function shouldReconcilePlan(text: string, incoming: PlanTask[], current: PlanTask[]): boolean {
@@ -834,7 +897,7 @@ export function reconcilePlanTasks(
   };
 }
 
-const TASK_REMOVAL_PATTERN = /\b(?:discard(?:ed|ing)?|drop(?:ped|ping)?|delete(?:d|ing)?|eliminate(?:d|ing)?|remove(?:d|ing)?|descart(?:ad[oa]s?|o|amos|ando)|elimin(?:ad[oa]s?|o|amos|ando)|quit(?:ad[oa]s?|o|amos|ando)|borr(?:ad[oa]s?|o|amos|ando))\b.*\b(?:task|item|step|plan|tarea|paso|punto)\b|\b(?:task|item|step|tarea|paso|punto)\b.*\b(?:discarded|dropped|deleted|eliminated|removed|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?)\b|\b(?:no\s+longer\s+needed|not\s+needed|out\s+of\s+scope|ya\s+no\s+hace\s+falta|ya\s+no\s+es\s+necesari[oa]|fuera\s+de\s+alcance)\b/i;
+const TASK_REMOVAL_PATTERN = /\b(?:discard(?:ed|ing)?|drop(?:ped|ping)?|delete(?:d|ing)?|eliminate(?:d|ing)?|remove(?:d|ing)?|descart(?:ad[oa]s?|o|amos|ando)|elimin(?:ad[oa]s?|o|amos|ando)|quit(?:ad[oa]s?|o|amos|ando)|borr(?:ad[oa]s?|o|amos|ando))\b.*\b(?:task|item|step|plan|tarea|paso|punto)\b|\b(?:task|item|step|tarea|paso|punto)\b.*\b(?:discarded|dropped|deleted|eliminated|removed|descartad[oa]s?|eliminad[oa]s?|quitad[oa]s?|borrad[oa]s?)\b|\b(?:no\s+longer\s+needed|not\s+needed|out\s+of\s+scope|ya\s+no\s+hace\s+falta|ya\s+no\s+es\s+necesari[oa]|fuera\s+de\s+alcance)\b|(?:丢弃|删除|移除|去掉|取消|淘汰).*(?:任务|步骤|计划|项目|事项)|(?:任务|步骤|计划|项目|事项).*(?:丢弃|删除|移除|去掉|取消|淘汰)|(?:不再需要|不需要|超出范围|范围之外)/i;
 
 export function detectRemovedTasks(text: string, tasks: PlanTask[]): string[] {
   const removedIds: string[] = [];
@@ -845,7 +908,7 @@ export function detectRemovedTasks(text: string, tasks: PlanTask[]): string[] {
     if (!TASK_REMOVAL_PATTERN.test(segment)) continue;
 
     for (const ref of segment.matchAll(TASK_NUMBER_REF)) {
-      const order = parseInt(ref[1], 10);
+      const order = parseInt(ref[1] ?? ref[2] ?? "0", 10);
       const task = removable.find((t) => t.order === order);
       if (task && !removedIds.includes(task.id)) removedIds.push(task.id);
     }
@@ -874,7 +937,7 @@ function bestMatch(candidate: string, tasks: PlanTask[], minScore: number): Plan
 
 function splitSegments(text: string): string[] {
   const segments: string[] = [];
-  for (const part of text.split(/\n+|(?<=[.!?])\s+/)) {
+  for (const part of text.split(/\n+|(?<=[.!?。！？])\s*/)) {
     const s = part.trim();
     if (s.length > 0 && s.length <= 300) segments.push(s);
   }
@@ -915,7 +978,7 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
 
     // 2a. Numbered references: "task 3 done", "step 2 is complete"
     for (const ref of segment.matchAll(TASK_NUMBER_REF)) {
-      const order = parseInt(ref[1], 10);
+      const order = parseInt(ref[1] ?? ref[2] ?? "0", 10);
       const task = active.find((t) => t.order === order);
       if (task && !completedIds.includes(task.id)) completedIds.push(task.id);
     }
@@ -975,31 +1038,35 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
 
 // A "generic" completion signal means the model is telling the user that the
 // work it was doing is finished, without necessarily naming a specific task
-// (e.g. "all done", "everything is complete", "la tarea está terminada").
-// Used to resolve tasks that are still marked in_progress when the model stops.
+// (e.g. "all done", "everything is complete", "la tarea está terminada",
+// "任务已完成"). Used to resolve tasks that are still marked in_progress when the model stops.
 const GENERIC_COMPLETION_PATTERN = /\b(?:all\s+done|all\s+finished|all\s+complete(?:d)?|everything(?:(?:\s+(?:is|was))|(?:'s))?\s+(?:done|complete(?:d)?|finished|ready)|all\s+tasks?\s+(?:are\s+)?(?:done|complete(?:d)?|finished)|(?:the\s+)?work\s+is\s+(?:done|complete(?:d)?|finished)|that\s+(?:completes|concludes|wraps\s+up)|(?:i(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:finished|completed)\s+(?:everything|all(?:(?:\s+(?:tasks?|work)))?|the\s+work|the\s+task)|(?:the\s+)?task\s+is\s+(?:done|complete(?:d)?|finished)|todo\s+(?:está|esta)?\s*(?:listo|completo|terminado|hecho|finalizado)|(?:he|hemos|ya\s+he)\s+terminado\s+(?:todo|todas\s+las\s+tareas|el\s+trabajo|la\s+tarea)|(?:la\s+)?tarea\s+(?:está|esta)\s+(?:completada|terminada|hecha|lista|finalizada)|todas\s+las\s+tareas\s+(?:están\s+)?(?:completadas|terminadas|hechas|listas)|ya\s+está\s+todo|todo\s+(?:completado|finalizado)|eso\s+es\s+todo)\b/i;
+const GENERIC_COMPLETION_ZH_PATTERN = /(?:任务|工作|事项)?(?:已完成|完成了|做完了|搞定了|结束了|准备好了|已就绪)|(?:我|我们)?(?:已经)?(?:(?<!未)完成|做完|搞定)(?:了)?(?:任务|工作|事项)?/u;
 
 // A whole-work conclusion means the model signals that the ENTIRE plan is done
-// ("all done", "everything is complete", "todo listo"). Unlike a generic
+// ("all done", "everything is complete", "todo listo", "全部完成"). Unlike a generic
 // completion, this resolves EVERY remaining task: active → done, and
 // pending/blocked → dropped from the list (the model concluded without doing
 // them).
 const WORK_CONCLUSION_PATTERN = /\b(?:all\s+done|all\s+finished|all\s+complete(?:d)?|everything(?:(?:\s+(?:is|was))|(?:'s))?\s+(?:done|complete(?:d)?|finished|ready)|all\s+tasks?\s+(?:are\s+)?(?:done|complete(?:d)?|finished)|(?:the\s+)?(?:work|plan|implementation)\s+is\s+(?:done|complete(?:d)?|finished)|that\s+(?:completes|concludes|wraps\s+up)(?:\s+(?:the\s+)?(?:work|plan|everything|it))?|(?:i(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:finished|completed)\s+(?:everything|all(?:(?:\s+(?:tasks?|work)))?|the\s+work|the\s+plan)|(?:we(?:'re|\s+are)|i(?:'m|\s+am))\s+(?:all\s+)?done|nothing\s+left\s+to\s+do|todo\s+(?:está|esta)?\s*(?:listo|completo|terminado|hecho|finalizado)|(?:he|hemos|ya\s+he)\s+terminado\s+(?:todo|todas\s+las\s+tareas|el\s+trabajo)|todas\s+las\s+tareas\s+(?:están\s+)?(?:completadas|terminadas|hechas|listas)|ya\s+está\s+todo|todo\s+(?:completado|finalizado)|eso\s+es\s+todo|nada\s+más\s+que\s+hacer)\b/i;
+const WORK_CONCLUSION_ZH_PATTERN = /(?:全部|所有|整个)(?:任务|工作|计划|实现)?(?:都)?(?:已完成|完成了|(?<!未)完成|做完了|搞定了|结束了|准备好了|已就绪)|(?:任务|工作|计划)(?:全部|都)(?:已完成|完成了|(?<!未)完成|做完了|搞定了|结束了)|(?:没有|没什么|无)(?:剩余|待办|要做)(?:的)?(?:任务|工作|事项)?/u;
 
 // Negation / continuation signals that override a completion match:
 // "the task is done, but I still need to…" should NOT resolve active tasks.
 const CONTINUATION_PATTERN = /\b(?:still|not\s+(?:done|finished|complete(?:d)?|ready)|yet|remaining|remain|pending|(?:still|remains?|things?|more)\s+to\s+do|todo\s+(?:queda|falta|está\s+pendiente)|aún|todavía|falta|queda|pendiente|restante|siguiente\s+(?:paso|fase)|next\s+(?:step|phase))\b/i;
+const CONTINUATION_ZH_PATTERN = /(?:仍然|尚未|未完成|没完成|待办|待处理|剩余|还有|还需|还要|接下来|下一步|下一阶段|需要继续|继续)/u;
 
 // Scope limits that turn a whole-work conclusion into a partial one:
 // "all done with phase 1" should not drop tasks from later phases.
 const SCOPE_LIMIT_PATTERN = /\b(?:this\s+(?:phase|step|part|sprint|batch|turn|milestone)|(?:phase|sprint|milestone)\s+\d+|for\s+now|so\s+far|de\s+momento|por\s+ahora|por\s+el\s+momento|esta\s+(?:fase|parte|etapa)|este\s+(?:paso|sprint|hito)|siguiente\s+(?:fase|etapa))\b/i;
+const SCOPE_LIMIT_ZH_PATTERN = /(?:目前|暂时|到目前为止|现在先|这一(?:阶段|步|部分|批次)|这个(?:阶段|步骤|部分|批次)|第\s*\d+\s*(?:阶段|步|部分|批次)|下一(?:阶段|步))/u;
 
 export function detectGenericCompletion(text: string): boolean {
-  if (CONTINUATION_PATTERN.test(text)) return false;
-  return GENERIC_COMPLETION_PATTERN.test(text);
+  if (CONTINUATION_PATTERN.test(text) || CONTINUATION_ZH_PATTERN.test(text)) return false;
+  return GENERIC_COMPLETION_PATTERN.test(text) || GENERIC_COMPLETION_ZH_PATTERN.test(text);
 }
 
 export function detectWorkConclusion(text: string): boolean {
-  if (CONTINUATION_PATTERN.test(text) || SCOPE_LIMIT_PATTERN.test(text)) return false;
-  return WORK_CONCLUSION_PATTERN.test(text);
+  if (CONTINUATION_PATTERN.test(text) || CONTINUATION_ZH_PATTERN.test(text) || SCOPE_LIMIT_PATTERN.test(text) || SCOPE_LIMIT_ZH_PATTERN.test(text)) return false;
+  return WORK_CONCLUSION_PATTERN.test(text) || WORK_CONCLUSION_ZH_PATTERN.test(text);
 }

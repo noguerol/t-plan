@@ -9,8 +9,8 @@
  * - Session-scoped plan file: <prefix>_<title-slug>_<session-id>.md —
  *   parallel pi instances in the same directory never collide, and any plan
  *   file traces back to the session that owns it (resume with pi --session)
- * - Localized plan title ("{project} Plan" / "Plan de {project}") shown in
- *   the widget and used in the file name
+ * - Localized plan title ("{project} Plan" / "Plan de {project}" /
+ *   "{project} 计划") shown in the widget and used in the file name
  * - TUI widget showing task progress
  * - Parallel agent task tracking
  * - Trimegisto mode: classifies tasks into t1 (complex) / t2 (medium) /
@@ -166,8 +166,8 @@ export default function planExtension(pi: ExtensionAPI): void {
     }
   }
 
-  /** Derive the localized default title ("{project} Plan" / "Plan de {project}")
-   *  from the working directory + the language of the given sample text.
+  /** Derive the localized default title ("{project} Plan" / "Plan de {project}" /
+   *  "{project} 计划") from the working directory + the language of the given sample text.
    *  Never overrides a user-set title (titleAuto === false). */
   function ensureTitle(sampleText: string | undefined, ctx?: ExtensionContext): void {
     if (!state.titleAuto) return;

@@ -25,7 +25,7 @@ export interface PlanTask {
 export interface PlanState {
   enabled: boolean;
   tasks: PlanTask[];
-  title: string;           // e.g. "myapp Plan" / "Plan de miapp" (localized)
+  title: string;           // e.g. "myapp Plan" / "Plan de miapp" / "myapp 计划" (localized)
   titleAuto: boolean;      // true while the title is auto-derived (project dir + language)
   description?: string;
   createdAt: number;
@@ -66,7 +66,7 @@ export const DEFAULT_CONFIG: PlanConfig = {
 export const DEFAULT_STATE: PlanState = {
   enabled: true,
   tasks: [],
-  title: "",              // computed at runtime: "{project} Plan" / "Plan de {project}"
+  title: "",              // computed at runtime: "{project} Plan" / "Plan de {project}" / "{project} 计划"
   titleAuto: true,
   createdAt: Date.now(),
   updatedAt: Date.now(),
