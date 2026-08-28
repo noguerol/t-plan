@@ -25,7 +25,8 @@ export interface PlanTask {
 export interface PlanState {
   enabled: boolean;
   tasks: PlanTask[];
-  title: string;
+  title: string;           // e.g. "myapp Plan" / "Plan de miapp" (localized)
+  titleAuto: boolean;      // true while the title is auto-derived (project dir + language)
   description?: string;
   createdAt: number;
   updatedAt: number;
@@ -39,7 +40,7 @@ export interface PlanConfig {
   autoDetect: boolean;
   showWidget: boolean;
   widgetPlacement: "aboveEditor" | "belowEditor";
-  planFileName: string;    // Default: "plan.md"
+  planFilePrefix: string;  // Plan files: <prefix>_<title-slug>_<session-id>.md. Default: "plan"
   trackAgents: boolean;    // Track parallel agent tasks
   animateWidget: boolean;  // Animate in-progress spinners and completion highlights
   compactTaskLines: boolean; // Truncate task lines to fit the widget width
@@ -53,7 +54,7 @@ export const DEFAULT_CONFIG: PlanConfig = {
   autoDetect: true,
   showWidget: true,
   widgetPlacement: "aboveEditor",
-  planFileName: "plan.md",
+  planFilePrefix: "plan",
   trackAgents: true,
   animateWidget: true,
   compactTaskLines: true,
@@ -65,7 +66,8 @@ export const DEFAULT_CONFIG: PlanConfig = {
 export const DEFAULT_STATE: PlanState = {
   enabled: true,
   tasks: [],
-  title: "Project Plan",
+  title: "",              // computed at runtime: "{project} Plan" / "Plan de {project}"
+  titleAuto: true,
   createdAt: Date.now(),
   updatedAt: Date.now(),
   autoDetect: true,

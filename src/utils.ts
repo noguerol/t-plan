@@ -13,6 +13,95 @@ export function generateId(): string {
   return `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
+// ─── Session-scoped plan files ──────────────────────────────────────────────
+//
+// Every pi session owns its plan file: <prefix>_<title-slug>_<session-id>.md
+// (e.g. plan_myapp_01a048c3.md). Multiple pi instances working in the same
+// directory therefore never collide, and a plan file can always be traced
+// back to the session that created it.
+
+/** Normalize a title into a filename-safe slug ("Mi Proyecto!" → "mi-proyecto"). */
+export function slugify(text: string): string {
+  return text
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // strip accents
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40)
+    .replace(/-+$/g, "");
+}
+
+/** Title → project name, dropping the localized "Plan" wrapper
+ *  ("myapp Plan" → "myapp", "Plan de myapp" → "myapp"). */
+export function titleToProjectName(title: string): string {
+  const stripped = title
+    .replace(/^plan\s+de\s+/i, "")
+    .replace(/^plan\s+/i, "")
+    .replace(/\s+plan$/i, "")
+    .trim();
+  return stripped || title;
+}
+
+/** Build the session-scoped plan file name: <prefix>_<title-slug>_<session-id>.md */
+export function planFileNameFor(prefix: string, title: string, sessionId: string | undefined): string {
+  const slug = slugify(titleToProjectName(title)) || "untitled";
+  const id = sessionId ? sessionId.replace(/[^0-9a-zA-Z]/g, "").slice(0, 8) : "noid";
+  return `${prefix}_${slug}_${id}.md`;
+}
+
+export interface ParsedPlanFileName {
+  titleSlug: string;
+  /** Short (8-char) session id baked into the name, when present. */
+  sessionId: string | undefined;
+}
+
+const SHORT_ID_RE = "[0-9a-zA-Z]{6,12}|noid";
+
+/** Parse a session-scoped plan file name produced by planFileNameFor. */
+export function parsePlanFileName(name: string, prefix: string): ParsedPlanFileName | null {
+  const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(`^${escaped}_(?<slug>.+)_(?<id>${SHORT_ID_RE})\\.md$`, "i");
+  const m = name.match(re);
+  if (!m || !m.groups) return null;
+  return {
+    titleSlug: m.groups.slug,
+    sessionId: m.groups.id === "noid" ? undefined : m.groups.id,
+  };
+}
+
+/** De-slug a title slug for display when the file has no readable title ("mi-app" → "Mi App"). */
+export function deslugTitle(slug: string): string {
+  return slug
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((w) => (w.length <= 2 ? w : w[0].toUpperCase() + w.slice(1)))
+    .join(" ");
+}
+
+// ─── Language detection (for localized plan titles) ────────────────────
+// The extension UI is English, but plan titles and tasks follow the language
+// the user and the model are using.
+
+const ES_ACCENTS = /[áéíóúñü¿¡]/gi;
+const ES_WORDS = /\b(?:el|la|los|las|un|una|unos|unas|del|al|por|para|con|sin|que|como|pero|más|mas|ya|es|son|ser|este|esta|esto|tarea|tareas|paso|pasos|implementar|implementación|crear|creación|añadir|añadido|configurar|configuración|actualizar|revisar|arreglar|corregir|diseñar|arquitectura|autenticación|documento|documentación)\b/gi;
+const EN_WORDS = /\b(?:the|and|for|with|from|that|this|these|those|of|to|into|task|tasks|step|steps|plan|implement|implementation|create|adding|add|update|review|fix|fixing|design|architecture|authentication|document|documentation|endpoint)\b/gi;
+
+/** Best-effort language detection of plan/task text ("es" | "en"). */
+export function detectLanguage(text: string): "en" | "es" {
+  if (!text) return "en";
+  const accents = (text.match(ES_ACCENTS)?.length ?? 0) * 2;
+  const esWords = text.match(ES_WORDS)?.length ?? 0;
+  const enWords = text.match(EN_WORDS)?.length ?? 0;
+  return accents + esWords > enWords ? "es" : "en";
+}
+
+/** Localized default plan title for a project (directory) name. */
+export function planTitle(projectName: string, lang: "en" | "es"): string {
+  const name = projectName.trim() || "project";
+  return lang === "es" ? `Plan de ${name}` : `${name} Plan`;
+}
+
 /**
  * Parse plan tasks from model output text
  * Supports various formats:

@@ -1,8 +1,10 @@
 # t-plan — Implementation Plan Tracking for pi
 
-t-plan keeps a live, persistent implementation plan for every pi session. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a `plan.md` file in your project directory — so your plan survives restarts, session switches and compaction.
+t-plan keeps a live, persistent implementation plan for every pi session. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a **session-scoped plan file** in your project directory — so your plan survives restarts, session switches and compaction.
 
 The model gets a `plan_manager` tool plus automatic plan-context injection, so it can create, update and complete tasks itself. Progress detection also works without any tool calls: the extension reads the model's natural language (English **and** Spanish) and its tool activity to mark tasks in progress and done.
+
+**Per-session plans:** every plan file is bound to the pi session that created it (`plan_<title>_<session-id>.md`), so several pi instances can work on different plans in the same directory without ever colliding. Resuming a session brings its plan back; loading a foreign plan file tells you which session owns it and how to resume it.
 
 **Trimegisto integration:** with Trimegisto mode enabled, every task is classified by complexity and assigned a tier — **t1** (complex → deep thinking), **t2** (medium → solver), **t3** (simple → mechanical) — so the model launches each task on the right agent tier. Task timers show a live `HH:MM:SS` counter for every in-progress task.
 
@@ -11,8 +13,10 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 ## Features
 
 - **Auto-detect plans** from model output — numbered lists, checkboxes, step headers, plan sections
+- **Session-scoped plan files** — `plan_<title-slug>_<session-id>.md`: one file per pi session, zero collisions between parallel instances
+- **Session ↔ plan binding** — resuming a session restores its plan (and keeps writing the same file); loading another session's plan hints `pi --session <id>`
+- **Localized plan title** — `{project} Plan` / `Plan de {project}` following the conversation language; shown in the widget and used in the file name
 - **Live TUI widget** — compact, animated, always-visible progress above or below the editor
-- **Persistent `plan.md`** — written to the working directory and kept in sync as tasks progress
 - **Automatic progress tracking** — fuzzy bilingual (EN/ES) matching of completion/starting/removal language plus tool-call evidence; no `[DONE:n]` markers required
 - **Continuous plan refresh** — reconciles revised/updated/remaining plans the model publishes mid-project (new, renamed, split and removed tasks)
 - **Active-task invariant** — `in_progress` means *right now*: when the agent run settles, stale active tasks revert to pending
@@ -55,7 +59,7 @@ pi remove git:github.com/noguerol/plan
 1. Start (or continue) a conversation about a multi-step project.
 2. The model produces a plan — a numbered list, checkboxes or a `## Plan` section. t-plan detects it automatically and creates the task list.
 3. Watch the widget: tasks turn 🔄 in progress (with a live timer) as the model works on them and ✅ done as they complete — detected from its responses and tool activity.
-4. `plan.md` appears in your working directory and stays up to date.
+4. The session's plan file (`plan_<title>_<session>.md`) appears in your working directory and stays up to date.
 5. Correct or drive anything manually at any time:
 
 ```
@@ -65,6 +69,21 @@ pi remove git:github.com/noguerol/plan
 ```
 
 The extension is enabled by default. Toggle it anytime with `/t-plan` or `Ctrl+Alt+P`.
+
+## Session-Scoped Plan Files
+
+Each plan belongs to exactly one pi session, and its file name carries both the plan title and the session id:
+
+```
+plan_<title-slug>_<session-id>.md      e.g. plan_myapp_01a048c3.md
+```
+
+- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten.
+- **Parallel instances** — two pi processes in the same directory produce `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`; they never intersect.
+- **Resume a session → get its plan back.** Plan state rides in the session file, and updates keep landing on the same plan file.
+- **Load a plan → find its session.** `/t-plan load` lists every plan file in the directory (title, session id, task count, last modified). Picking one adopts its tasks into the current session, and if it belongs to another session the extension tells you how to jump back: `pi --session <id>`.
+- **Purge** (`/t-plan purge`) removes only this session's plan file.
+- Old single-file setups keep working: a legacy `plan.md` shows up in the `/t-plan load` picker.
 
 ## Trimegisto Mode
 
@@ -81,11 +100,11 @@ The extension is enabled by default. Toggle it anytime with `/t-plan` or `Ctrl+A
 - **Manual override** — `/task tier 3 t1` or the `tier` parameter of `plan_manager` (`"t0" | "t1" | "t2" | "t3" | "active"`).
 - **Availability-aware** — the extension reads `~/.pi/agent/trimegisto/config.json` and knows which tiers are actually spawnable (enabled + model configured, respecting `spawnOnlyOnActive`). Tasks assigned to an unavailable tier fall back to `t0` (`active`), so plans stay executable.
 - **LLM guidance** — the injected plan context lists each task's effective tier and instructs the model to launch tasks on their tier with the `trimegisto` tool, batching independent tasks in one call.
-- **Everywhere** — the widget shows colored `[tN]` badges plus a header distribution (`t1×1 t2×3 t3×2`), `plan.md` shows `(→ tN)` per task, and `/t-plan show` + `plan_manager list` show `→ tN`.
+- **Everywhere** — the widget shows colored `[tN]` badges plus a header distribution (`t1×1 t2×3 t3×2`), the plan file shows `(→ tN)` per task, and `/t-plan show` + `plan_manager list` show `→ tN`.
 
 ## Task Timers
 
-Every in-progress task can show a live `HH:MM:SS` counter since it started (spinner, badge and timer all update in real time). Completed tasks record their total time in `plan.md` as `(took HH:MM:SS)`. Toggle with `/t-plan config` → `Task timers`.
+Every in-progress task can show a live `HH:MM:SS` counter since it started (spinner, badge and timer all update in real time). Completed tasks record their total time in the plan file as `(took HH:MM:SS)`. Toggle with `/t-plan config` → `Task timers`.
 
 ## Commands
 
@@ -98,10 +117,10 @@ Every in-progress task can show a live `HH:MM:SS` counter since it started (spin
 | `/t-plan on` / `/t-plan off` | Enable/disable tracking |
 | `/t-plan show` | Display current plan status |
 | `/t-plan new` | Create a new (empty) plan |
-| `/t-plan load` | Load tasks from `plan.md` |
-| `/t-plan save` | Save tasks to `plan.md` |
+| `/t-plan load` | Pick a plan file in the directory and load it |
+| `/t-plan save` | Save tasks to this session's plan file |
 | `/t-plan clear` | Remove all tasks (keep state) |
-| `/t-plan purge` | Delete all tasks, reset state and remove `plan.md` |
+| `/t-plan purge` | Delete all tasks, reset state and remove this session's plan file |
 
 ### `/task` — manual task management
 
@@ -145,7 +164,7 @@ Long projects produce revised plans. When an assistant message contains an **upd
 - Existing tasks keep their IDs, timestamps and completed status where safe
 - New tasks are appended; renamed/refined tasks update their text
 - Unfinished tasks missing from an explicitly replacement plan are removed
-- Status-grouped `plan.md` sections round-trip with their correct statuses
+- Status-grouped plan file sections round-trip with their correct statuses
 
 ### Invariants
 
@@ -179,9 +198,9 @@ The extension registers a `plan_manager` tool the model can use to maintain the 
 
 Task status also updates automatically from the model's language and tool activity, so the plan stays in sync even when the model never calls the tool.
 
-## `plan.md` Format
+## Plan File Format
 
-The extension maintains a `plan.md` file in your working directory:
+The extension maintains one plan file per pi session in your working directory:
 
 ```markdown
 # Project Plan
@@ -222,7 +241,7 @@ Open with `/t-plan config`:
 | Auto-detect plans | ON | Detect plans in model output |
 | Show widget | ON | Display the task widget |
 | Widget placement | aboveEditor | Widget position (above/below editor) |
-| Plan filename | `plan.md` | Name of the plan file |
+| Plan file prefix | `plan` | Plan files: `<prefix>_<title>_<session>.md` |
 | Track agents | ON | Monitor parallel agent tasks |
 | Trimegisto mode | OFF | Tier classification + agent assignment per task |
 | Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
