@@ -1,0 +1,36 @@
+{
+  "name": "pi-plan-manager",
+  "version": "1.0.0",
+  "description": "Implementation plan tracking for pi: auto-detects plans from model output, tracks progress live in a TUI widget, keeps a persistent plan.md, and exposes a plan_manager tool so the model can update the plan itself. Bilingual (EN/ES) fuzzy progress detection.",
+  "keywords": [
+    "pi-package",
+    "plan",
+    "tasks",
+    "todo",
+    "project-management",
+    "tui",
+    "widget"
+  ],
+  "author": "Javier Noguerol <https://github.com/noguerol>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/noguerol/plan"
+  },
+  "homepage": "https://github.com/noguerol/plan",
+  "bugs": {
+    "url": "https://github.com/noguerol/plan/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}
