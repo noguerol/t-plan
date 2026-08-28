@@ -2,7 +2,7 @@
 
 t-plan keeps a live, persistent implementation plan for every pi session. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a **session-scoped plan file** in your project directory — so your plan survives restarts, session switches and compaction.
 
-The model gets a `plan_manager` tool plus automatic plan-context injection, so it can create, update and complete tasks itself. Progress detection also works without any tool calls: the extension reads the model's natural language (English **and** Spanish) and its tool activity to mark tasks in progress and done.
+The model gets a `plan_manager` tool plus automatic plan-context injection, so it can create, update and complete tasks itself. Progress detection also works without any tool calls: the extension reads the model's natural language (English, Spanish **and Mandarin Chinese**) and its tool activity to mark tasks in progress and done.
 
 **Per-session plans:** every plan file is bound to the pi session that created it (`plan_<title>_<session-id>.md`), so several pi instances can work on different plans in the same directory without ever colliding. Resuming a session brings its plan back; loading a foreign plan file tells you which session owns it and how to resume it.
 
@@ -15,9 +15,9 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 - **Auto-detect plans** from model output — numbered lists, checkboxes, step headers, plan sections
 - **Session-scoped plan files** — `plan_<title-slug>_<session-id>.md`: one file per pi session, zero collisions between parallel instances
 - **Session ↔ plan binding** — resuming a session restores its plan (and keeps writing the same file); loading another session's plan hints `pi --session <id>`
-- **Localized plan title** — `{project} Plan` / `Plan de {project}` following the conversation language; shown in the widget and used in the file name
+- **Localized plan title** — `{project} Plan` / `Plan de {project}` / `{project} 计划` following the conversation language; shown in the widget and used in the file name
 - **Live TUI widget** — compact, animated, always-visible progress above or below the editor
-- **Automatic progress tracking** — fuzzy bilingual (EN/ES) matching of completion/starting/removal language plus tool-call evidence; no `[DONE:n]` markers required
+- **Automatic progress tracking** — fuzzy trilingual (EN/ES/ZH Mandarin) matching of completion/starting/removal language plus tool-call evidence; no `[DONE:n]` markers required
 - **Continuous plan refresh** — reconciles revised/updated/remaining plans the model publishes mid-project (new, renamed, split and removed tasks)
 - **Active-task invariant** — `in_progress` means *right now*: when the agent run settles, stale active tasks revert to pending
 - **Work-conclusion invariant** — when the model concludes the whole work, nothing is left active or pending
@@ -78,7 +78,7 @@ Each plan belongs to exactly one pi session, and its file name carries both the 
 plan_<title-slug>_<session-id>.md      e.g. plan_myapp_01a048c3.md
 ```
 
-- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten.
+- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten.
 - **Parallel instances** — two pi processes in the same directory produce `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`; they never intersect.
 - **Resume a session → get its plan back.** Plan state rides in the session file, and updates keep landing on the same plan file.
 - **Load a plan → find its session.** `/t-plan load` lists every plan file in the directory (title, session id, task count, last modified). Picking one adopts its tasks into the current session, and if it belongs to another session the extension tells you how to jump back: `pi --session <id>`.
@@ -96,7 +96,7 @@ plan_<title-slug>_<session-id>.md      e.g. plan_myapp_01a048c3.md
 | `t3` | `[t3]` (simple) | Low | Parsing, formatting, translations, renames, docs, conversions |
 | `t0` | `[t0]` (active) | fallback | Default worker tier — used when the assigned tier is unavailable |
 
-- **Auto-classification** — new tasks are classified by a bilingual (EN/ES) weighted keyword heuristic. Ties and unknown texts land on `t2` (the catch-all implementation tier).
+- **Auto-classification** — new tasks are classified by a trilingual (EN/ES/ZH Mandarin) weighted keyword heuristic. Ties and unknown texts land on `t2` (the catch-all implementation tier).
 - **Manual override** — `/task tier 3 t1` or the `tier` parameter of `plan_manager` (`"t0" | "t1" | "t2" | "t3" | "active"`).
 - **Availability-aware** — the extension reads `~/.pi/agent/trimegisto/config.json` and knows which tiers are actually spawnable (enabled + model configured, respecting `spawnOnlyOnActive`). Tasks assigned to an unavailable tier fall back to `t0` (`active`), so plans stay executable.
 - **LLM guidance** — the injected plan context lists each task's effective tier and instructs the model to launch tasks on their tier with the `trimegisto` tool, batching independent tasks in one call.
@@ -152,7 +152,7 @@ Omit the identifier and the extension shows an interactive picker.
 The model rarely emits explicit markers, so the extension infers progress after every assistant turn from three signal classes:
 
 - **Explicit markers** — `[DONE:n]` lines and done checkboxes (`- [x] …`, `✅ …`, `✔️ …`)
-- **Natural language** — completion language ("implemented", "done", "añadido"…), starting language ("starting", "working on", "empezando"…), removal language ("dropped", "no longer needed"…) and whole-work conclusions ("all done", "todo listo"…), matched fuzzily against task text with token overlap, light stemming and ES↔EN synonym mapping
+- **Natural language** — completion language ("implemented", "done", "añadido", "已完成"…), starting language ("starting", "working on", "empezando", "正在"…), removal language ("dropped", "no longer needed", "移除"…) and whole-work conclusions ("all done", "todo listo", "全部完成"…), matched fuzzily against task text with token overlap, light stemming, Mandarin CJK shingles and ES/ZH↔EN synonym mapping
 - **Tool evidence** — tool calls and results of the turn (edited paths, command arguments) matched against each task's distinctive words
 
 Detection is deliberately **conservative**: weak signals never complete a task. You can always correct with `/task done N` or the `plan_manager` tool.
