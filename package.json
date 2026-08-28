@@ -1,7 +1,7 @@
 {
-  "name": "pi-plan-manager",
-  "version": "1.0.0",
-  "description": "Implementation plan tracking for pi: auto-detects plans from model output, tracks progress live in a TUI widget, keeps a persistent plan.md, and exposes a plan_manager tool so the model can update the plan itself. Bilingual (EN/ES) fuzzy progress detection.",
+  "name": "pi-t-plan",
+  "version": "2.0.0",
+  "description": "Implementation plan tracking for pi: auto-detects plans from model output, tracks progress live in a TUI widget, keeps a persistent plan.md, and exposes a plan_manager tool so the model can update the plan itself. Trimegisto mode classifies each task into t1/t2/t3 agent tiers; live HH:MM:SS timers for in-progress tasks. Bilingual (EN/ES) fuzzy progress detection.",
   "keywords": [
     "pi-package",
     "plan",
@@ -9,7 +9,10 @@
     "todo",
     "project-management",
     "tui",
-    "widget"
+    "widget",
+    "trimegisto",
+    "multi-agent",
+    "timer"
   ],
   "author": "Javier Noguerol <https://github.com/noguerol>",
   "license": "MIT",

@@ -3,6 +3,7 @@
  */
 
 import type { PlanTask, PlanState, TaskStatus } from "./types.ts";
+import { formatElapsed, tierBadge, tierColor } from "./tiers.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 /**
@@ -141,6 +142,10 @@ export function extractPlanTasks(text: string): PlanTask[] {
  */
 function cleanTaskText(text: string): string {
   return text
+    .replace(/\((?:→|->)\s*t[0-3]\)/gi, "")   // tier marker written by generatePlanMarkdown
+    .replace(/\(took\s+[\d:]+\)/gi, "")        // completion timer written by generatePlanMarkdown
+    .replace(/⏱\s*[\d:]+/g, "")                 // running timer written by generatePlanMarkdown
+    .replace(/\[t[0-3]\]/gi, "")                // tier badges
     .replace(/\*\*([^*]+)\*\*/g, "$1")  // Remove bold
     .replace(/\*([^*]+)\*/g, "$1")      // Remove italic
     .replace(/`([^`]+)`/g, "$1")        // Remove code
@@ -212,7 +217,12 @@ export function containsPlan(text: string): boolean {
 /**
  * Generate plan.md content from state
  */
-export function generatePlanMarkdown(state: PlanState): string {
+export interface PlanMarkdownOptions {
+  trimegisto?: boolean;  // include tier assignments
+  showTimers?: boolean;  // include elapsed-time counters
+}
+
+export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOptions = {}): string {
   const lines: string[] = [];
   
   lines.push(`# ${state.title}`);
@@ -245,12 +255,22 @@ export function generatePlanMarkdown(state: PlanState): string {
   const blockedTasks = state.tasks.filter(t => t.status === "blocked");
   const doneTasks = state.tasks.filter(t => t.status === "done");
 
+  const showTier = options.trimegisto === true;
+  const showTimers = options.showTimers !== false;
+  const now = Date.now();
+
+  const tierSuffix = (task: PlanTask): string => {
+    if (!showTier || !task.tier) return "";
+    return ` (→ ${task.tier})`;
+  };
+
   if (inProgressTasks.length > 0) {
     lines.push("## 🔄 In Progress");
     lines.push("");
     for (const task of inProgressTasks.sort((a, b) => a.order - b.order)) {
       const agent = task.agentName ? ` (agent: ${task.agentName})` : "";
-      lines.push(`- [ ] ${task.text}${agent}`);
+      const timer = showTimers && task.startedAt ? ` ⏱ ${formatElapsed(now - task.startedAt)}` : "";
+      lines.push(`- [ ] ${task.text}${timer}${tierSuffix(task)}${agent}`);
     }
     lines.push("");
   }
@@ -259,7 +279,7 @@ export function generatePlanMarkdown(state: PlanState): string {
     lines.push("## ⏳ Pending");
     lines.push("");
     for (const task of pendingTasks.sort((a, b) => a.order - b.order)) {
-      lines.push(`- [ ] ${task.text}`);
+      lines.push(`- [ ] ${task.text}${tierSuffix(task)}`);
     }
     lines.push("");
   }
@@ -269,7 +289,7 @@ export function generatePlanMarkdown(state: PlanState): string {
     lines.push("");
     for (const task of blockedTasks.sort((a, b) => a.order - b.order)) {
       const note = task.notes ? ` — ${task.notes}` : "";
-      lines.push(`- [ ] ${task.text}${note}`);
+      lines.push(`- [ ] ${task.text}${tierSuffix(task)}${note}`);
     }
     lines.push("");
   }
@@ -278,7 +298,10 @@ export function generatePlanMarkdown(state: PlanState): string {
     lines.push("## ✅ Completed");
     lines.push("");
     for (const task of doneTasks.sort((a, b) => a.order - b.order)) {
-      lines.push(`- [x] ${task.text}`);
+      const took = showTimers && task.startedAt && task.completedAt
+        ? ` (took ${formatElapsed(task.completedAt - task.startedAt)})`
+        : "";
+      lines.push(`- [x] ${task.text}${took}${tierSuffix(task)}`);
     }
     lines.push("");
   }
@@ -314,6 +337,9 @@ export interface FormatTaskForWidgetOptions {
   highlight?: boolean;
   spinnerFrame?: number;
   spinnerFrames?: string[];
+  showTier?: boolean;   // show trimegisto tier badge
+  showTimers?: boolean; // show elapsed timer on in-progress tasks
+  now?: number;         // current timestamp (injectable for tests)
 }
 
 /**
@@ -329,6 +355,18 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
   const rawAgent = task.agentName ? ` [${task.agentName}]` : "";
   const agent = task.agentName ? theme.fg?.("muted", rawAgent) ?? rawAgent : "";
   const spacer = task.status === "in_progress" ? " " : "";
+
+  const showTier = options.showTier === true;
+  const rawTier = showTier && task.tier ? ` ${tierBadge(task.tier)}` : "";
+  const tier = rawTier ? theme.fg?.(tierColor(task.tier), rawTier) ?? rawTier : "";
+
+  const showTimers = options.showTimers !== false;
+  const rawTimer =
+    showTimers && task.status === "in_progress" && task.startedAt
+      ? ` ⏱ ${formatElapsed((options.now ?? Date.now()) - task.startedAt)}`
+      : "";
+  const timer = rawTimer ? theme.fg?.("muted", rawTimer) ?? rawTimer : "";
+
   const head = `${prefix}${spacer}${marker}`;
   const headWidth = visibleWidth(head);
 
@@ -351,20 +389,20 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
 
   let text = styleText(task.text);
 
-  const line = `${head}${text}${agent}`;
+  const line = `${head}${text}${tier}${timer}${agent}`;
   const lineBudget = options.lineBudget ?? 70;
   if (options.compact === false || visibleWidth(line) <= lineBudget) {
     return line;
   }
 
-  // Keep the marker/icon and optional agent label stable, then truncate only
-  // the task text with a single ellipsis.
+  // Keep the marker/icon, tier badge, timer and agent label stable, then
+  // truncate only the task text with a single ellipsis.
   const rawText = task.text.replace(/\s+/g, " ").trim();
-  const agentWidth = visibleWidth(agent);
-  const textBudget = Math.max(8, lineBudget - headWidth - agentWidth - 1);
+  const suffixWidth = visibleWidth(tier) + visibleWidth(timer) + visibleWidth(agent);
+  const textBudget = Math.max(8, lineBudget - headWidth - suffixWidth - 1);
   const truncatedText = truncateToWidth(rawText, textBudget, "…");
   const styled = styleText(truncatedText);
-  return `${head}${styled}${agent}`;
+  return `${head}${styled}${tier}${timer}${agent}`;
 }
 
 /**
@@ -518,7 +556,6 @@ const SYNONYMS: Record<string, string> = {
   buscar: "search", b\u00fasqueda: "search",
   corregir: "fix", corregido: "fix",
   actualizar: "update", actualizado: "update",
-  a\u00f1adir: "add",
 };
 
 function normalizeToken(w: string): string {

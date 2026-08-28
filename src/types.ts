@@ -1,6 +1,10 @@
 /**
- * Types for the Plan extension
+ * Types for the t-plan extension
  */
+
+import type { Tier } from "./tiers.ts";
+
+export type { Tier } from "./tiers.ts";
 
 export type TaskStatus = "pending" | "in_progress" | "done" | "blocked";
 
@@ -15,6 +19,7 @@ export interface PlanTask {
   completedAt?: number;    // Timestamp when task completed
   notes?: string;          // Optional notes
   parentId?: string;       // For subtasks
+  tier?: Tier;             // Trimegisto tier assignment (t0/t1/t2/t3)
 }
 
 export interface PlanState {
@@ -39,6 +44,8 @@ export interface PlanConfig {
   animateWidget: boolean;  // Animate in-progress spinners and completion highlights
   compactTaskLines: boolean; // Truncate task lines to fit the widget width
   highlightCompleted: boolean; // Briefly highlight newly completed tasks before hiding them
+  trimegisto: boolean;     // Trimegisto mode: classify tasks into t1/t2/t3 tiers
+  showTimers: boolean;     // Show HH:MM:SS elapsed timers on in-progress tasks
 }
 
 export const DEFAULT_CONFIG: PlanConfig = {
@@ -51,6 +58,8 @@ export const DEFAULT_CONFIG: PlanConfig = {
   animateWidget: true,
   compactTaskLines: true,
   highlightCompleted: true,
+  trimegisto: false,
+  showTimers: true,
 };
 
 export const DEFAULT_STATE: PlanState = {
