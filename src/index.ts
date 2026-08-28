@@ -2,11 +2,15 @@
  * t-plan Extension for pi
  *
  * Manages implementation plans with task tracking, parallel agent support,
- * and persistent plan.md file generation.
+ * and persistent per-session plan files.
  *
  * Features:
  * - Auto-detect plans from model output
- * - Persistent plan.md file in working directory
+ * - Session-scoped plan file: <prefix>_<title-slug>_<session-id>.md —
+ *   parallel pi instances in the same directory never collide, and any plan
+ *   file traces back to the session that owns it (resume with pi --session)
+ * - Localized plan title ("{project} Plan" / "Plan de {project}") shown in
+ *   the widget and used in the file name
  * - TUI widget showing task progress
  * - Parallel agent task tracking
  * - Trimegisto mode: classifies tasks into t1 (complex) / t2 (medium) /
@@ -51,9 +55,16 @@ import {
   shouldReconcilePlan,
   shouldRemoveMissingTasksFromPlan,
   generateId,
+  detectLanguage,
+  deslugTitle,
+  parsePlanFileName,
+  planFileNameFor,
+  planTitle,
+  slugify,
+  titleToProjectName,
 } from "./utils.ts";
-import { readFile, writeFile, access, unlink, mkdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { readFile, writeFile, access, unlink, mkdir, readdir, stat } from "node:fs/promises";
+import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
 // Type guard for assistant messages
@@ -84,6 +95,10 @@ export default function planExtension(pi: ExtensionAPI): void {
   let tgConfig: TrimegistoFileConfig | null = null;
   // Global (cross-session) preferences from ~/.pi/agent/t-plan/config.json
   let globalConfigPartial: Partial<PlanConfig> = {};
+  // Current pi session id + the plan file last written for this session.
+  // Each session owns its plan file: <prefix>_<title-slug>_<session-id>.md
+  let sessionId: string | undefined;
+  let lastPlanFile: string | undefined;
 
   // ─── Global config file ───────────────────────────────────────────────
 
@@ -127,11 +142,41 @@ export default function planExtension(pi: ExtensionAPI): void {
     if (planEntry?.data) {
       if (planEntry.data.config) {
         // Precedence: session entry (newest) > global file > defaults.
-        config = { ...DEFAULT_CONFIG, ...globalConfigPartial, ...planEntry.data.config };
+        const merged = { ...DEFAULT_CONFIG, ...globalConfigPartial, ...planEntry.data.config } as PlanConfig & { planFileName?: string };
+        // v2 → v3 migration: planFileName (a full file name) became a prefix.
+        const saved = planEntry.data.config as PlanConfig & { planFileName?: string };
+        if (typeof saved.planFileName === "string" && saved.planFileName && saved.planFilePrefix === undefined) {
+          merged.planFilePrefix = saved.planFileName.replace(/\.md$/i, "");
+        }
+        delete merged.planFileName;
+        config = merged;
       }
       if (planEntry.data.state) {
-        state = { ...DEFAULT_STATE, ...planEntry.data.state };
+        const savedState = planEntry.data.state as PlanState & { titleAuto?: boolean };
+        state = { ...DEFAULT_STATE, ...savedState };
+        // v2 sessions have no titleAuto: treat a meaningful title as custom.
+        if (savedState.titleAuto === undefined) {
+          state.titleAuto = !(savedState.title && savedState.title !== "Project Plan");
+        }
+        if (state.title === "Project Plan") {
+          state.title = "";
+          state.titleAuto = true;
+        }
       }
+    }
+  }
+
+  /** Derive the localized default title ("{project} Plan" / "Plan de {project}")
+   *  from the working directory + the language of the given sample text.
+   *  Never overrides a user-set title (titleAuto === false). */
+  function ensureTitle(sampleText: string | undefined, ctx?: ExtensionContext): void {
+    if (!state.titleAuto) return;
+    const project = ctx ? basename(ctx.cwd) : "project";
+    const lang = sampleText ? detectLanguage(sampleText) : "en";
+    const next = planTitle(project, lang);
+    if (state.title !== next) {
+      state.title = next;
+      state.updatedAt = Date.now();
     }
   }
 
@@ -140,7 +185,18 @@ export default function planExtension(pi: ExtensionAPI): void {
   async function writePlanFile(cwd: string): Promise<void> {
     if (!config.enabled || state.tasks.length === 0) return;
 
-    const filePath = join(cwd, config.planFileName);
+    // Session-scoped file: <prefix>_<title-slug>_<session-id>.md — parallel pi
+    // instances in this directory never collide.
+    const fileName = planFileNameFor(config.planFilePrefix, state.title, sessionId);
+    const filePath = join(cwd, fileName);
+    // Title changed → this session's plan file moves; drop the stale one.
+    if (lastPlanFile && lastPlanFile !== filePath) {
+      try {
+        await unlink(lastPlanFile);
+      } catch {
+        // already gone
+      }
+    }
     // plan.md shows the EFFECTIVE tier (after availability fallback).
     const displayState: PlanState = config.trimegisto
       ? { ...state, tasks: state.tasks.map((t) => ({ ...t, tier: resolveEffectiveTier(t.tier, tgConfig) })) }
@@ -153,13 +209,14 @@ export default function planExtension(pi: ExtensionAPI): void {
     try {
       await writeFile(filePath, content, "utf-8");
       planFilePath = filePath;
+      lastPlanFile = filePath;
     } catch (err) {
       // Silent fail - file write is best-effort
     }
   }
 
   async function readPlanFile(cwd: string): Promise<boolean> {
-    const filePath = join(cwd, config.planFileName);
+    const filePath = join(cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId));
 
     try {
       await access(filePath);
@@ -168,6 +225,8 @@ export default function planExtension(pi: ExtensionAPI): void {
       if (tasks.length > 0) {
         state.tasks = tasks;
         state.updatedAt = Date.now();
+        planFilePath = filePath;
+        lastPlanFile = filePath;
         return true;
       }
     } catch {
@@ -315,7 +374,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 
       const lines: string[] = [
         truncateToWidth(
-          ctx.ui.theme.bold(ctx.ui.theme.fg("accent", `📋 ${state.title}`)) +
+          ctx.ui.theme.bold(ctx.ui.theme.fg("accent", `📋 ${state.title || "Plan"}`)) +
             `  ${ctx.ui.theme.fg("muted", `${done}/${total} done${inProgress > 0 ? ` • ${inProgress} active` : ""}${tierSummary}`)}`,
           78,
           "…"
@@ -461,6 +520,108 @@ export default function planExtension(pi: ExtensionAPI): void {
     }
   }
 
+  // ─── Plan File Picker (cross-session plan recovery) ───────────────────
+
+  interface PlanFileCandidate {
+    file: string;
+    name: string;
+    title: string;
+    sessionId: string | undefined;
+    mtimeMs: number;
+    taskCount: number;
+    isCurrentSession: boolean;
+  }
+
+  /** Scan the working directory for session-scoped plan files (+ legacy
+   *  <prefix>.md), newest first. */
+  async function scanPlanFiles(ctx: ExtensionContext): Promise<PlanFileCandidate[]> {
+    const out: PlanFileCandidate[] = [];
+    let names: string[] = [];
+    try {
+      names = await readdir(ctx.cwd);
+    } catch {
+      return out;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".md")) continue;
+      const parsed = parsePlanFileName(name, config.planFilePrefix);
+      const legacy = name === `${config.planFilePrefix}.md`;
+      if (!parsed && !legacy) continue;
+      const path = join(ctx.cwd, name);
+      try {
+        const st = await stat(path);
+        const content = await readFile(path, "utf-8");
+        const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+        const title = h1 || (parsed ? deslugTitle(parsed.titleSlug) : config.planFilePrefix);
+        const tasks = extractPlanTasks(content);
+        out.push({
+          file: path,
+          name,
+          title,
+          sessionId: parsed?.sessionId,
+          mtimeMs: st.mtimeMs,
+          taskCount: tasks.length,
+          isCurrentSession: !!parsed?.sessionId && !!sessionId && parsed.sessionId === sessionId.slice(0, 8),
+        });
+      } catch {
+        // unreadable — skip
+      }
+    }
+    return out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  }
+
+  /** Interactive picker over all plan files in the directory. Loading a plan
+   *  from ANOTHER session adopts its tasks+title here and hints how to resume
+   *  the owning session with `pi --session <id>`. */
+  async function pickAndLoadPlan(ctx: ExtensionContext): Promise<void> {
+    const candidates = await scanPlanFiles(ctx);
+    if (candidates.length === 0) {
+      ctx.ui.notify(`No plan files (${config.planFilePrefix}_*.md) in ${ctx.cwd}`, "warning");
+      return;
+    }
+
+    const fmt = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    const labels = candidates.map((c, i) => {
+      const mark = c.isCurrentSession ? " ← current" : "";
+      const sess = c.sessionId ? ` · session ${c.sessionId}` : "";
+      return `${i + 1}. ${c.title}${mark}${sess} · ${c.taskCount} tasks · ${fmt.format(c.mtimeMs)}`;
+    });
+    const choice = await ctx.ui.select("Load plan:", labels);
+    if (!choice) return;
+
+    const target = candidates[Number.parseInt(choice, 10) - 1];
+    if (!target) return;
+
+    try {
+      const content = await readFile(target.file, "utf-8");
+      const tasks = extractPlanTasks(content);
+      if (tasks.length === 0) {
+        ctx.ui.notify(`No tasks found in ${target.name}`, "warning");
+        return;
+      }
+      const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+      if (h1) {
+        state.title = h1;
+        state.titleAuto = false; // adopted title belongs to that project
+      }
+      state.tasks = tasks;
+      state.updatedAt = Date.now();
+      lastPlanFile = target.isCurrentSession ? target.file : undefined;
+      updateUI(ctx);
+      persistState();
+      await writePlanFile(ctx.cwd);
+      ctx.ui.notify(`Loaded ${tasks.length} tasks from ${target.name}`, "info");
+      if (target.sessionId && sessionId && target.sessionId !== sessionId.slice(0, 8)) {
+        ctx.ui.notify(
+          `This plan belongs to session ${target.sessionId} — resume it with: pi --session ${target.sessionId}`,
+          "info"
+        );
+      }
+    } catch (err) {
+      ctx.ui.notify(`Could not read ${target.name}`, "error");
+    }
+  }
+
   // ─── Commands ─────────────────────────────────────────────────────────
 
   // Main /t-plan command - toggle or show status
@@ -498,12 +659,15 @@ export default function planExtension(pi: ExtensionAPI): void {
       }
 
       if (subcommand === "new") {
+        ensureTitle(undefined, ctx);
         const title = await ctx.ui.input("Plan title:", state.title);
         if (title) {
           state.title = title;
+          state.titleAuto = false; // user owns this title now
           state.tasks = [];
           state.createdAt = Date.now();
           state.updatedAt = Date.now();
+          lastPlanFile = undefined; // next write lands on the new title's file
           ctx.ui.notify(`New plan created: ${title}`, "info");
           updateUI(ctx);
           persistState();
@@ -512,19 +676,14 @@ export default function planExtension(pi: ExtensionAPI): void {
       }
 
       if (subcommand === "load") {
-        const loaded = await readPlanFile(ctx.cwd);
-        if (loaded) {
-          ctx.ui.notify(`Loaded ${state.tasks.length} tasks from ${config.planFileName}`, "info");
-        } else {
-          ctx.ui.notify(`No plan file found at ${config.planFileName}`, "warning");
-        }
+        await pickAndLoadPlan(ctx);
         updateUI(ctx);
         return;
       }
 
       if (subcommand === "save" || subcommand === "export") {
         await writePlanFile(ctx.cwd);
-        ctx.ui.notify(`Plan saved to ${config.planFileName}`, "info");
+        ctx.ui.notify(`Plan saved to ${planFileNameFor(config.planFilePrefix, state.title, sessionId)}`, "info");
         return;
       }
 
@@ -543,7 +702,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       if (subcommand === "purge") {
         const ok = await ctx.ui.confirm(
           "Purge plan?",
-          "Delete ALL tasks, reset plan state, and remove plan.md from disk. This cannot be undone."
+          "Delete ALL tasks, reset plan state, and remove this session's plan file. This cannot be undone."
         );
         if (ok) {
           state = {
@@ -556,7 +715,8 @@ export default function planExtension(pi: ExtensionAPI): void {
           // Keep config preferences, but drop the persisted plan so it does
           // not come back on the next session restart.
           try {
-            await unlink(join(ctx.cwd, config.planFileName));
+            await unlink(join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId)));
+            lastPlanFile = undefined;
           } catch {
             // plan file may not exist
           }
@@ -582,10 +742,10 @@ export default function planExtension(pi: ExtensionAPI): void {
         { value: "config", label: "config", description: "Open configuration" },
         { value: "show", label: "show", description: "Show current plan" },
         { value: "new", label: "new", description: "Create new plan" },
-        { value: "load", label: "load", description: "Load plan from file" },
-        { value: "save", label: "save", description: "Save plan to file" },
+        { value: "load", label: "load", description: "Pick a plan file in this directory to load" },
+        { value: "save", label: "save", description: "Save plan to this session's plan file" },
         { value: "clear", label: "clear", description: "Clear all tasks" },
-        { value: "purge", label: "purge", description: "Purge plan: delete all tasks and plan file" },
+        { value: "purge", label: "purge", description: "Purge plan: delete all tasks and this session's plan file" },
       ];
       const filtered = subcommands.filter((s) => s.value.startsWith(prefix));
       return filtered.length > 0 ? filtered : null;
@@ -609,8 +769,10 @@ export default function planExtension(pi: ExtensionAPI): void {
         if (!text) {
           const input = await ctx.ui.input("Task description:", "");
           if (!input) return;
+          ensureTitle(input, ctx);
           addTask(input);
         } else {
+          ensureTitle(text, ctx);
           addTask(text);
         }
         ctx.ui.notify("Task added", "info");
@@ -896,7 +1058,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       `${config.autoDetect ? "✅" : "❌"} Auto-detect plans: ${config.autoDetect ? "ON" : "OFF"}`,
       `${config.showWidget ? "✅" : "❌"} Show widget: ${config.showWidget ? "ON" : "OFF"}`,
       `📐 Widget placement: ${config.widgetPlacement}`,
-      `📄 Plan filename: ${config.planFileName}`,
+      `📄 Plan file prefix: ${config.planFilePrefix}`,
       `${config.trackAgents ? "✅" : "❌"} Track agents: ${config.trackAgents ? "ON" : "OFF"}`,
       `${config.trimegisto ? "✅" : "❌"} Trimegisto mode: ${config.trimegisto ? "ON" : "OFF"}`,
       `${config.showTimers ? "✅" : "❌"} Task timers: ${config.showTimers ? "ON" : "OFF"}`,
@@ -907,7 +1069,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       "💾 Save plan to file",
       "📂 Load plan from file",
       "🗑️ Clear all tasks",
-      "🧹 Purge plan (reset state + delete plan.md)",
+      "🧹 Purge plan (reset state + delete this session's plan file)",
     ];
 
     const choice = await ctx.ui.select("Plan Configuration:", options);
@@ -926,9 +1088,12 @@ export default function planExtension(pi: ExtensionAPI): void {
     } else if (choice.includes("Widget placement")) {
       config.widgetPlacement = config.widgetPlacement === "aboveEditor" ? "belowEditor" : "aboveEditor";
       state.widgetPlacement = config.widgetPlacement;
-    } else if (choice.includes("Plan filename")) {
-      const name = await ctx.ui.input("Filename:", config.planFileName);
-      if (name) config.planFileName = name;
+    } else if (choice.includes("Plan file prefix")) {
+      const name = await ctx.ui.input("File prefix (files: <prefix>_<title>_<session>.md):", config.planFilePrefix);
+      if (name) {
+        config.planFilePrefix = slugify(name) || "plan";
+        lastPlanFile = undefined; // next write lands under the new prefix
+      }
     } else if (choice.includes("Track agents")) {
       config.trackAgents = !config.trackAgents;
     } else if (choice.includes("Trimegisto mode")) {
@@ -963,7 +1128,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       config.highlightCompleted = !config.highlightCompleted;
     } else if (choice.includes("Save plan")) {
       await writePlanFile(ctx.cwd);
-      ctx.ui.notify(`Saved to ${config.planFileName}`, "info");
+      ctx.ui.notify(`Saved to ${planFileNameFor(config.planFilePrefix, state.title, sessionId)}`, "info");
     } else if (choice.includes("Load plan")) {
       const loaded = await readPlanFile(ctx.cwd);
       ctx.ui.notify(loaded ? "Plan loaded" : "No plan file found", loaded ? "info" : "warning");
@@ -976,18 +1141,20 @@ export default function planExtension(pi: ExtensionAPI): void {
     } else if (choice.includes("Purge plan")) {
       const ok = await ctx.ui.confirm(
         "Purge plan?",
-        "Delete all tasks, reset state, and remove plan.md from disk?"
+        "Delete all tasks, reset state, and remove this session's plan file?"
       );
       if (ok) {
         state = {
           ...DEFAULT_STATE,
           tasks: [],
-          title: DEFAULT_STATE.title,
+          title: "",
+          titleAuto: true,
           createdAt: Date.now(),
           updatedAt: Date.now(),
         };
         try {
-          await unlink(join(ctx.cwd, config.planFileName));
+          await unlink(join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId)));
+          lastPlanFile = undefined;
         } catch {
           // plan file may not exist
         }
@@ -1087,16 +1254,25 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   // ─── Event Handlers ───────────────────────────────────────────────────
 
-  // Session start - restore state
+  // Session start - restore state (also fires on /new, /resume, /fork, /reload)
   pi.on("session_start", async (_event, ctx) => {
     globalConfigPartial = await loadGlobalConfig();
     tgConfig = readTrimegistoConfig();
+    sessionId = ctx.sessionManager.getSessionId();
+    lastPlanFile = undefined;
     const entries = ctx.sessionManager.getEntries();
     // Global prefs form the base; session entries (if any) override.
     config = { ...DEFAULT_CONFIG, ...globalConfigPartial };
+    const hadSessionState = entries.some((e: any) => e.type === "custom" && e.customType === "plan-state");
+    if (!hadSessionState) {
+      // Fresh session (new run, /new): clean plan state so parallel sessions
+      // in the same directory never inherit each other's plans.
+      state = { ...DEFAULT_STATE, tasks: [], createdAt: Date.now(), updatedAt: Date.now() };
+    }
     restoreState(entries);
+    ensureTitle(undefined, ctx);
 
-    // Try to load plan.md if no tasks
+    // Try to load this session's plan file if no tasks
     if (state.tasks.length === 0 && config.enabled) {
       await readPlanFile(ctx.cwd);
     }
@@ -1118,6 +1294,7 @@ export default function planExtension(pi: ExtensionAPI): void {
         config.trimegisto ? ` (→ ${resolveEffectiveTier(t.tier, tgConfig)})` : "";
 
       let planContext = "[PLAN TRACKING ACTIVE]\n\n";
+      planContext += `Plan: ${state.title} (file: ${planFileNameFor(config.planFilePrefix, state.title, sessionId)})\n\n`;
 
       if (config.trimegisto) {
         const available = (["t0", "t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
@@ -1183,6 +1360,7 @@ export default function planExtension(pi: ExtensionAPI): void {
     if (config.autoDetect && state.tasks.length === 0 && containsPlan(text)) {
       const tasks = extractPlanTasks(text);
       if (tasks.length >= 3) {
+        ensureTitle(text, ctx); // title follows the plan's language
         state.tasks = tasks;
         if (config.trimegisto) {
           for (const t of state.tasks) {
@@ -1230,6 +1408,7 @@ export default function planExtension(pi: ExtensionAPI): void {
             removeMissing: shouldRemoveMissingTasksFromPlan(text),
           });
           if (refresh.changed) {
+            ensureTitle(text, ctx);
             state.tasks = refresh.tasks;
             if (config.trimegisto) {
               // Newly added tasks arrive without a tier — classify them.
@@ -1433,6 +1612,7 @@ export default function planExtension(pi: ExtensionAPI): void {
             return { content: [{ type: "text", text: "task_text is required for add action" }], details: {} };
           }
           const tier = params.tier ? toolValueToTier(params.tier) : undefined;
+          ensureTitle(params.task_text, ctx);
           const task = addTask(params.task_text, "pending", undefined, tier);
           updateUI(ctx);
           persistState();
