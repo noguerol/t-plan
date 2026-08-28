@@ -1,3 +1,9 @@
+<div align="center">
+
+![t-plan banner](docs/banner.png)
+
+</div>
+
 # t-plan — Implementation Plan Tracking for pi
 
 t-plan keeps a live, persistent implementation plan for every pi session. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a **session-scoped plan file** in your project directory — so your plan survives restarts, session switches and compaction.
