@@ -1,26 +1,12 @@
-/**
- * Utility functions for the Plan extension
- */
 
 import type { PlanTask, PlanState, TaskStatus } from "./types.ts";
 import { formatElapsed, tierBadge, tierColor } from "./tiers.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
-/**
- * Generate a unique ID for tasks
- */
 export function generateId(): string {
   return `task_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-// ─── Session-scoped plan files ──────────────────────────────────────────────
-//
-// Every pi session owns its plan file: <prefix>_<title-slug>_<session-id>.md
-// (e.g. plan_myapp_01a048c3.md). Multiple pi instances working in the same
-// directory therefore never collide, and a plan file can always be traced
-// back to the session that created it.
-
-/** Normalize a title into a filename-safe slug ("Mi Proyecto!" → "mi-proyecto"). */
 export function slugify(text: string): string {
   return text
     .normalize("NFD")
@@ -32,8 +18,6 @@ export function slugify(text: string): string {
     .replace(/-+$/g, "");
 }
 
-/** Title → project name, dropping the localized "Plan" wrapper
- *  ("myapp Plan" → "myapp", "Plan de myapp" → "myapp", "myapp 计划" → "myapp"). */
 export function titleToProjectName(title: string): string {
   const stripped = title
     .replace(/^plan\s+de\s+/i, "")
@@ -45,7 +29,6 @@ export function titleToProjectName(title: string): string {
   return stripped || title;
 }
 
-/** Build the session-scoped plan file name: <prefix>_<title-slug>_<session-id>.md */
 export function planFileNameFor(prefix: string, title: string, sessionId: string | undefined): string {
   const slug = slugify(titleToProjectName(title)) || "untitled";
   const id = sessionId ? sessionId.replace(/[^0-9a-zA-Z]/g, "").slice(0, 8) : "noid";
@@ -54,13 +37,11 @@ export function planFileNameFor(prefix: string, title: string, sessionId: string
 
 export interface ParsedPlanFileName {
   titleSlug: string;
-  /** Short (8-char) session id baked into the name, when present. */
-  sessionId: string | undefined;
+    sessionId: string | undefined;
 }
 
 const SHORT_ID_RE = "[0-9a-zA-Z]{6,12}|noid";
 
-/** Parse a session-scoped plan file name produced by planFileNameFor. */
 export function parsePlanFileName(name: string, prefix: string): ParsedPlanFileName | null {
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const re = new RegExp(`^${escaped}_(?<slug>.+)_(?<id>${SHORT_ID_RE})\\.md$`, "i");
@@ -72,7 +53,6 @@ export function parsePlanFileName(name: string, prefix: string): ParsedPlanFileN
   };
 }
 
-/** De-slug a title slug for display when the file has no readable title ("mi-app" → "Mi App"). */
 export function deslugTitle(slug: string): string {
   return slug
     .split(/[-_]+/)
@@ -80,10 +60,6 @@ export function deslugTitle(slug: string): string {
     .map((w) => (w.length <= 2 ? w : w[0].toUpperCase() + w.slice(1)))
     .join(" ");
 }
-
-// ─── Language detection (for localized plan titles) ────────────────────
-// The extension UI is English, but plan titles and tasks follow the language
-// the user and the model are using.
 
 export type PlanLanguage = "en" | "es" | "zh";
 
@@ -93,7 +69,6 @@ const EN_WORDS = /\b(?:the|and|for|with|from|that|this|these|those|of|to|into|ta
 const ZH_CHARS = /[\u3400-\u9FFF]/g;
 const ZH_WORDS = /(?:计划|任务|步骤|待办|完成|实现|添加|新增|创建|更新|修复|设计|架构|文档|配置|测试|接口|端点|模块|组件|审查|分析|调试|部署|安装|普通话|国语|中文|汉语)/g;
 
-/** Best-effort language detection of plan/task text ("en" | "es" | "zh"). */
 export function detectLanguage(text: string): PlanLanguage {
   if (!text) return "en";
   const accents = (text.match(ES_ACCENTS)?.length ?? 0) * 2;
@@ -106,7 +81,6 @@ export function detectLanguage(text: string): PlanLanguage {
   return accents + esWords > enWords ? "es" : "en";
 }
 
-/** Localized default plan title for a project (directory) name. */
 export function planTitle(projectName: string, lang: PlanLanguage): string {
   const name = projectName.trim() || "project";
   if (lang === "es") return `Plan de ${name}`;
@@ -114,27 +88,14 @@ export function planTitle(projectName: string, lang: PlanLanguage): string {
   return `${name} Plan`;
 }
 
-/**
- * Parse plan tasks from model output text
- * Supports various formats:
- * - Numbered lists: "1. Task description"
- * - Checkbox style: "- [ ] Task" or "- [x] Task"
- * - Dash lists: "- Task description"
- * - Headers with steps: "## Step 1: Description" or "## 步骤 1：描述"
- */
 export function extractPlanTasks(text: string): PlanTask[] {
   const tasks: PlanTask[] = [];
   const lines = text.split("\n");
   
-  // Patterns to match plan items
   const patterns = [
-    // Numbered: "1. Task", "1) Task", or "1、任务"
     /^\s*(\d+)[.)、．]\s*(.+)$/,
-    // Checkbox: "- [ ] Task" or "- [x] Task" or "- [X] Task"
     /^\s*[-*]\s+\[([ xX])\]\s+(.+)$/,
-    // Step header: "## Step 1: Description", "### 步骤 1 - 描述", or "## 第1步：描述"
     /^#{1,4}\s+(?:(?:Step|步骤)\s*(\d+)|第\s*(\d+)\s*步)[:：\s-]+(.+)$/i,
-    // Plan header followed by items
     /^\s*[-*]\s+(.+)$/,
   ];
 
@@ -146,8 +107,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
     const line = lines[i];
     const headingStatus = statusFromHeading(line);
     
-    // Detect plan/status section headers. Generated plan.md groups tasks by
-    // status, so keep that status while parsing the following list items.
     if (headingStatus) {
       inPlanSection = true;
       planSectionFound = true;
@@ -162,7 +121,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
       continue;
     }
 
-    // Stop at the next unrelated major section.
     if (inPlanSection && /^#{1,2}\s+(?!(?:Step|步骤|第\s*\d+\s*步))/i.test(line) && planSectionFound) {
       if (!/^#{1,4}\s+(?:(?:Step|步骤)\s*\d+|第\s*\d+\s*步)/i.test(line)) {
         inPlanSection = false;
@@ -170,7 +128,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
       }
     }
 
-    // Try numbered pattern first (most common)
     const numberedMatch = line.match(patterns[0]);
     if (numberedMatch && (inPlanSection || !planSectionFound)) {
       const step = parseInt(numberedMatch[1]);
@@ -186,7 +143,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
       continue;
     }
 
-    // Try checkbox pattern
     const checkboxMatch = line.match(patterns[1]);
     if (checkboxMatch) {
       const isDone = checkboxMatch[1].toLowerCase() === "x";
@@ -202,7 +158,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
       continue;
     }
 
-    // Try step header pattern
     const stepMatch = line.match(patterns[2]);
     if (stepMatch) {
       const step = parseInt(stepMatch[1] ?? stepMatch[2] ?? "0");
@@ -218,7 +173,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
       continue;
     }
 
-    // Try dash list in plan section
     if (inPlanSection) {
       const dashMatch = line.match(patterns[3]);
       if (dashMatch) {
@@ -238,9 +192,6 @@ export function extractPlanTasks(text: string): PlanTask[] {
   return tasks;
 }
 
-/**
- * Clean task text by removing markdown formatting
- */
 function cleanTaskText(text: string): string {
   return text
     .replace(/\((?:→|->)\s*t[0-3]\)/gi, "")   // tier marker written by generatePlanMarkdown
@@ -273,8 +224,6 @@ function statusFromHeading(line: string): TaskStatus | undefined {
   const heading = headingText(line);
   if (!heading) return undefined;
 
-  // "## Status: 3/7 completed" / "## 状态：3/7 已完成" are summary headings,
-  // not completed-task sections.
   if (/^(?:Status|Estado)\b/i.test(heading) || /^状态[:：\s]?/u.test(heading)) return undefined;
 
   if (/(?:待办|待处理|未完成|剩余|下一步|接下来)/u.test(heading)) {
@@ -295,22 +244,16 @@ function statusFromHeading(line: string): TaskStatus | undefined {
   return undefined;
 }
 
-/**
- * Detect if text contains a plan structure
- */
 export function containsPlan(text: string): boolean {
-  // Check for plan section headers (including generated plan.md status groups)
   if (text.split("\n").some((line) => isPlanSectionHeading(line) || statusFromHeading(line))) {
     return true;
   }
 
-  // Check for multiple numbered items (3+ suggests a plan)
   const numberedItems = text.match(/^\s*\d+[.)]\s+.+$/gm);
   if (numberedItems && numberedItems.length >= 3) {
     return true;
   }
 
-  // Check for multiple checkbox items
   const checkboxItems = text.match(/^\s*[-*]\s+\[[ xX]\]\s+.+$/gm);
   if (checkboxItems && checkboxItems.length >= 3) {
     return true;
@@ -319,9 +262,6 @@ export function containsPlan(text: string): boolean {
   return false;
 }
 
-/**
- * Generate plan.md content from state
- */
 export interface PlanMarkdownOptions {
   trimegisto?: boolean;  // include tier assignments
   showTimers?: boolean;  // include elapsed-time counters
@@ -338,7 +278,6 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("");
   }
 
-  // Status summary
   const total = state.tasks.length;
   const done = state.tasks.filter(t => t.status === "done").length;
   const inProgress = state.tasks.filter(t => t.status === "in_progress").length;
@@ -354,7 +293,6 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   if (done > 0) lines.push(`- ✅ Completed: ${done}`);
   lines.push("");
 
-  // Tasks grouped by status
   const inProgressTasks = state.tasks.filter(t => t.status === "in_progress");
   const pendingTasks = state.tasks.filter(t => t.status === "pending");
   const blockedTasks = state.tasks.filter(t => t.status === "blocked");
@@ -411,7 +349,6 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("");
   }
 
-  // Footer
   lines.push("---");
   lines.push(`*Last updated: ${new Date(state.updatedAt).toLocaleString()}*`);
   lines.push("");
@@ -420,9 +357,6 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   return lines.join("\n");
 }
 
-/**
- * Format task status icon
- */
 export function getStatusIcon(status: TaskStatus): string {
   switch (status) {
     case "done": return "✅";
@@ -449,9 +383,6 @@ export interface FormatTaskForWidgetOptions {
   now?: number;         // current timestamp (injectable for tests)
 }
 
-/**
- * Format task for display in widget as a single compact line.
- */
 export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, task: PlanTask, options: FormatTaskForWidgetOptions & { compact?: boolean } = {}): string {
   const theme = ctx.ui.theme;
   const spinnerFrames = options.spinnerFrames ?? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -503,8 +434,6 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
     return line;
   }
 
-  // Keep the marker/icon, tier badge, timer and agent label stable, then
-  // truncate only the task text with a single ellipsis.
   const rawText = task.text.replace(/\s+/g, " ").trim();
   const suffixWidth = visibleWidth(tier) + visibleWidth(timer) + visibleWidth(agent);
   const textBudget = Math.max(8, lineBudget - headWidth - suffixWidth - 1);
@@ -513,24 +442,17 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
   return `${head}${styled}${tier}${timer}${agent}`;
 }
 
-/**
- * Parse DONE markers from agent output
- * Supports: [DONE:task_id], [DONE:1], ✅ task text
- */
 export function parseDoneMarkers(text: string, tasks: PlanTask[]): string[] {
   const completedIds: string[] = [];
   
-  // Match [DONE:id] or [DONE:1]
   const doneIdMatches = text.matchAll(/\[DONE:([^\]]+)\]/gi);
   for (const match of doneIdMatches) {
     const identifier = match[1];
-    // Try as task ID first
     const taskById = tasks.find(t => t.id === identifier);
     if (taskById) {
       completedIds.push(taskById.id);
       continue;
     }
-    // Try as step number
     const stepNum = parseInt(identifier);
     if (!isNaN(stepNum)) {
       const taskByOrder = tasks.find(t => t.order === stepNum);
@@ -543,11 +465,6 @@ export function parseDoneMarkers(text: string, tasks: PlanTask[]): string[] {
   return completedIds;
 }
 
-/**
- * Skip "summary" lines that appear inside generated plan.md files
- * (e.g. "- ✅ Completed: 3", "- 🔄 In progress: 2", "- ✅ 已完成：3").
- * These are status counters, not tasks, and pollute the task list when the file is loaded.
- */
 function isSummaryLine(text: string): boolean {
   if (/^(?:🔄|⏳|🚫|✅|📋|📈|⚡)\s*(?:In progress|Pending|Blocked|Completed|Progress|Status|进行中|待办|阻塞|已完成|完成|进度|状态)/iu.test(text)) {
     return true;
@@ -558,13 +475,9 @@ function isSummaryLine(text: string): boolean {
   return false;
 }
 
-/**
- * Detect agent spawning patterns in text
- */
 export function detectAgentTasks(text: string): Array<{ agentId: string; agentName: string; taskDescription: string }> {
   const agents: Array<{ agentId: string; agentName: string; taskDescription: string }> = [];
   
-  // Match patterns like "Launching agent for X" or "Spawning agent: X"
   const spawnPatterns = [
     /(?:launching|spawning|starting)\s+agent\s+(?:for|to|:)\s*(.+)/gi,
     /Agent\s+\(([^)]+)\)\s+(?:started|launched|working on)\s*:?\s*(.+)/gi,
@@ -584,17 +497,6 @@ export function detectAgentTasks(text: string): Array<{ agentId: string; agentNa
   return agents;
 }
 
-// ─── Auto-transition detection ─────────────────────────────────────────
-//
-// The model rarely emits explicit [DONE:n] markers, so we also detect task
-// progress from natural language and tool activity:
-//   - Lines like "- [x] …", "✅ …", "✔️ …"  → task completed
-//   - Segments with completion verbs ("implemented", "done", "finished"…)
-//     that mention a task (fuzzy text match or "task N" references)
-//   - Segments with starting language ("starting", "working on"…)
-//   - Tool calls whose names/arguments contain the task's distinctive words
-//     → task marked in_progress
-
 const COMPLETION_PATTERN = /(?:\b(?:done|complete|completed|finished|implemented|added|created|fixed|resolved|closed|landed|ready|accomplished|wrapped|pass(?:es|ed|ing)?|terminad[oa]|completad[oa]|hech[oa]|implementad[oa]|agregad[oa]|cread[oa]|arreglad[oa]|resuelt[oa]|a\u00f1adid[oa]|incluid[oa]|conseguid[oa]|listo)\b|(?:已完成|完成了|(?<!未)完成|做完|搞定|实现了|已实现|添加了|已添加|新增了|已新增|创建了|已创建|修复了|已修复|解决了|已解决|通过了|已通过|准备好了|就绪))/i;
 
 const START_PATTERN = /(?:\b(?:start(?:ed|ing)?|working\s+on|work\s+on|in\s+progress|begin(?:ning)?|began|on\s+it|empezad[oa]|trabajando\s+en|en\s+progreso|comenzand[oa])\b|(?:开始|已开始|正在|着手|处理中|进行中|我来做|我在做))/i;
@@ -607,7 +509,6 @@ const CJK_TEXT_RE = /[\u3400-\u9FFF]/u;
 const WORD_OR_CJK_RE = /[a-z0-9áéíóúñü]+|[\u3400-\u9FFF]+/giu;
 
 const STOPWORDS = new Set([
-  // English
   "the", "and", "but", "for", "with", "from", "that", "this", "these", "those",
   "have", "has", "had", "was", "were", "been", "being", "not", "you", "your",
   "are", "can", "will", "just", "also", "all", "any", "some", "into", "over",
@@ -620,7 +521,6 @@ const STOPWORDS = new Set([
   "used", "need", "wants", "want", "like", "look", "see", "going", "go", "went",
   "know", "think", "much", "many", "still", "well", "even", "back", "here",
   "then", "them", "they", "their", "there", "its", "it's",
-  // Spanish
   "que", "para", "por", "con", "sin", "los", "las", "una", "unas", "unos",
   "del", "esta", "este", "esto", "ese", "esa", "eso", "pero", "como", "cuando",
   "donde", "muy", "bien", "todo", "toda", "cada", "entre", "hacia", "desde",
@@ -628,13 +528,11 @@ const STOPWORDS = new Set([
   "haber", "tener", "hacer", "otro", "otra", "otros", "otras", "mas", "ya",
   "les", "sus", "mis", "tus", "nos", "vamos", "voy", "ver", "decir", "quiero",
   "puedo", "podemos", "vamos", "estoy", "esta", "estan", "tenemos", "hace",
-  // Mandarin / Chinese function words (used when short CJK chunks are tokenized)
   "的", "了", "和", "与", "及", "在", "是", "我", "我们", "你", "你们", "他", "她", "它",
   "这", "这个", "这些", "那", "那个", "那些", "就", "也", "都", "很", "更", "还", "要",
   "把", "被", "给", "对", "从", "到", "为", "并", "或", "而", "但", "如果", "然后",
 ]);
 
-/** Light stemming: strip common English/Spanish suffixes. Mandarin tokens are left intact. */
 function stem(w: string): string {
   if (CJK_TEXT_RE.test(w) || w.length <= 4) return w;
   let s = w
@@ -645,10 +543,6 @@ function stem(w: string): string {
   return s.length < 3 ? w : s;
 }
 
-/**
- * Common ES/ZH↔EN vocabulary so trilingual responses still match English tasks.
- * Keys are the stemmed token or exact Mandarin phrase; values the canonical English stem.
- */
 const SYNONYMS: Record<string, string> = {
   purga: "purge", purgar: "purge", purgado: "purge",
   a\u00f1ad: "add", a\u00f1adir: "add", a\u00f1adido: "add", a\u00f1adida: "add",
@@ -700,8 +594,6 @@ function addCjkToken(tokens: Set<string>, chunk: string): void {
   for (const phrase of ZH_SYNONYM_PHRASES) {
     if (chunk.includes(phrase)) tokens.add(SYNONYMS[phrase]);
   }
-  // Small shingles make Mandarin task text match even when particles split phrases
-  // differently between the task and the assistant's progress sentence.
   for (const size of [2, 3]) {
     if (chars.length < size) continue;
     for (let i = 0; i <= chars.length - size; i++) {
@@ -711,7 +603,6 @@ function addCjkToken(tokens: Set<string>, chunk: string): void {
   }
 }
 
-/** Tokenize + stem + remove stopwords, keeping Latin tokens with 3+ chars and Mandarin chunks/shingles. */
 function tokenize(text: string): Set<string> {
   const tokens = new Set<string>();
   const lower = text.toLowerCase();
@@ -729,7 +620,6 @@ function tokenize(text: string): Set<string> {
   return tokens;
 }
 
-/** Exact match after stemming, or substring containment for longer words. */
 function tokensMatch(a: string, b: string): boolean {
   if (a === b) return true;
   if (a.length >= 4 && b.length > a.length && b.includes(a)) return true;
@@ -737,10 +627,6 @@ function tokensMatch(a: string, b: string): boolean {
   return false;
 }
 
-/**
- * Score how well a candidate text (statement/segment/corpus) matches a task.
- * Weighted recall+precision of the task's distinctive tokens.
- */
 export function taskTextScore(taskText: string, candidate: string): number {
   const taskTokens = tokenize(taskText);
   const candidateTokens = tokenize(candidate);
@@ -875,8 +761,6 @@ export function reconcilePlanTasks(
   for (const task of [...current].sort((a, b) => a.order - b.order)) {
     if (matchedCurrent.has(task.id)) continue;
 
-    // A refreshed/remaining plan should drop stale unfinished tasks, while
-    // completed history is preserved unless the assistant explicitly removes it.
     if (options.removeMissing && task.status !== "done") {
       removed++;
       continue;
@@ -885,7 +769,6 @@ export function reconcilePlanTasks(
     nextTasks.push({ ...task, order: appendStart + (nextTasks.length - appendStart) + 1 });
   }
 
-  // Ensure final order is contiguous even after removals/appends.
   nextTasks.forEach((task, index) => (task.order = index + 1));
 
   return {
@@ -951,12 +834,6 @@ export interface AutoTransitions {
   startedIds: string[];
 }
 
-/**
- * Detect task progress from an assistant turn: natural language + tool evidence.
- * Returns task IDs that should be marked done / in_progress. Conservative by
- * design: only strong signals (verb + text match, explicit done lines, or
- * distinctive tool-call evidence) trigger transitions.
- */
 export function detectAutoTransitions(text: string, toolCorpus: string, tasks: PlanTask[]): AutoTransitions {
   const completedIds: string[] = [];
   const startedIds: string[] = [];
@@ -964,7 +841,6 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
   const active = tasks.filter((t) => t.status === "pending" || t.status === "in_progress");
   if (active.length === 0) return { completedIds, startedIds };
 
-  // 1. Explicit done lines: "- [x] …", "✅ …", "✔️ …", "☑️ …", "✓ …"
   for (const line of text.split(/\n+/)) {
     const m = line.match(DONE_LINE_PREFIX);
     if (!m) continue;
@@ -974,25 +850,21 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
 
   const segments = splitSegments(text);
 
-  // 2. Segments with completion language
   for (const segment of segments) {
     if (!COMPLETION_PATTERN.test(segment)) continue;
 
-    // 2a. Numbered references: "task 3 done", "step 2 is complete"
     for (const ref of segment.matchAll(TASK_NUMBER_REF)) {
       const order = parseInt(ref[1] ?? ref[2] ?? "0", 10);
       const task = active.find((t) => t.order === order);
       if (task && !completedIds.includes(task.id)) completedIds.push(task.id);
     }
 
-    // 2b. Fuzzy text match (all tasks passing the threshold)
     for (const task of active) {
       if (completedIds.includes(task.id)) continue;
       if (taskTextScore(task.text, segment) >= 0.55) completedIds.push(task.id);
     }
   }
 
-  // 3. Starting language → in_progress (best single match per turn)
   for (const segment of segments) {
     if (!START_PATTERN.test(segment)) continue;
     const candidates = active.filter(
@@ -1002,7 +874,6 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
     if (best) startedIds.push(best.id);
   }
 
-  // 4. Tool-call evidence → the task is being worked on
   const corpusTokens = toolCorpus && toolCorpus.trim() ? tokenize(toolCorpus) : new Set<string>();
   if (corpusTokens.size > 0) {
     const candidates = tasks.filter(
@@ -1038,28 +909,15 @@ export function detectAutoTransitions(text: string, toolCorpus: string, tasks: P
   return { completedIds, startedIds };
 }
 
-// A "generic" completion signal means the model is telling the user that the
-// work it was doing is finished, without necessarily naming a specific task
-// (e.g. "all done", "everything is complete", "la tarea está terminada",
-// "任务已完成"). Used to resolve tasks that are still marked in_progress when the model stops.
 const GENERIC_COMPLETION_PATTERN = /\b(?:all\s+done|all\s+finished|all\s+complete(?:d)?|everything(?:(?:\s+(?:is|was))|(?:'s))?\s+(?:done|complete(?:d)?|finished|ready)|all\s+tasks?\s+(?:are\s+)?(?:done|complete(?:d)?|finished)|(?:the\s+)?work\s+is\s+(?:done|complete(?:d)?|finished)|that\s+(?:completes|concludes|wraps\s+up)|(?:i(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:finished|completed)\s+(?:everything|all(?:(?:\s+(?:tasks?|work)))?|the\s+work|the\s+task)|(?:the\s+)?task\s+is\s+(?:done|complete(?:d)?|finished)|todo\s+(?:está|esta)?\s*(?:listo|completo|terminado|hecho|finalizado)|(?:he|hemos|ya\s+he)\s+terminado\s+(?:todo|todas\s+las\s+tareas|el\s+trabajo|la\s+tarea)|(?:la\s+)?tarea\s+(?:está|esta)\s+(?:completada|terminada|hecha|lista|finalizada)|todas\s+las\s+tareas\s+(?:están\s+)?(?:completadas|terminadas|hechas|listas)|ya\s+está\s+todo|todo\s+(?:completado|finalizado)|eso\s+es\s+todo)\b/i;
 const GENERIC_COMPLETION_ZH_PATTERN = /(?:任务|工作|事项)?(?:已完成|完成了|做完了|搞定了|结束了|准备好了|已就绪)|(?:我|我们)?(?:已经)?(?:(?<!未)完成|做完|搞定)(?:了)?(?:任务|工作|事项)?/u;
 
-// A whole-work conclusion means the model signals that the ENTIRE plan is done
-// ("all done", "everything is complete", "todo listo", "全部完成"). Unlike a generic
-// completion, this resolves EVERY remaining task: active → done, and
-// pending/blocked → dropped from the list (the model concluded without doing
-// them).
 const WORK_CONCLUSION_PATTERN = /\b(?:all\s+done|all\s+finished|all\s+complete(?:d)?|everything(?:(?:\s+(?:is|was))|(?:'s))?\s+(?:done|complete(?:d)?|finished|ready)|all\s+tasks?\s+(?:are\s+)?(?:done|complete(?:d)?|finished)|(?:the\s+)?(?:work|plan|implementation)\s+is\s+(?:done|complete(?:d)?|finished)|that\s+(?:completes|concludes|wraps\s+up)(?:\s+(?:the\s+)?(?:work|plan|everything|it))?|(?:i(?:'ve|\s+have)?|we(?:'ve|\s+have)?)\s+(?:finished|completed)\s+(?:everything|all(?:(?:\s+(?:tasks?|work)))?|the\s+work|the\s+plan)|(?:we(?:'re|\s+are)|i(?:'m|\s+am))\s+(?:all\s+)?done|nothing\s+left\s+to\s+do|todo\s+(?:está|esta)?\s*(?:listo|completo|terminado|hecho|finalizado)|(?:he|hemos|ya\s+he)\s+terminado\s+(?:todo|todas\s+las\s+tareas|el\s+trabajo)|todas\s+las\s+tareas\s+(?:están\s+)?(?:completadas|terminadas|hechas|listas)|ya\s+está\s+todo|todo\s+(?:completado|finalizado)|eso\s+es\s+todo|nada\s+más\s+que\s+hacer)\b/i;
 const WORK_CONCLUSION_ZH_PATTERN = /(?:全部|所有|整个)(?:任务|工作|计划|实现)?(?:都)?(?:已完成|完成了|(?<!未)完成|做完了|搞定了|结束了|准备好了|已就绪)|(?:任务|工作|计划)(?:全部|都)(?:已完成|完成了|(?<!未)完成|做完了|搞定了|结束了)|(?:没有|没什么|无)(?:剩余|待办|要做)(?:的)?(?:任务|工作|事项)?/u;
 
-// Negation / continuation signals that override a completion match:
-// "the task is done, but I still need to…" should NOT resolve active tasks.
 const CONTINUATION_PATTERN = /\b(?:still|not\s+(?:done|finished|complete(?:d)?|ready)|yet|remaining|remain|pending|(?:still|remains?|things?|more)\s+to\s+do|todo\s+(?:queda|falta|está\s+pendiente)|aún|todavía|falta|queda|pendiente|restante|siguiente\s+(?:paso|fase)|next\s+(?:step|phase))\b/i;
 const CONTINUATION_ZH_PATTERN = /(?:仍然|尚未|未完成|没完成|待办|待处理|剩余|还有|还需|还要|接下来|下一步|下一阶段|需要继续|继续)/u;
 
-// Scope limits that turn a whole-work conclusion into a partial one:
-// "all done with phase 1" should not drop tasks from later phases.
 const SCOPE_LIMIT_PATTERN = /\b(?:this\s+(?:phase|step|part|sprint|batch|turn|milestone)|(?:phase|sprint|milestone)\s+\d+|for\s+now|so\s+far|de\s+momento|por\s+ahora|por\s+el\s+momento|esta\s+(?:fase|parte|etapa)|este\s+(?:paso|sprint|hito)|siguiente\s+(?:fase|etapa))\b/i;
 const SCOPE_LIMIT_ZH_PATTERN = /(?:目前|暂时|到目前为止|现在先|这一(?:阶段|步|部分|批次)|这个(?:阶段|步骤|部分|批次)|第\s*\d+\s*(?:阶段|步|部分|批次)|下一(?:阶段|步))/u;
 
