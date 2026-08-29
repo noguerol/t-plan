@@ -16,6 +16,7 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 ## What's new
 
+- **Plan files are private — never commit or publish them** — t-plan now enforces this in three ways: it keeps the session-scoped pattern (`plan_*_[0-9a-zA-Z]*.md`, plus legacy `plan.md`) in your `.gitignore` automatically, it instructs the model never to `git add`/commit/publish plan files, and every generated plan file carries a private-runtime-state marker.
 - **Mandarin Chinese support** — automatic language detection now recognizes Mandarin/Chinese text and localizes auto-generated plan titles as `{project} 计划`.
 - **Chinese plan parsing** — t-plan detects headings and task formats such as `## 计划`, `1、任务`, `## 步骤 1：...`, and status groups like `已完成`, `进行中`, `待办`, and `阻塞`.
 - **Trilingual fuzzy progress detection** — Mandarin completion/start/removal/conclusion phrases like `已完成`, `正在`, `移除`, `不再需要`, and `全部完成` now work alongside English and Spanish.
@@ -94,6 +95,7 @@ plan_<title-slug>_<session-id>.md      e.g. plan_myapp_01a048c3.md
 - **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten.
 - **Parallel instances** — two pi processes in the same directory produce `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`; they never intersect.
 - **Resume a session → get its plan back.** Plan state rides in the session file, and updates keep landing on the same plan file.
+- **Private by design — never commit or publish plan files.** Plan files are runtime state, not source: t-plan keeps the pattern `<prefix>_*_[0-9a-zA-Z]*.md` (plus legacy `plan.md`) in your `.gitignore` automatically — best-effort, and only inside a git working tree — and the model is explicitly instructed never to `git add`, commit, force-add or publish them. A fixed-filename rule like `plan.md` is not enough: the session id in the name changes per session, so the ignore entry must be the pattern. If you commit or share plan files, you leak session-internal state.
 - **Load a plan → find its session.** `/t-plan load` lists every plan file in the directory (title, session id, task count, last modified). Picking one adopts its tasks into the current session, and if it belongs to another session the extension tells you how to jump back: `pi --session <id>`.
 - **Purge** (`/t-plan purge`) removes only this session's plan file.
 - Old single-file setups keep working: a legacy `plan.md` shows up in the `/t-plan load` picker.
