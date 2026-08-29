@@ -1,6 +1,3 @@
-/**
- * Types for the t-plan extension
- */
 
 import type { Tier } from "./tiers.ts";
 
