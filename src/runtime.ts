@@ -60,6 +60,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   let planFilePath: string = "";
   let widgetVisible = false;
   let widgetAnimationTimer: NodeJS.Timeout | undefined;
+  let disposed = false; // true tras session_shutdown: el runtime viejo no debe tocar ctx stale
   let spinnerFrame = 0;
   const highlightedTasks = new Map<string, number>();
   const highlightTimers = new Set<NodeJS.Timeout>();
@@ -235,6 +236,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
     const interval = wantSpin ? 160 : 1000;
     widgetAnimationTimer = setInterval(() => {
+      if (disposed) return; // runtime viejo tras reload: nunca tocar ctx stale
       try {
         if (wantSpin) spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
         updateUI(ctx);
@@ -263,6 +265,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     highlightedTasks.set(task.id, Date.now());
     const start = Date.now();
     const timer = setInterval(() => {
+      if (disposed) {
+        clearInterval(timer);
+        highlightTimers.delete(timer);
+        return;
+      }
       try {
         if (Date.now() - start >= 2400 || !highlightedTasks.has(task.id)) {
           clearInterval(timer);
@@ -279,6 +286,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   }
 
   function updateUI(ctx: ExtensionContext): void {
+    if (disposed) return; // tras reload, el runtime viejo no actualiza UI
     if (!config.enabled || !config.showWidget) {
       stopWidgetAnimation();
       ctx.ui.setStatus("t-plan", undefined);
@@ -1152,6 +1160,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   };
 
   const onSessionStart = async (_event: unknown, ctx: ExtensionContext) => {
+    try {
     globalConfigPartial = await loadGlobalConfig();
     tgConfig = readTrimegistoConfig();
     sessionId = ctx.sessionManager.getSessionId();
@@ -1170,9 +1179,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
 
     updateUI(ctx);
+    } catch { /* stale ctx/reload — no propagar errores del runtime viejo */ }
   };
 
   const onBeforeAgentStart = async (event: any, ctx: ExtensionContext) => {
+    try {
     if (!config.enabled) return;
 
     if (state.tasks.length > 0) {
@@ -1225,9 +1236,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         },
       };
     }
+    } catch { /* stale ctx/reload */ }
   };
 
   const onTurnEnd = async (event: any, ctx: ExtensionContext) => {
+    try {
     if (!config.enabled) return;
     if (!isAssistantMessage(event.message)) return;
 
@@ -1407,14 +1420,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         await writePlanFile(ctx.cwd);
       }
     }
+    } catch { /* stale ctx/reload */ }
   };
 
   const onAgentEnd = async (_event: unknown, ctx: ExtensionContext) => {
+    try {
     if (!config.enabled) return;
     updateUI(ctx);
+    } catch { /* stale ctx/reload */ }
   };
 
   const onAgentSettled = async (_event: unknown, ctx: ExtensionContext) => {
+    try {
     if (!config.enabled) return;
 
     const stillActive = state.tasks.filter((t) => t.status === "in_progress");
@@ -1430,14 +1447,20 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     persistState();
     await writePlanFile(ctx.cwd);
     ctx.ui.notify(`⏸ ${stillActive.length} paused`, "info");
+    } catch { /* stale ctx/reload */ }
   };
 
   const onSessionShutdown = async (_event: unknown, ctx: ExtensionContext) => {
+    // Síncrono y primero: el runtime viejo queda inerte antes de que pi lo
+    // invalide; ningún timer ni continuación tocará un ctx stale tras reload.
+    disposed = true;
     stopAllTimers();
-    if (config.enabled && state.tasks.length > 0) {
-      await writePlanFile(ctx.cwd);
-    }
-    persistState();
+    try {
+      if (config.enabled && state.tasks.length > 0) {
+        await writePlanFile(ctx.cwd);
+      }
+      persistState();
+    } catch { /* stale ctx/reload */ }
   };
 
   const planManagerTool = {
