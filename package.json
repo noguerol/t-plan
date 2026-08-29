@@ -1,6 +1,6 @@
 {
   "name": "pi-t-plan",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "pi plan tracker: TUI progress, plan_manager tool, Trimegisto tiers, timers, EN/ES/ZH fuzzy progress.",
   "keywords": [
     "pi-package",
