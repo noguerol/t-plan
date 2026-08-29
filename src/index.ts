@@ -210,6 +210,8 @@ export default function planExtension(pi: ExtensionAPI): void {
       await writeFile(filePath, content, "utf-8");
       planFilePath = filePath;
       lastPlanFile = filePath;
+      // Safety net: plan files must never be committed or published.
+      await ensurePlanFileGitIgnored(cwd, config.planFilePrefix);
     } catch (err) {
       // Silent fail - file write is best-effort
     }
@@ -233,6 +235,59 @@ export default function planExtension(pi: ExtensionAPI): void {
       // File doesn't exist or can't be read
     }
     return false;
+  }
+
+  /** Walk up from `start` looking for a git working-tree root (`.git` dir or
+   *  worktree file), bounded to avoid climbing the whole filesystem. */
+  async function findGitRoot(start: string): Promise<string | undefined> {
+    let dir = start;
+    for (let i = 0; i < 12; i++) {
+      try {
+        await access(join(dir, ".git"));
+        return dir;
+      } catch {
+        const parent = dirname(dir);
+        if (parent === dir) return undefined;
+        dir = parent;
+      }
+    }
+    return undefined;
+  }
+
+  /** Best-effort, idempotent: keep generated plan files out of version control.
+   *
+   *  Plan files are PRIVATE runtime state — they must never be committed or
+   *  published. Because the session-scoped name embeds a per-session id
+   *  (plan_<title>_<session-id>.md), a fixed-filename rule like `plan.md` is not
+   *  enough: the .gitignore entry has to be a pattern that covers the whole
+   *  family (<prefix>_*_[0-9a-zA-Z]*.md).
+   *
+   *  This is a safety net, not a requirement: never throws, and does nothing
+   *  when the working directory is not inside a git repository.
+   */
+  async function ensurePlanFileGitIgnored(cwd: string, prefix: string): Promise<void> {
+    try {
+      const gitRoot = await findGitRoot(cwd);
+      if (!gitRoot) return; // not inside a git repository — nothing to protect
+      const gitignorePath = join(gitRoot, ".gitignore");
+      let content = "";
+      try {
+        content = await readFile(gitignorePath, "utf-8");
+      } catch {
+        // no .gitignore yet — create one below
+      }
+      const patterns = [`${prefix}_*_[0-9a-zA-Z]*.md`];
+      if (prefix === "plan") patterns.push("plan.md"); // legacy single-file plans
+      const lines = content.split("\n");
+      const missing = patterns.filter((p) => !lines.some((l) => l.trim() === p));
+      if (missing.length === 0) return; // already covered
+      const header = "# t-plan: plan files are private runtime state — never commit or publish them";
+      const block = [header, ...missing, ""].join("\n");
+      const next = content.length === 0 || content.endsWith("\n") ? content + block : content + "\n" + block;
+      await writeFile(gitignorePath, next, "utf-8");
+    } catch {
+      // best-effort — never throw
+    }
   }
 
   // ─── UI Updates ───────────────────────────────────────────────────────
@@ -1296,6 +1351,12 @@ export default function planExtension(pi: ExtensionAPI): void {
       let planContext = "[PLAN TRACKING ACTIVE]\n\n";
       planContext += `Plan: ${state.title} (file: ${planFileNameFor(config.planFilePrefix, state.title, sessionId)})\n\n`;
 
+      // Privacy rule — plan files are runtime state and must NEVER be
+      // committed or published. The session-scoped name embeds a per-session
+      // id, so the rule must reference the pattern, not a fixed filename.
+      planContext += "⚠️ PRIVACY: the plan file above is private runtime state — never `git add`, commit, or publish it, and never paste its contents into public outputs (issues, gists, PRs, READMEs).\n";
+      planContext += `Keep it out of version control: the .gitignore pattern \`${config.planFilePrefix}_*_[0-9a-zA-Z]*.md\` covers every session-scoped plan file — the session id embedded in the name changes per session, so a fixed filename rule (e.g. \`plan.md\`) will not work. The extension maintains this .gitignore entry for you; never force-add (\`git add -f\`) or force-commit it.\n\n`;
+
       if (config.trimegisto) {
         const available = (["t0", "t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
         planContext += "[TRIMEGISTO DISTRIBUTION]\n\n";
@@ -1583,6 +1644,7 @@ export default function planExtension(pi: ExtensionAPI): void {
       "When you complete a task, use plan_manager to mark it as done.",
       "When you discover new tasks during implementation, add them to the plan.",
       "When you discard, split, rename, or reprioritize tasks, update or remove the old tasks immediately.",
+      "The plan file (plan_<title>_<session-id>.md) is PRIVATE runtime state — never commit or publish it, and never force-add it to git; keep it covered by .gitignore.",
     ],
     parameters: Type.Object({
       action: StringEnum(["add", "complete", "update", "list", "start", "block", "remove"] as const),
