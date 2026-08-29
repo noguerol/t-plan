@@ -17,6 +17,9 @@ export interface PlanTask {
   notes?: string;          // Optional notes
   parentId?: string;       // For subtasks
   tier?: Tier;             // Trimegisto tier assignment (t0/t1/t2/t3)
+  everTouched?: boolean;   // True once any detection path has referenced this task;
+                           // at plan-conclusion, untouched pending tasks are dropped
+                           // (the model registered them but never acted on them).
 }
 
 export interface PlanState {

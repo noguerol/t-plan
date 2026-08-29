@@ -445,6 +445,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const task = state.tasks.find((t) => t.id === taskId);
     if (!task) return false;
 
+    task.everTouched = true;
     task.status = status;
     if (status === "in_progress") {
       task.startedAt = Date.now();
@@ -459,14 +460,21 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     return true;
   }
 
+  function touchTask(taskId: string): void {
+    const task = state.tasks.find((t) => t.id === taskId);
+    if (task) task.everTouched = true;
+  }
+
   function trackAgentTask(agentId: string, agentName: string, taskText: string): void {
     const existing = state.tasks.find((t) => t.agentId === agentId);
     if (existing) {
+      existing.everTouched = true;
       existing.text = taskText;
       existing.agentName = agentName;
       existing.status = "in_progress";
     } else {
       const task = addTask(taskText, "in_progress");
+      task.everTouched = true;
       task.agentId = agentId;
       task.agentName = agentName;
       task.startedAt = Date.now();
@@ -477,6 +485,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   function completeAgentTask(agentId: string): void {
     const task = state.tasks.find((t) => t.agentId === agentId);
     if (task) {
+      task.everTouched = true;
       task.status = "done";
       task.completedAt = Date.now();
       state.updatedAt = Date.now();
@@ -941,16 +950,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
   function findTaskByIdentifier(identifier: string): PlanTask | undefined {
     let task = state.tasks.find((t) => t.id === identifier);
-    if (task) return task;
+    if (task) { task.everTouched = true; return task; }
 
     const order = parseInt(identifier);
     if (!isNaN(order)) {
       task = state.tasks.find((t) => t.order === order);
-      if (task) return task;
+      if (task) { task.everTouched = true; return task; }
     }
 
     const lower = identifier.toLowerCase();
     task = state.tasks.find((t) => t.text.toLowerCase().includes(lower));
+    if (task) task.everTouched = true;
     return task;
   }
 
@@ -1227,6 +1237,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const tasks = extractPlanTasks(text);
       if (tasks.length >= 3) {
         ensureTitle(text, ctx); // title follows the plan's language
+        for (const t of tasks) t.everTouched = true; // model just authored them
         state.tasks = tasks;
         if (config.trimegisto) {
           for (const t of state.tasks) {
@@ -1270,7 +1281,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           });
           if (refresh.changed) {
             ensureTitle(text, ctx);
-            state.tasks = refresh.tasks;
+            // The assistant emitted a refreshed plan and we matched every
+            // refreshed task against an existing one (or appended a new one).
+            // Touch all of them: the assistant is actively managing them.
+            for (const t of state.tasks) t.everTouched = true;
             if (config.trimegisto) {
               for (const t of state.tasks) {
                 if (!t.tier) t.tier = classifyTask(t.text);
@@ -1293,14 +1307,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const removedIds = detectRemovedTasks(text, state.tasks);
       if (removedIds.length > 0) {
         for (const id of removedIds) {
+          touchTask(id);
           if (removeTask(id)) changed = true;
         }
         autoNotes.push(`-${removedIds.length} stale`);
       }
 
       const explicitDone = parseDoneMarkers(text, state.tasks);
+      for (const id of explicitDone) touchTask(id);
 
       const auto = detectAutoTransitions(text, toolCorpus, state.tasks);
+      for (const id of auto.completedIds) touchTask(id);
+      for (const id of auto.startedIds) touchTask(id);
 
       const allDone = [...new Set([...explicitDone, ...auto.completedIds])];
       if (allDone.length > 0) {
@@ -1329,20 +1347,32 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
       if (detectWorkConclusion(text)) {
         const active = state.tasks.filter((t) => t.status === "in_progress");
-        const dropped = state.tasks.filter((t) => t.status === "pending" || t.status === "blocked");
+        const pending = state.tasks.filter((t) => t.status === "pending" || t.status === "blocked");
+        // Untouched tasks are ones the model registered but never acted on
+        // (no completion marker, no start, no tool-evidence match, no manual
+        // edit). At plan conclusion they should be dropped — the model
+        // explicitly ended the plan and never came back for them. Touched
+        // pending/blocked tasks are best-effort marked done (the model
+        // referenced them, so it intends for them to be finished).
+        const untouched = pending.filter((t) => !t.everTouched);
+        const leftoverTouched = pending.filter((t) => t.everTouched);
 
         for (const task of active) {
           markTaskStatus(task.id, "done", ctx);
         }
-        for (const task of dropped) {
+        for (const task of leftoverTouched) {
+          markTaskStatus(task.id, "done", ctx);
+        }
+        for (const task of untouched) {
           removeTask(task.id);
         }
 
-        if (active.length > 0 || dropped.length > 0) {
+        if (active.length > 0 || untouched.length > 0 || leftoverTouched.length > 0) {
           changed = true;
           const parts: string[] = [];
           if (active.length > 0) parts.push(`${active.length} completed`);
-          if (dropped.length > 0) parts.push(`${dropped.length} dropped`);
+          if (leftoverTouched.length > 0) parts.push(`${leftoverTouched.length} finalized`);
+          if (untouched.length > 0) parts.push(`${untouched.length} dropped`);
           autoNotes.push(`done: ${parts.join(",")}`);
         }
       } else if (detectGenericCompletion(text)) {
