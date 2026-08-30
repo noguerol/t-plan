@@ -1,6 +1,6 @@
 <div align="center">
 
-![t-plan banner](docs/banner.png)
+![t-plan banner](docs/banner.jpeg)
 
 </div>
 
