@@ -1,6 +1,6 @@
 <div align="center">
 
-![t-plan banner](docs/banner.jpeg)
+![t-plan banner](https://raw.githubusercontent.com/noguerol/t-plan/main/docs/banner.jpeg)
 
 </div>
 
