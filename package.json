@@ -28,7 +28,7 @@
     "extensions": [
       "./src/index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/noguerol/t-plan/main/docs/preview.png"
+    "image": "https://raw.githubusercontent.com/noguerol/t-plan/main/docs/preview.jpeg"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
