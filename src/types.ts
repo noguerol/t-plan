@@ -7,6 +7,9 @@ export type TaskStatus = "pending" | "in_progress" | "done" | "blocked";
 
 export interface PlanTask {
   id: string;
+  ref: number;             // Stable handle shown to the model (never renumbered).
+                           // `order` is display-only and may be re-sorted/compacted,
+                           // so [DONE:n] / task_id=n must resolve against `ref` first.
   text: string;
   status: TaskStatus;
   order: number;
@@ -17,9 +20,31 @@ export interface PlanTask {
   notes?: string;          // Optional notes
   parentId?: string;       // For subtasks
   tier?: Tier;             // Trimegisto tier assignment (t0/t1/t2/t3)
-  everTouched?: boolean;   // True once any detection path has referenced this task;
-                           // at plan-conclusion, untouched pending tasks are dropped
-                           // (the model registered them but never acted on them).
+  everTouched?: boolean;   // True once a *per-task* detection path referenced it
+                           // (explicit marker, tool evidence, fuzzy completion, manual
+                           // edit). Never set in bulk: at plan-conclusion, untouched
+                           // pending tasks are dropped (the model registered them but
+                           // never acted on them).
+}
+
+/** Tool activity observed during the current agent run (evidence for completion). */
+export interface EvidenceClass {
+  mutating: boolean;   // edit / write / apply_patch / multiedit (file changed)
+  command: boolean;    // bash / powershell (command executed)
+  read: boolean;       // read / grep / find / ls (inspection only)
+}
+
+export interface ToolEvidence {
+  /** Normalized tokens extracted from tool args (paths, basenames, routes, identifiers). */
+  tokens: Set<string>;
+  /** Tokens seen through a file-mutating tool. */
+  mutatingTokens: Set<string>;
+  /** Tokens seen through a command execution. */
+  commandTokens: Set<string>;
+  /** Number of test/build/lint commands observed. */
+  testRuns: number;
+  /** Number of tool calls recorded. */
+  calls: number;
 }
 
 export interface PlanState {
@@ -47,6 +72,8 @@ export interface PlanConfig {
   highlightCompleted: boolean; // Briefly highlight newly completed tasks before hiding them
   trimegisto: boolean;     // Trimegisto mode: classify tasks into t1/t2/t3 tiers
   showTimers: boolean;     // Show HH:MM:SS elapsed timers on in-progress tasks
+  toolEvidence: boolean;   // Complete/advance tasks from real tool activity (paths touched)
+  debug: boolean;          // Log swallowed errors to ~/.pi/agent/t-plan/debug.log
 }
 
 export const DEFAULT_CONFIG: PlanConfig = {
@@ -61,6 +88,8 @@ export const DEFAULT_CONFIG: PlanConfig = {
   highlightCompleted: true,
   trimegisto: false,
   showTimers: true,
+  toolEvidence: true,
+  debug: false,
 };
 
 export const DEFAULT_STATE: PlanState = {

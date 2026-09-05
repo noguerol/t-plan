@@ -1,5 +1,5 @@
 
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
@@ -25,8 +25,14 @@ import {
   detectAgentTasks,
   detectAutoTransitions,
   detectGenericCompletion,
-  detectWorkConclusion,
+  detectWorkConclusionClauses,
+  detectPendingMentions,
   detectRemovedTasks,
+  detectEvidenceTransitions,
+  createEvidence,
+  recordToolEvidence,
+  resolveTaskRef,
+  assignRefs,
   reconcilePlanTasks,
   shouldReconcilePlan,
   shouldRemoveMissingTasksFromPlan,
@@ -39,7 +45,7 @@ import {
   slugify,
   titleToProjectName,
 } from "./utils.ts";
-import { readFile, writeFile, access, unlink, mkdir, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, appendFile, access, unlink, mkdir, readdir, stat } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -68,6 +74,24 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   let globalConfigPartial: Partial<PlanConfig> = {};
   let sessionId: string | undefined;
   let lastPlanFile: string | undefined;
+
+  // ── Evidencia del run en curso ────────────────────────────────────────
+  // Qué ficheros/comandos tocó realmente el agente: señal determinista e
+  // independiente del idioma para avanzar/completar tareas.
+  let evidence = createEvidence();
+  let lastStopReason: string | undefined;   // "stop" | "aborted" | "error" | ...
+  let lastAssistantText = "";               // último texto del modelo (para el settle)
+
+  const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "t-plan", "debug.log");
+
+  /** Los catch vacíos hacían invisibles estos fallos; con `debug` se registran. */
+  function logError(scope: string, err: unknown): void {
+    if (!config.debug) return;
+    const line = `[${new Date().toISOString()}] ${scope}: ${err instanceof Error ? (err.stack ?? err.message) : String(err)}\n`;
+    mkdir(dirname(DEBUG_LOG_PATH), { recursive: true })
+      .then(() => appendFile(DEBUG_LOG_PATH, line, "utf-8"))
+      .catch(() => {});
+  }
 
   const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "t-plan", "config.json");
 
@@ -114,6 +138,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (planEntry.data.state) {
         const savedState = planEntry.data.state as PlanState & { titleAuto?: boolean };
         state = { ...DEFAULT_STATE, ...savedState };
+        // Migración: los estados persistidos antes de `ref` no lo llevan.
+        state.tasks = (state.tasks ?? []).map((t) => ({ ...t, ref: typeof t.ref === "number" ? t.ref : 0 }));
+        assignRefs(state.tasks);
         if (savedState.titleAuto === undefined) {
           state.titleAuto = !(savedState.title && savedState.title !== "Project Plan");
         }
@@ -161,6 +188,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       lastPlanFile = filePath;
       await ensurePlanFileGitIgnored(cwd, config.planFilePrefix);
     } catch (err) {
+      logError("writePlanFile", err);
     }
   }
 
@@ -172,13 +200,15 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const content = await readFile(filePath, "utf-8");
       const tasks = extractPlanTasks(content);
       if (tasks.length > 0) {
+        assignRefs(tasks);
         state.tasks = tasks;
         state.updatedAt = Date.now();
         planFilePath = filePath;
         lastPlanFile = filePath;
         return true;
       }
-    } catch {
+    } catch (err) {
+      logError("readPlanFile", err);
     }
     return false;
   }
@@ -394,8 +424,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   }
 
   function addTask(text: string, status: TaskStatus = "pending", order?: number, tier?: Tier): PlanTask {
+    const maxRef = state.tasks.reduce((max, t) => Math.max(max, t.ref ?? 0), 0);
     const task: PlanTask = {
       id: generateId(),
+      ref: maxRef + 1, // estable: nunca se renumera
       text,
       status,
       order: order ?? state.tasks.length + 1,
@@ -576,6 +608,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         state.title = h1;
         state.titleAuto = false; // adopted title belongs to that project
       }
+      assignRefs(tasks);
       state.tasks = tasks;
       state.updatedAt = Date.now();
       lastPlanFile = target.isCurrentSession ? target.file : undefined;
@@ -590,6 +623,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         );
       }
     } catch (err) {
+      logError("pickAndLoadPlan", err);
       ctx.ui.notify(`read fail: ${target.name}`, "error");
     }
   }
@@ -739,14 +773,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           }
           const choice = await ctx.ui.select(
             "Mark as done:",
-            pending.map((t) => `${t.order}. ${t.text}`)
+            pending.map((t) => `#${t.ref}. ${t.text}`)
           );
           if (choice) {
-            const order = parseInt(choice);
-            const task = state.tasks.find((t) => t.order === order);
+            const task = resolveTaskRef(state.tasks, choice.replace(/^[^\d]*/, ""));
             if (task) {
               markTaskStatus(task.id, "done", ctx);
-              ctx.ui.notify(`✓ ${task.text}`, "info");
+              ctx.ui.notify(`✓ #${task.ref} ${task.text}`, "info");
             }
           }
         } else {
@@ -769,11 +802,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         if (!identifier) {
           const choice = await ctx.ui.select(
             "Remove task:",
-            state.tasks.map((t) => `${t.order}. ${t.text}`)
+            state.tasks.map((t) => `#${t.ref}. ${t.text}`)
           );
           if (choice) {
-            const order = parseInt(choice);
-            const task = state.tasks.find((t) => t.order === order);
+            const task = resolveTaskRef(state.tasks, choice.replace(/^[^\d]*/, ""));
             if (task) {
               removeTask(task.id);
               ctx.ui.notify("Removed", "info");
@@ -800,11 +832,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         if (!task) {
           const choice = await ctx.ui.select(
             "Edit task:",
-            state.tasks.map((t) => `${t.order}. ${t.text}`)
+            state.tasks.map((t) => `#${t.ref}. ${t.text}`)
           );
           if (choice) {
-            const order = parseInt(choice);
-            const t = state.tasks.find((t) => t.order === order);
+            const t = resolveTaskRef(state.tasks, choice.replace(/^[^\d]*/, ""));
             if (t) {
               const newText = await ctx.ui.input("New text:", t.text);
               if (newText) {
@@ -863,11 +894,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           if (pending.length > 0) {
             const choice = await ctx.ui.select(
               "Start task:",
-              pending.map((t) => `${t.order}. ${t.text}`)
+              pending.map((t) => `#${t.ref}. ${t.text}`)
             );
             if (choice) {
-              const order = parseInt(choice);
-              const t = state.tasks.find((t) => t.order === order);
+              const t = resolveTaskRef(state.tasks, choice.replace(/^[^\d]*/, ""));
               if (t) {
                 markTaskStatus(t.id, "in_progress", ctx);
                 ctx.ui.notify(`▶ ${t.text}`, "info");
@@ -922,21 +952,20 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           const tier = await pickTier();
           if (tier) {
             updateTask(task.id, { tier });
-            ctx.ui.notify(`T${task.order}→${tier}`, "info");
+            ctx.ui.notify(`#${task.ref}→${tier}`, "info");
           }
         } else {
           const choice = await ctx.ui.select(
             "Set tier for task:",
-            state.tasks.map((t) => `${t.order}. ${t.text}`)
+            state.tasks.map((t) => `#${t.ref}. ${t.text}`)
           );
           if (choice) {
-            const order = parseInt(choice);
-            const t = state.tasks.find((x) => x.order === order);
+            const t = resolveTaskRef(state.tasks, choice.replace(/^[^\d]*/, ""));
             if (t) {
               const tier = await pickTier();
               if (tier) {
                 updateTask(t.id, { tier });
-                ctx.ui.notify(`T${t.order}→${tier}`, "info");
+                ctx.ui.notify(`#${t.ref}→${tier}`, "info");
               }
             }
           }
@@ -956,20 +985,61 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     },
   };
 
-  function findTaskByIdentifier(identifier: string): PlanTask | undefined {
-    let task = state.tasks.find((t) => t.id === identifier);
-    if (task) { task.everTouched = true; return task; }
-
-    const order = parseInt(identifier);
-    if (!isNaN(order)) {
-      task = state.tasks.find((t) => t.order === order);
-      if (task) { task.everTouched = true; return task; }
-    }
-
-    const lower = identifier.toLowerCase();
-    task = state.tasks.find((t) => t.text.toLowerCase().includes(lower));
+  function findTaskByIdentifier(identifier: unknown): PlanTask | undefined {
+    const task = resolveTaskRef(state.tasks, identifier);
     if (task) task.everTouched = true;
     return task;
+  }
+
+  /** Lista compacta con refs: se devuelve al modelo cuando no resuelve un task_id. */
+  function taskRefList(): string {
+    return state.tasks
+      .slice()
+      .sort((a, b) => a.order - b.order)
+      .map((t) => `${t.status === "done" ? "x" : t.status === "in_progress" ? ">" : t.status === "blocked" ? "!" : " "} #${t.ref} ${t.text}`)
+      .join("\n");
+  }
+
+  /**
+   * Resuelve task_id aceptando uno o varios refs: "3", "2,3", "2-4", "2 3", "all",
+   * o texto libre (con fallback difuso). Antes sólo existía la coincidencia literal,
+   * así que un task_id aproximado devolvía "Task not found" y la tarea quedaba pendiente.
+   */
+  function resolveTaskIds(identifier: unknown): PlanTask[] {
+    const raw = (typeof identifier === "string" ? identifier : String(identifier ?? "")).trim();
+    if (!raw) return [];
+
+    if (/^(?:all|todo|todos|todas|everything|\*)$/i.test(raw)) {
+      return state.tasks
+        .filter((t) => t.status !== "done")
+        .map((t) => {
+          t.everTouched = true;
+          return t;
+        });
+    }
+
+    const numericList = /^#?\d+(?:[\s,;/|]+#?\d+)+$/.test(raw);
+    const chunks = raw
+      .split(numericList ? /[\s,;/|]+/ : /[,;/|]+|\s+(?:y|and)\s+/)
+      .map((c) => c.trim())
+      .filter(Boolean);
+
+    const out: PlanTask[] = [];
+    const push = (task: PlanTask | undefined): void => {
+      if (task && !out.some((x) => x.id === task.id)) out.push(task);
+    };
+
+    for (const chunk of chunks) {
+      const range = chunk.match(/^#?(\d+)\s*[-\u2013\u2014]\s*#?(\d+)$/);
+      if (range) {
+        const from = Math.min(+range[1], +range[2]);
+        const to = Math.max(+range[1], +range[2]);
+        for (let n = from; n <= to && n - from < 50; n++) push(findTaskByIdentifier(String(n)));
+        continue;
+      }
+      push(findTaskByIdentifier(chunk));
+    }
+    return out;
   }
 
   async function showConfigMenu(ctx: ExtensionContext): Promise<void> {
@@ -982,6 +1052,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       `${config.trackAgents ? "✅" : "❌"} Agents: ${config.trackAgents ? "ON" : "OFF"}`,
       `${config.trimegisto ? "✅" : "❌"} TG: ${config.trimegisto ? "ON" : "OFF"}`,
       `${config.showTimers ? "✅" : "❌"} Timers: ${config.showTimers ? "ON" : "OFF"}`,
+      `${config.toolEvidence ? "✅" : "❌"} Tool evidence: ${config.toolEvidence ? "ON" : "OFF"}`,
+      `${config.debug ? "✅" : "❌"} Debug log: ${config.debug ? "ON" : "OFF"}`,
       `${config.animateWidget ? "✅" : "❌"} Animate: ${config.animateWidget ? "ON" : "OFF"}`,
       `${config.compactTaskLines ? "✅" : "❌"} Compact: ${config.compactTaskLines ? "ON" : "OFF"}`,
       `${config.highlightCompleted ? "✅" : "❌"} Highlight: ${config.highlightCompleted ? "ON" : "OFF"}`,
@@ -1035,6 +1107,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       }
     } else if (choice.includes("Timers")) {
       config.showTimers = !config.showTimers;
+    } else if (choice.includes("Tool evidence")) {
+      config.toolEvidence = !config.toolEvidence;
+      ctx.ui.notify(
+        config.toolEvidence
+          ? "Tool evidence ON: touched files/commands complete tasks"
+          : "Tool evidence OFF: only text/markers drive status",
+        "info"
+      );
+    } else if (choice.includes("Debug log")) {
+      config.debug = !config.debug;
+      ctx.ui.notify(config.debug ? `Debug log ON: ${DEBUG_LOG_PATH}` : "Debug log OFF", "info");
     } else if (choice.includes("Animate")) {
       config.animateWidget = !config.animateWidget;
     } else if (choice.includes("Compact")) {
@@ -1142,7 +1225,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
               if (took) timer = ` (${took})`;
             }
           }
-          return `${icon} ${t.order}. ${t.text}${timer}${tier}${agent}`;
+          return `${icon} #${t.ref}. ${t.text}${timer}${tier}${agent}`;
         }),
     ];
 
@@ -1179,16 +1262,23 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
 
     updateUI(ctx);
-    } catch { /* stale ctx/reload — no propagar errores del runtime viejo */ }
+    } catch (err) { logError("session_start", err); /* stale ctx/reload */ }
   };
 
   const onBeforeAgentStart = async (event: any, ctx: ExtensionContext) => {
     try {
+    // Nueva petición del usuario => nueva evidencia; también se limpia el stopReason
+    // del run anterior para que agent_settled no decida con datos viejos.
+    evidence = createEvidence();
+    lastStopReason = undefined;
+    lastAssistantText = "";
+
     if (!config.enabled) return;
 
     if (state.tasks.length > 0) {
       const pending = state.tasks.filter((t) => t.status === "pending");
       const inProgress = state.tasks.filter((t) => t.status === "in_progress");
+      const blocked = state.tasks.filter((t) => t.status === "blocked");
       const done = state.tasks.filter((t) => t.status === "done");
 
       const tierTag = (t: PlanTask) =>
@@ -1196,7 +1286,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
       const planFile = planFileNameFor(config.planFilePrefix, state.title, sessionId);
       let planContext = `[PLAN]\n${state.title} (file: ${planFile})\n`;
-      planContext += `Private: never git add/commit/publish plan files; gitignore ${config.planFilePrefix}_*_[0-9a-zA-Z]*.md; no force-add.\n\n`;
+      planContext += `Private: never git add/commit/publish plan files; gitignore ${config.planFilePrefix}_*_[0-9a-zA-Z]*.md; no force-add.\n`;
+      planContext += `Refs (#n) are stable handles: use them in task_id and [DONE:#n].\n\n`;
 
       if (config.trimegisto) {
         const available = (["t0", "t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
@@ -1210,23 +1301,33 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         planContext += "Doing:\n";
         for (const t of inProgress) {
           const agent = t.agentName ? ` @${t.agentName}` : "";
-          planContext += `- 🔄 ${t.order}. ${t.text}${tierTag(t)}${agent}\n`;
+          planContext += `- 🔄 #${t.ref}. ${t.text}${tierTag(t)}${agent}\n`;
         }
         planContext += "\n";
       }
 
+      // Todo el plan visible: antes se recortaba a 10 pendientes y la tarea 11+
+      // era imposible de completar (el modelo no sabía que existía).
+      const PENDING_CAP = 40;
       if (pending.length > 0) {
         planContext += "Todo:\n";
-        for (const t of pending.slice(0, 10)) {
-          planContext += `- ⏳ ${t.order}. ${t.text}${tierTag(t)}\n`;
+        for (const t of pending.slice(0, PENDING_CAP)) {
+          planContext += `- ⏳ #${t.ref}. ${t.text}${tierTag(t)}\n`;
         }
-        if (pending.length > 10) planContext += `- ... +${pending.length - 10}\n`;
+        if (pending.length > PENDING_CAP) planContext += `- ... +${pending.length - PENDING_CAP} more (plan_manager list)\n`;
         planContext += "\n";
       }
 
-      if (done.length > 0) planContext += `Done: ${done.length}\n\n`;
+      if (blocked.length > 0) {
+        planContext += `Blocked: ${blocked.map((t) => `#${t.ref}`).join(", ")}\n\n`;
+      }
 
-      planContext += "Auto-tracks tool activity/responses. Plan changed? use plan_manager add/remove/update. Finish? [DONE:n] or plan_manager complete task_id=n. Starting? name task.\n";
+      if (done.length > 0) {
+        const refs = done.slice(-12).map((t) => `#${t.ref}`).join(", ");
+        planContext += `Done (${done.length}): ${refs}${done.length > 12 ? ", ..." : ""}\n\n`;
+      }
+
+      planContext += "Rules: before ending the turn call plan_manager complete task_id=<ref> for EVERY finished task (accepts \"2,3\" and text). Plan changed? add/remove/update. Starting? plan_manager start or name the task. Auto-tracking also uses the files/commands you touch.\n";
 
       return {
         message: {
@@ -1236,7 +1337,19 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         },
       };
     }
-    } catch { /* stale ctx/reload */ }
+    } catch (err) { logError("before_agent_start", err); /* stale ctx/reload */ }
+  };
+
+  /**
+   * Evidencia determinista: args reales de cada herramienta (rutas, comandos).
+   * `tool_result` trae `input` tipado, sin los recortes del texto del resultado.
+   */
+  const onToolResult = async (event: any, _ctx: ExtensionContext) => {
+    try {
+      if (!config.enabled || !config.toolEvidence) return;
+      if (!event?.toolName || event.toolName === "plan_manager") return;
+      recordToolEvidence(evidence, event.toolName, event.input, event.isError === true);
+    } catch (err) { logError("tool_result", err); }
   };
 
   const onTurnEnd = async (event: any, ctx: ExtensionContext) => {
@@ -1244,13 +1357,19 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     if (!config.enabled) return;
     if (!isAssistantMessage(event.message)) return;
 
-    const text = getTextContent(event.message);
+    const message = event.message;
+    if (typeof message.stopReason === "string") lastStopReason = message.stopReason;
+
+    const text = getTextContent(message);
+    if (text.trim()) lastAssistantText = text;
 
     if (config.autoDetect && state.tasks.length === 0 && containsPlan(text)) {
       const tasks = extractPlanTasks(text);
       if (tasks.length >= 3) {
         ensureTitle(text, ctx); // title follows the plan's language
-        for (const t of tasks) t.everTouched = true; // model just authored them
+        assignRefs(tasks);
+        // everTouched NO se marca en bloque: sólo cuenta la evidencia por tarea,
+        // si no la rama "descartar no tocadas" de la conclusión queda muerta.
         state.tasks = tasks;
         if (config.trimegisto) {
           for (const t of state.tasks) {
@@ -1258,25 +1377,25 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           }
         }
         state.updatedAt = Date.now();
-        ctx.ui.notify(`+${tasks.length} tasks`, "info");
-        updateUI(ctx);
         persistState();
         await writePlanFile(ctx.cwd);
+        updateUI(ctx);
+        ctx.ui.notify(`+${tasks.length} tasks`, "info");
         return;
       }
     }
 
     const toolParts: string[] = [];
-    for (const block of event.message.content) {
+    for (const block of message.content) {
       if (block.type === "toolCall") {
         toolParts.push(`${block.name} ${JSON.stringify(block.arguments ?? {})}`);
       }
     }
     for (const result of event.toolResults ?? []) {
       if (result.toolName) toolParts.push(result.toolName);
-      const resultText = (result.content ?? [])
-        .filter((c) => c.type === "text")
-        .map((c) => c.text)
+      const resultText = ((result.content ?? []) as Array<{ type: string; text?: string }>)
+        .filter((c: { type: string; text?: string }) => c.type === "text")
+        .map((c: { type: string; text?: string }) => c.text ?? "")
         .join(" ");
       if (resultText) toolParts.push(resultText.slice(0, 400));
     }
@@ -1286,6 +1405,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const autoNotes: string[] = [];
 
     if (state.tasks.length > 0) {
+      // Snapshot con los refs vigentes AL INICIO del turno: el modelo trabaja con la
+      // numeración que recibió en before_agent_start, y las reconciliaciones/borrados
+      // renumeran `order`. Resolver contra el snapshot evita marcar la tarea equivocada.
+      const snapshot = state.tasks.map((t) => ({ ...t }));
+      const explicitDone = parseDoneMarkers(text, snapshot);
+      for (const id of explicitDone) touchTask(id);
+
       if (config.autoDetect && containsPlan(text)) {
         const refreshedTasks = extractPlanTasks(text);
         if (shouldReconcilePlan(text, refreshedTasks, state.tasks)) {
@@ -1294,10 +1420,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           });
           if (refresh.changed) {
             ensureTitle(text, ctx);
-            // The assistant emitted a refreshed plan and we matched every
-            // refreshed task against an existing one (or appended a new one).
-            // Touch all of them: the assistant is actively managing them.
-            for (const t of state.tasks) t.everTouched = true;
+            state.tasks = refresh.tasks;
+            assignRefs(state.tasks);
             if (config.trimegisto) {
               for (const t of state.tasks) {
                 if (!t.tier) t.tier = classifyTask(t.text);
@@ -1317,7 +1441,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         }
       }
 
-      const removedIds = detectRemovedTasks(text, state.tasks);
+      // Nunca borrar una tarea que el modelo acaba de dar por hecha en el mismo texto.
+      const removedIds = detectRemovedTasks(text, state.tasks, explicitDone);
       if (removedIds.length > 0) {
         for (const id of removedIds) {
           touchTask(id);
@@ -1326,14 +1451,26 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         autoNotes.push(`-${removedIds.length} stale`);
       }
 
-      const explicitDone = parseDoneMarkers(text, state.tasks);
-      for (const id of explicitDone) touchTask(id);
-
       const auto = detectAutoTransitions(text, toolCorpus, state.tasks);
       for (const id of auto.completedIds) touchTask(id);
       for (const id of auto.startedIds) touchTask(id);
 
-      const allDone = [...new Set([...explicitDone, ...auto.completedIds])];
+      // Lo que el modelo declara explícitamente pendiente no se completa por evidencia.
+      const mentionedPending = detectPendingMentions(text, state.tasks);
+      const byEvidence = config.toolEvidence
+        ? detectEvidenceTransitions(state.tasks, evidence, {
+            complete: false,
+            excludeIds: mentionedPending,
+          })
+        : { completedIds: [] as string[], startedIds: [] as string[] };
+      for (const id of byEvidence.startedIds) touchTask(id);
+
+      const allDone = [
+        ...new Set([
+          ...explicitDone.filter((id) => state.tasks.some((t) => t.id === id)),
+          ...auto.completedIds,
+        ]),
+      ];
       if (allDone.length > 0) {
         for (const id of allDone) {
           const task = state.tasks.find((t) => t.id === id);
@@ -1342,50 +1479,63 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             changed = true;
           }
         }
-        if (auto.completedIds.length > 0) {
-          autoNotes.push(`+${auto.completedIds.length} done`);
-        }
+        autoNotes.push(`+${allDone.length} done`);
       }
 
-      if (auto.startedIds.length > 0) {
-        for (const id of auto.startedIds) {
+      const allStarted = [...new Set([...auto.startedIds, ...byEvidence.startedIds])];
+      if (allStarted.length > 0) {
+        let started = 0;
+        for (const id of allStarted) {
           const task = state.tasks.find((t) => t.id === id);
-          if (task && task.status === "pending") {
+          if (task && task.status === "pending" && !mentionedPending.includes(id)) {
             markTaskStatus(id, "in_progress", ctx);
+            started++;
             changed = true;
           }
         }
-        autoNotes.push(`${auto.startedIds.length} in-progress`);
+        if (started > 0) autoNotes.push(`${started} in-progress`);
       }
 
-      if (detectWorkConclusion(text)) {
+      // Conclusión por cláusulas: un cierre real mezcla lo terminado con lo que queda
+      // ("Listo, commit y push hechos. Queda pendiente el despliegue.") y el veto global
+      // anterior anulaba toda la detección.
+      const clauses = detectWorkConclusionClauses(text);
+      if (clauses.conclusion) {
         const active = state.tasks.filter((t) => t.status === "in_progress");
-        const pending = state.tasks.filter((t) => t.status === "pending" || t.status === "blocked");
-        // Untouched tasks are ones the model registered but never acted on
-        // (no completion marker, no start, no tool-evidence match, no manual
-        // edit). At plan conclusion they should be dropped — the model
-        // explicitly ended the plan and never came back for them. Touched
-        // pending/blocked tasks are best-effort marked done (the model
-        // referenced them, so it intends for them to be finished).
-        const untouched = pending.filter((t) => !t.everTouched);
-        const leftoverTouched = pending.filter((t) => t.everTouched);
+        const leftover = state.tasks.filter((t) => t.status === "pending" || t.status === "blocked");
+        const withEvidence = new Set(
+          config.toolEvidence
+            ? detectEvidenceTransitions(leftover, evidence, {
+                complete: true,
+                excludeIds: mentionedPending,
+              }).completedIds
+            : []
+        );
+        // "Tocada" = referenced by a marker, by tool evidence, by fuzzy completion or
+        // edited by hand. Las que nadie tocó se descartan (intención original); las que
+        // siguen declaradas pendientes se conservan como pendientes.
+        const keep = leftover.filter(
+          (t) => (t.everTouched || withEvidence.has(t.id)) && !mentionedPending.includes(t.id)
+        );
+        const hold = leftover.filter((t) => mentionedPending.includes(t.id));
+        const drop = leftover.filter(
+          (t) => !t.everTouched && !withEvidence.has(t.id) && !mentionedPending.includes(t.id)
+        );
 
-        for (const task of active) {
+        for (const task of active) markTaskStatus(task.id, "done", ctx);
+        for (const task of keep) {
+          touchTask(task.id);
           markTaskStatus(task.id, "done", ctx);
         }
-        for (const task of leftoverTouched) {
-          markTaskStatus(task.id, "done", ctx);
-        }
-        for (const task of untouched) {
-          removeTask(task.id);
-        }
+        for (const task of hold) touchTask(task.id);
+        for (const task of drop) removeTask(task.id);
 
-        if (active.length > 0 || untouched.length > 0 || leftoverTouched.length > 0) {
+        if (active.length > 0 || keep.length > 0 || drop.length > 0) {
           changed = true;
           const parts: string[] = [];
           if (active.length > 0) parts.push(`${active.length} completed`);
-          if (leftoverTouched.length > 0) parts.push(`${leftoverTouched.length} finalized`);
-          if (untouched.length > 0) parts.push(`${untouched.length} dropped`);
+          if (keep.length > 0) parts.push(`${keep.length} finalized`);
+          if (drop.length > 0) parts.push(`${drop.length} dropped`);
           autoNotes.push(`done: ${parts.join(",")}`);
         }
       } else if (detectGenericCompletion(text)) {
@@ -1400,9 +1550,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       }
 
       if (changed) {
-        updateUI(ctx);
+        // Persistir ANTES de pintar: si updateUI lanza (ctx stale tras reload) el estado
+        // ya está guardado en la sesión y en el fichero de plan.
         persistState();
         await writePlanFile(ctx.cwd);
+        updateUI(ctx);
         if (autoNotes.length > 0) {
           ctx.ui.notify(autoNotes.join(" • "), "info");
         }
@@ -1415,39 +1567,74 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         trackAgentTask(agent.agentId, agent.agentName, agent.taskDescription);
       }
       if (agents.length > 0) {
-        updateUI(ctx);
         persistState();
         await writePlanFile(ctx.cwd);
+        updateUI(ctx);
       }
     }
-    } catch { /* stale ctx/reload */ }
+    } catch (err) { logError("turn_end", err); /* stale ctx/reload */ }
   };
 
   const onAgentEnd = async (_event: unknown, ctx: ExtensionContext) => {
     try {
     if (!config.enabled) return;
     updateUI(ctx);
-    } catch { /* stale ctx/reload */ }
+    } catch (err) { logError("agent_end", err); }
   };
 
   const onAgentSettled = async (_event: unknown, ctx: ExtensionContext) => {
     try {
     if (!config.enabled) return;
 
-    const stillActive = state.tasks.filter((t) => t.status === "in_progress");
-    if (stillActive.length === 0) {
-      updateUI(ctx);
-      return;
+    // agent_settled se emite en un `finally` tras CUALQUIER run (éxito, aborto o error).
+    // Degradar in_progress → pending incondicionalmente devolvía a pendientes tareas
+    // que el agente acababa de completar en cada ejecución normal.
+    const interrupted = lastStopReason === "aborted" || lastStopReason === "error";
+    const mentionedPending = detectPendingMentions(lastAssistantText, state.tasks);
+    let changed = false;
+    const notes: string[] = [];
+
+    // Run normal: la evidencia de herramientas (ficheros/comandos tocados) cierra las
+    // tareas que el modelo no llegó a marcar. Varias a la vez, sin depender del idioma.
+    if (!interrupted && config.toolEvidence) {
+      const byEvidence = detectEvidenceTransitions(state.tasks, evidence, {
+        complete: true,
+        excludeIds: mentionedPending,
+      });
+      let completed = 0;
+      for (const id of byEvidence.completedIds) {
+        const task = state.tasks.find((t) => t.id === id);
+        if (!task || task.status === "done") continue;
+        touchTask(id);
+        markTaskStatus(id, "done", ctx);
+        completed++;
+      }
+      if (completed > 0) {
+        changed = true;
+        notes.push(`✓ ${completed} by tool evidence`);
+      }
     }
 
-    for (const task of stillActive) {
-      markTaskStatus(task.id, "pending", ctx);
+    // Sólo una interrupción real justifica pausar lo que estaba en curso.
+    if (interrupted) {
+      const stillActive = state.tasks.filter((t) => t.status === "in_progress");
+      for (const task of stillActive) {
+        markTaskStatus(task.id, "pending", ctx);
+      }
+      if (stillActive.length > 0) {
+        changed = true;
+        notes.push(`⏸ ${stillActive.length} paused`);
+      }
+    }
+
+    if (changed) {
+      persistState();
+      await writePlanFile(ctx.cwd);
     }
     updateUI(ctx);
-    persistState();
-    await writePlanFile(ctx.cwd);
-    ctx.ui.notify(`⏸ ${stillActive.length} paused`, "info");
-    } catch { /* stale ctx/reload */ }
+    if (notes.length > 0) ctx.ui.notify(notes.join(" • "), "info");
+    lastStopReason = undefined;
+    } catch (err) { logError("agent_settled", err); }
   };
 
   const onSessionShutdown = async (_event: unknown, ctx: ExtensionContext) => {
@@ -1460,11 +1647,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         await writePlanFile(ctx.cwd);
       }
       persistState();
-    } catch { /* stale ctx/reload */ }
+    } catch (err) { logError("session_shutdown", err); /* stale ctx/reload */ }
   };
 
   const planManagerTool = {
-    async execute(_toolCallId: string, params: any, _signal: AbortSignal, _onUpdate: any, ctx: ExtensionContext) {
+    async execute(
+      _toolCallId: string,
+      params: any,
+      _signal: AbortSignal | undefined,
+      _onUpdate: any,
+      ctx: ExtensionContext
+    ): Promise<AgentToolResult<any>> {
       if (!config.enabled) {
         return {
           content: [{ type: "text", text: "plan off" }],
@@ -1485,73 +1678,79 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           await writePlanFile(ctx.cwd);
           const tierNote = config.trimegisto && task.tier ? ` [${task.tier}]` : "";
           return {
-            content: [{ type: "text", text: `Added task ${task.order}: ${task.text}${tierNote}` }],
+            content: [{ type: "text", text: `Added task #${task.ref}: ${task.text}${tierNote}` }],
             details: { task },
           };
         }
 
         case "complete": {
-          if (!params.task_id) {
-            return { content: [{ type: "text", text: "task_id is required for complete action" }], details: {} };
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return {
+              content: [{ type: "text", text: `task_id is required for complete action. Refs:\n${taskRefList()}` }],
+              details: {},
+            };
           }
-          const task = findTaskByIdentifier(params.task_id);
-          if (!task) {
-            return { content: [{ type: "text", text: `Task not found: ${params.task_id}` }], details: {} };
+          const targets = resolveTaskIds(params.task_id);
+          if (targets.length === 0) {
+            return {
+              content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }],
+              details: { notFound: String(params.task_id) },
+            };
           }
-          markTaskStatus(task.id, "done", ctx);
-          updateUI(ctx);
+          for (const target of targets) markTaskStatus(target.id, "done", ctx);
           persistState();
           await writePlanFile(ctx.cwd);
+          updateUI(ctx);
           return {
-            content: [{ type: "text", text: `✓ ${task.text}` }],
-            details: { task },
+            content: [{ type: "text", text: targets.map((t) => `✓ #${t.ref} ${t.text}`).join("\n") }],
+            details: { task: targets[0], tasks: targets },
           };
         }
 
         case "start": {
-          if (!params.task_id) {
-            return { content: [{ type: "text", text: "task_id is required for start action" }], details: {} };
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return { content: [{ type: "text", text: `task_id is required for start action. Refs:\n${taskRefList()}` }], details: {} };
           }
-          const task = findTaskByIdentifier(params.task_id);
+          const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
-            return { content: [{ type: "text", text: `Task not found: ${params.task_id}` }], details: {} };
+            return { content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }], details: { notFound: String(params.task_id) } };
           }
           markTaskStatus(task.id, "in_progress", ctx);
-          updateUI(ctx);
           persistState();
           await writePlanFile(ctx.cwd);
+          updateUI(ctx);
           return {
-            content: [{ type: "text", text: `▶ ${task.text}` }],
+            content: [{ type: "text", text: `▶ #${task.ref} ${task.text}` }],
             details: { task },
           };
         }
 
         case "block": {
-          if (!params.task_id) {
-            return { content: [{ type: "text", text: "task_id is required for block action" }], details: {} };
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return { content: [{ type: "text", text: `task_id is required for block action. Refs:\n${taskRefList()}` }], details: {} };
           }
-          const task = findTaskByIdentifier(params.task_id);
+          const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
-            return { content: [{ type: "text", text: `Task not found: ${params.task_id}` }], details: {} };
+            return { content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }], details: { notFound: String(params.task_id) } };
           }
           markTaskStatus(task.id, "blocked", ctx);
           if (params.notes) updateTask(task.id, { notes: params.notes });
-          updateUI(ctx);
           persistState();
           await writePlanFile(ctx.cwd);
+          updateUI(ctx);
           return {
-            content: [{ type: "text", text: `Blocked: ${task.text}${params.notes ? ` — ${params.notes}` : ""}` }],
+            content: [{ type: "text", text: `Blocked: #${task.ref} ${task.text}${params.notes ? ` — ${params.notes}` : ""}` }],
             details: { task },
           };
         }
 
         case "update": {
-          if (!params.task_id) {
-            return { content: [{ type: "text", text: "task_id is required for update action" }], details: {} };
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return { content: [{ type: "text", text: `task_id is required for update action. Refs:\n${taskRefList()}` }], details: {} };
           }
-          const task = findTaskByIdentifier(params.task_id);
+          const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
-            return { content: [{ type: "text", text: `Task not found: ${params.task_id}` }], details: {} };
+            return { content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }], details: { notFound: String(params.task_id) } };
           }
           const updates: Partial<PlanTask> = {};
           if (params.task_text) updates.text = params.task_text;
@@ -1562,30 +1761,31 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             if (tier) updates.tier = tier;
           }
           updateTask(task.id, updates);
-          updateUI(ctx);
+          task.everTouched = true;
           persistState();
           await writePlanFile(ctx.cwd);
+          updateUI(ctx);
           return {
-            content: [{ type: "text", text: `Updated: ${task.text}` }],
+            content: [{ type: "text", text: `Updated: #${task.ref} ${task.text}` }],
             details: { task },
           };
         }
 
         case "remove": {
-          if (!params.task_id) {
-            return { content: [{ type: "text", text: "task_id is required for remove action" }], details: {} };
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return { content: [{ type: "text", text: `task_id is required for remove action. Refs:\n${taskRefList()}` }], details: {} };
           }
-          const task = findTaskByIdentifier(params.task_id);
-          if (!task) {
-            return { content: [{ type: "text", text: `Task not found: ${params.task_id}` }], details: {} };
+          const targets = resolveTaskIds(params.task_id);
+          if (targets.length === 0) {
+            return { content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }], details: { notFound: String(params.task_id) } };
           }
-          removeTask(task.id);
-          updateUI(ctx);
+          for (const target of targets) removeTask(target.id);
           persistState();
           await writePlanFile(ctx.cwd);
+          updateUI(ctx);
           return {
-            content: [{ type: "text", text: `Removed: ${task.text}` }],
-            details: {},
+            content: [{ type: "text", text: targets.map((t) => `Removed: #${t.ref} ${t.text}`).join("\n") }],
+            details: { removed: targets.length },
           };
         }
 
@@ -1612,7 +1812,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
                     if (took) timer = ` (${took})`;
                   }
                 }
-                return `${icon} ${t.order}. ${t.text}${timer}${tier}`;
+                return `${icon} #${t.ref}. ${t.text}${timer}${tier}`;
               }),
           ];
 
@@ -1621,6 +1821,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             details: { tasks: state.tasks, stats: { total, done, inProgress } },
           };
         }
+
+        default:
+          return {
+            content: [{ type: "text", text: `Unknown action: ${String(params?.action)}. Use add|complete|update|list|start|block|remove. Refs:\n${taskRefList()}` }],
+            details: {},
+          };
       }
     },
   };
@@ -1631,6 +1837,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     shortcut,
     onSessionStart,
     onBeforeAgentStart,
+    onToolResult,
     onTurnEnd,
     onAgentEnd,
     onAgentSettled,
