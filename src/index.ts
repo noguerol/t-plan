@@ -57,6 +57,7 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (event, ctx) => (await runtime(pi)).onSessionStart(event, ctx));
   pi.on("before_agent_start", async (event, ctx) => (await runtime(pi)).onBeforeAgentStart(event, ctx));
+  pi.on("tool_result", async (event, ctx) => (await runtime(pi)).onToolResult(event, ctx));
   pi.on("turn_end", async (event, ctx) => (await runtime(pi)).onTurnEnd(event, ctx));
   pi.on("agent_end", async (event, ctx) => (await runtime(pi)).onAgentEnd(event, ctx));
   pi.on("agent_settled", async (event, ctx) => (await runtime(pi)).onAgentSettled(event, ctx));
@@ -70,13 +71,17 @@ export default function planExtension(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use for multi-step progress.",
       "Complete finished tasks; add new tasks.",
+      "Before ending a turn, call complete for every finished task (task_id accepts \"3\", \"2,3\", \"2-4\" or task text).",
+      "Use the stable #ref shown in the plan context; display order can change.",
       "Discard/split/rename/reprioritize: update/remove old tasks.",
       "Plan files are PRIVATE runtime state: never commit/publish/force-add; keep gitignored.",
     ],
     parameters: Type.Object({
       action: StringEnum(["add", "complete", "update", "list", "start", "block", "remove"] as const),
       task_text: Type.Optional(Type.String({ description: "Task text (add/update)" })),
-      task_id: Type.Optional(Type.String({ description: "Task id/order (complete/update/remove/start/block)" })),
+      task_id: Type.Optional(
+        Type.String({ description: "Task ref/order/text; accepts lists (\"2,3\") and ranges (\"2-4\")" })
+      ),
       status: Type.Optional(StringEnum(["pending", "in_progress", "done", "blocked"] as const)),
       notes: Type.Optional(Type.String({ description: "Notes" })),
       tier: Type.Optional(

@@ -16,6 +16,8 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 ## What's new
 
+- **v1.1.0 — no more "done-but-pending" tasks** — completed work used to stay pending because (a) `agent_settled` reset every in-progress task to pending at the end of *any* run (even successful ones), (b) the fuzzy detector dropped sentences over 300 chars, required a completion verb that was missing for ~20 Spanish participles, and failed by a floating-point epsilon on `0.55`, (c) real tool activity (edited files, run tests) never completed anything, (d) `[DONE:1,2,3]` only marked the first id, (e) task numbers shifted mid-run when tasks were removed, (f) only 10 pending tasks were injected into the model context. Fixed: abort-aware settle (only interrupted runs pause), clause-level detection with an epsilon-safe threshold and a full participle set, deterministic **tool-evidence completion**, multi-id/range/`all` `[DONE:…]`, stable **#refs** that never renumber, the full plan injected with refs, and per-task (never bulk) touch tracking so conclusions drop only what nobody acted on.
+- **Stable task refs** — every task carries a `#ref` assigned once and never renumbered (`[DONE:#3]`, `task_id="3"`, `task_id="2,3"`, `task_id="2-4"`, `task_id="all"`). Display order may change; refs don't.
 - **Plan files are private — never commit or publish them** — t-plan now enforces this in three ways: it keeps the session-scoped pattern (`plan_*_[0-9a-zA-Z]*.md`, plus legacy `plan.md`) in your `.gitignore` automatically, it instructs the model never to `git add`/commit/publish plan files, and every generated plan file carries a private-runtime-state marker.
 - **Mandarin Chinese support** — automatic language detection now recognizes Mandarin/Chinese text and localizes auto-generated plan titles as `{project} 计划`.
 - **Chinese plan parsing** — t-plan detects headings and task formats such as `## 计划`, `1、任务`, `## 步骤 1：...`, and status groups like `已完成`, `进行中`, `待办`, and `阻塞`.
@@ -156,21 +158,22 @@ Every in-progress task can show a live `HH:MM:SS` counter since it started (spin
 
 Commands accept any of:
 
-- **Order number** — `/task done 2`
+- **Stable ref** — `#3` / `3` (never renumbered when other tasks are removed)
+- **List / range / all** — `task_id="2,3"`, `"2-4"`, `"all"`, `[DONE:2,3]`, `[DONE:2-4]`
 - **Task ID** — the internal unique ID (e.g. `task_1234_abc`)
-- **Partial text** — case-insensitive substring of the description
+- **Text** — exact, substring, or fuzzy best match (`task_id="JWT auth"` finds the JWT task)
 
-Omit the identifier and the extension shows an interactive picker.
+If nothing matches, `plan_manager` returns the current ref list so the model can retry in the same turn. Omit the identifier and the extension shows an interactive picker.
 
 ## How Progress Detection Works
 
 The model rarely emits explicit markers, so the extension infers progress after every assistant turn from three signal classes:
 
-- **Explicit markers** — `[DONE:n]` lines and done checkboxes (`- [x] …`, `✅ …`, `✔️ …`)
-- **Natural language** — completion language ("implemented", "done", "añadido", "已完成"…), starting language ("starting", "working on", "empezando", "正在"…), removal language ("dropped", "no longer needed", "移除"…) and whole-work conclusions ("all done", "todo listo", "全部完成"…), matched fuzzily against task text with token overlap, light stemming, Mandarin CJK shingles and ES/ZH↔EN synonym mapping
-- **Tool evidence** — tool calls and results of the turn (edited paths, command arguments) matched against each task's distinctive words
+- **Explicit markers** — `[DONE:n]` (now multi-id: `[DONE:1,3]`, `[DONE:2-4]`, `[DONE:all]`, `[DONE:#3]`), done checkboxes (`- [x] …`, `✅ …`, `✔️ …`)
+- **Natural language** — completion language (EN/ES/ZH participles including *actualizado, escrito, probado, verificado, desplegado, configurado, refactorizado, migrado, validado, integrado, cubierto, funciona, corregido…*), starting language, removal language and whole-work conclusions, matched per clause (long summaries are split by clause, never discarded) with token overlap, light stemming, Mandarin CJK shingles and ES/ZH↔EN synonym mapping (synonyms are now resolved **before** stemming, so `terminado↔finished`, `eliminar↔remove`, `guardar↔save` all match)
+- **Tool evidence** — deterministic and language-independent: every `tool_result` records the exact paths/commands used (edits and writes mutate; runs of `vitest`/`jest`/`tsc`… count as test evidence). Several tasks can advance per turn, and tasks whose artefacts were genuinely touched are completed when the run settles normally
 
-Detection is deliberately **conservative**: weak signals never complete a task. You can always correct with `/task done N` or the `plan_manager` tool.
+Detection is deliberately **conservative**: weak signals never complete a task, reading a file alone never completes it, and a clause that explicitly says a task *remains pending* excludes it from evidence completion. You can always correct with `/task done N` or the `plan_manager` tool.
 
 ### Continuous plan refresh
 
@@ -183,8 +186,8 @@ Long projects produce revised plans. When an assistant message contains an **upd
 
 ### Invariants
 
-- **Active-task invariant** — `in_progress` means a model is actively working on it. When the agent run fully settles, finished tasks are marked done and any task still active reverts to pending.
-- **Work-conclusion invariant** — when the model concludes the entire work ("all done", "everything is complete"), active tasks are completed and remaining pending/blocked tasks are dropped from the list.
+- **Active-task invariant** — `in_progress` means a model is actively working on it. `agent_settled` fires after **every** agent run (success, abort or error), so only interrupted runs (`stopReason: "aborted" | "error"`) revert in-progress tasks to pending; a normal settle leaves them active and completes the ones with tool evidence.
+- **Work-conclusion invariant** — when the model concludes the entire work ("all done", "todo listo"), active tasks are completed, tasks with real evidence are finalized, tasks explicitly left pending stay pending, and only pending tasks nobody ever touched are dropped from the list.
 
 ## Widget UI
 
@@ -204,11 +207,11 @@ The extension registers a `plan_manager` tool the model can use to maintain the 
 | Action | Description |
 |--------|-------------|
 | `add` | Add a task (`task_text`, optional `tier`) |
-| `complete` | Mark a task done (`task_id`) |
+| `complete` | Mark task(s) done — `task_id` accepts `"3"`, `"2,3"`, `"2-4"`, `"all"` or task text |
 | `start` | Mark a task in progress (`task_id`) |
 | `block` | Mark a task blocked (`task_id`, optional `notes`) |
 | `update` | Change text/status/notes/tier (`task_id`, `task_text`, `status`, `notes`, `tier`) |
-| `remove` | Remove a task (`task_id`) |
+| `remove` | Remove task(s) (`task_id`) |
 | `list` | Return the current plan state |
 
 Task status also updates automatically from the model's language and tool activity, so the plan stays in sync even when the model never calls the tool.
@@ -260,6 +263,8 @@ Open with `/t-plan config`:
 | Track agents | ON | Monitor parallel agent tasks |
 | Trimegisto mode | OFF | Tier classification + agent assignment per task |
 | Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
+| Tool evidence | ON | Touch files/commands complete or advance tasks |
+| Debug log | OFF | Log swallowed errors to `~/.pi/agent/t-plan/debug.log` |
 | Animate widget | ON | Spinner on in-progress tasks + completion flash |
 | Compact task lines | ON | Truncate each task to a single line |
 | Highlight completed | ON | Briefly illuminate completed tasks before hiding them |
