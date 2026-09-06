@@ -267,6 +267,23 @@ export function containsPlan(text: string): boolean {
   return false;
 }
 
+/**
+ * ¿El texto contiene un plan DE VERDAD (estructura reconocible) y no sólo una
+ * enumeración narrativa? Un resumen con bullets "1. … 2. … 3. …" y palabras sueltas
+ * como "actualizados"/"pendiente" disparaba containsPlan + hasPlanRefreshCue y la
+ * reconciliación convertía los puntos del diagnóstico en tareas fantasma que luego
+ * quedaban in_progress con el timer corriendo (sesión real pi-poke, 2026-09-06).
+ * Las actualizaciones legítimas de plan llevan cabeceras, estados o checkboxes;
+ * la adopción inicial (state vacío) sigue usando containsPlan sin esta exigencia.
+ */
+export function hasRealPlanStructure(text: string): boolean {
+  const lines = text.split("\n");
+  if (lines.some((line) => isPlanSectionHeading(line) || statusFromHeading(line))) return true;
+  if (/^\s*[-*]\s+\[[ xX]\]\s+/m.test(text)) return true; // línea de checkbox
+  if (/\[PLAN\]|Refs\s*\(#n\)|plan_manager\b|##\s*Done|##\s*Todo/i.test(text)) return true;
+  return false;
+}
+
 export interface PlanMarkdownOptions {
   trimegisto?: boolean;  // include tier assignments
   showTimers?: boolean;  // include elapsed-time counters
@@ -1095,16 +1112,41 @@ const CONTINUATION_ZH_PATTERN = /(?:仍然|尚未|未完成|没完成|待办|待
 const SCOPE_LIMIT_PATTERN = /\b(?:this\s+(?:phase|step|part|sprint|batch|turn|milestone)|(?:phase|sprint|milestone)\s+\d+|for\s+now|so\s+far|de\s+momento|por\s+ahora|por\s+el\s+momento|esta\s+(?:fase|parte|etapa)|este\s+(?:paso|sprint|hito)|siguiente\s+(?:fase|etapa))\b/i;
 const SCOPE_LIMIT_ZH_PATTERN = /(?:目前|暂时|到目前为止|现在先|这一(?:阶段|步|部分|批次)|这个(?:阶段|步骤|部分|批次)|第\s*\d+\s*(?:阶段|步|部分|批次)|下一(?:阶段|步))/u;
 
+const TOOL_OUTPUT_DONE_PATTERN = /\b(?:Everything\s+up-to-date|Already\s+up-to-date|nothing\s+to\s+commit,?\s+working\s+tree\s+clean|Your\s+branch\s+is\s+up\s+to\s+date(?:[^.\n]*?(?:with|behind)\s+['"]?(?:origin|upstream)['"]?(?:[^.\n]*?\/[A-Za-z0-9._-]+)?)?|0\s+files?\s+changed,?\s+0\s+insertions?\(\+\),?\s+0\s+deletions?\(-|build\s+succeeded|no\s+errors?\s+found|all\s+checks?\s+passed)\b/i;
+
+// ── Cierres reales de sesión ──────────────────────────────────────────────────
+// Patrones de "todo rematado" observados en sesiones reales (pi-poke 01a07235,
+// 2026-09-06): el resumen final decía "Ya estaba commiteado y pusheado… Working
+// tree: limpio, sin cambios pendientes… No queda nada pendiente por commitear ni
+// pushear. El fix … está cerrado y desplegado… ya publicado" y ningún detector lo
+// reconocía (imperfecto "estaba", doble eme en commiteado, git limpio en prosa).
+const WRAP_UP_PATTERN =
+  /\b(?:working\s+tree:?\s*(?:is\s+|est[áa]\s+)?(?:clean|limpio|limpia)|sin\s+cambios\s+pendientes|sin\s+cambios\s+sin\s+commitear|nothing\s+(?:left\s+)?(?:to\s+)?(?:commit|push|do)|no\s+queda\s+nada\s+pendiente|no\s+hay\s+nada\s+pendiente|(?:no\s+me|no\s+te|no\s+nos|no\s+os|no\s+le)?\s*(?:queda|qued[oó]|quedaba|hay|hab[íi]a)\s+nada\s+(?:pendiente|m[áa]s)|nada\s+(?:pendiente|m[áa]s)\s+(?:por|que)\s+(?:commitear|pushear|hacer|revisar|desplegar)|(?:ya\s+)?(?:est[áa]|estaba|qued[oó]|quedaba|ha\s+quedado|estuvo)\s+(?:todo\s+|ya\s+)?(?:commitead[oa]s?|comitead[oa]s?|pushead[oa]s?|publicad[oa]s?|subid[oa]s?|desplegad[oa]s?|hech[oa]s?|list[oa]s?|cerrad[oa]s?|terminad[oa]s?|completad[oa]s?|resuelt[oa]s?|solucionad[oa]s?|corregid[oa]s?|arreglad[oa]s?)|(?:commit|push|deploy|release|merge)(?:ed)?(?:(?:\s+(?:y|and)\s+(?:commit|push|deploy|release|merge)(?:ed)?))?\s+(?:done|ok|listo|hecho|hechas?|exitos[oa]|completad[oa]s?)|ya\s+(?:publicad[oa]s?|desplegad[oa]s?|pushead[oa]s?|subid[oa]s?|commitead[oa]s?|hech[oa]s?|cerrad[oa]s?|terminad[oa]s?|completad[oa]s?|resuelt[oa]s?)|est[áa]\s+(?:ya\s+)?(?:cerrad[oa]|completo|completad[oa]|terminad[oa]|resuelt[oa]|hech[oa]|list[oa])(?:\s+y\s+(?:desplegad[oa]|publicad[oa]|funcionando|list[oa]|pushead[oa]))?|(?:el\s+|este\s+|ese\s+)?(?:fix|trabajo|asunto|issue|problema|tarea|implementaci[oó]n)\s+(?:ya\s+)?(?:est[áa]|estaba|queda|qued[oó])\s+(?:cerrad[oa]|cerrado|completo|completad[oa]|terminad[oa]|resuelt[oa]|hech[oa]|desplegad[oa]|list[oa])(?:\s+y\s+(?:desplegad[oa]|publicad[oa]|funcionando|list[oa]))?)\b|^\s*(?:arreglado|resuelto|solucionado|corregido|completado|terminado|cerrado)\b/im;
+
+// Veto: la cláusula dice explícitamente que AÚN NO está. "No queda nada pendiente…"
+// y "sin cambios pendientes" son cierres POSITIVOS y quedan excluidos del veto.
+const NEGATED_CLOSER =
+  /\b(?:no\s+est[áa](?:\s+ya)?\s+(?:hech[oa]|commitead[oa]|terminad[oa]|completad[oa]|desplegad[oa]|publicad[oa]|list[oa]|cerrad[oa]|resuelt[oa])|no\s+qued[oó]\s+(?:hech[oa]|commitead[oa]|desplegad[oa]|list[oa])|todav[íi]a\s+no|a[úu]n\s+no|not\s+(?:done|finished|complete|completed|clean|pushed|committed|working|yet)|isn'?t\s+(?:done|working|clean|finished)|won'?t\s+work|still\s+not|no\s+funciona|no\s+pasa|sigue\s+sin|sin\s+terminar|sin\s+acabar)\b/i;
+const WRAP_UP_ZH_PATTERN = /(?:全部完成|全部搞定|没有(?:剩余|待办)|都完成了|已完成.*部署|已提交.*推送|已推送|已发布|工作树.*(?:干净|清洁)|没有.*(?:剩下|剩余|待办))(?:了|。|！)?/u;
+
 export function detectGenericCompletion(text: string): boolean {
   if (CONTINUATION_PATTERN.test(text) || CONTINUATION_ZH_PATTERN.test(text)) return false;
-  return GENERIC_COMPLETION_PATTERN.test(text) || GENERIC_COMPLETION_ZH_PATTERN.test(text) || TOOL_OUTPUT_DONE_PATTERN.test(text);
+  return (
+    GENERIC_COMPLETION_PATTERN.test(text) ||
+    GENERIC_COMPLETION_ZH_PATTERN.test(text) ||
+    TOOL_OUTPUT_DONE_PATTERN.test(text) ||
+    (WRAP_UP_PATTERN.test(text) || WRAP_UP_ZH_PATTERN.test(text))
+  );
 }
-
-const TOOL_OUTPUT_DONE_PATTERN = /\b(?:Everything\s+up-to-date|Already\s+up-to-date|nothing\s+to\s+commit,?\s+working\s+tree\s+clean|Your\s+branch\s+is\s+up\s+to\s+date(?:[^.\n]*?(?:with|behind)\s+['"]?(?:origin|upstream)['"]?(?:[^.\n]*?\/[A-Za-z0-9._-]+)?)?|0\s+files?\s+changed,?\s+0\s+insertions?\(\+\),?\s+0\s+deletions?\(-|build\s+succeeded|no\s+errors?\s+found|all\s+checks?\s+passed)\b/i;
 
 export function detectWorkConclusion(text: string): boolean {
   if (CONTINUATION_PATTERN.test(text) || CONTINUATION_ZH_PATTERN.test(text) || SCOPE_LIMIT_PATTERN.test(text) || SCOPE_LIMIT_ZH_PATTERN.test(text)) return false;
-  return WORK_CONCLUSION_PATTERN.test(text) || WORK_CONCLUSION_ZH_PATTERN.test(text) || TOOL_OUTPUT_DONE_PATTERN.test(text);
+  return (
+    WORK_CONCLUSION_PATTERN.test(text) ||
+    WORK_CONCLUSION_ZH_PATTERN.test(text) ||
+    TOOL_OUTPUT_DONE_PATTERN.test(text) ||
+    (WRAP_UP_PATTERN.test(text) || WRAP_UP_ZH_PATTERN.test(text))
+  );
 }
 
 /**
@@ -1119,8 +1161,15 @@ export function detectWorkConclusionClauses(text: string): { conclusion: boolean
 
   const hasContinuation = (s: string): boolean =>
     CONTINUATION_PATTERN.test(s) || CONTINUATION_ZH_PATTERN.test(s) || SCOPE_LIMIT_PATTERN.test(s) || SCOPE_LIMIT_ZH_PATTERN.test(s);
+  // "No queda nada pendiente…" / "sin cambios pendientes" son cierres POSITIVOS.
+  const negated = (s: string): boolean => NEGATED_CLOSER.test(s) && !/no\s+queda\s+nada\s+pendiente|no\s+hay\s+nada\s+pendiente|nothing\s+left/i.test(s);
   const hasConclusion = (s: string): boolean =>
-    WORK_CONCLUSION_PATTERN.test(s) || WORK_CONCLUSION_ZH_PATTERN.test(s) || TOOL_OUTPUT_DONE_PATTERN.test(s);
+    !negated(s) &&
+    (WORK_CONCLUSION_PATTERN.test(s) ||
+      WORK_CONCLUSION_ZH_PATTERN.test(s) ||
+      TOOL_OUTPUT_DONE_PATTERN.test(s) ||
+      WRAP_UP_PATTERN.test(s) ||
+      WRAP_UP_ZH_PATTERN.test(s));
 
   for (const raw of text.split(/\n+|(?<=[.!?\u3002\uff01\uff1f])(?:\s+|$)/)) {
     const sentence = raw.trim();

@@ -252,3 +252,96 @@ test("el fichero de plan refleja los estados y no se pierde al releerlo", async 
     await h.cleanup();
   }
 });
+
+// ── v1.2.0: secuencias reales que dejaban tareas in_progress con el timer ─────
+// Sesión real pi-poke (01a07235, 2026-09-06): el resumen final con bullets
+// numerados + "actualizados" creaba tareas fantasma, y los cierres tipo
+// "Ya estaba commiteado y pusheado… working tree limpio" nunca se detectaban.
+
+test("un resumen con bullets numerados y palabra-cue no crea tareas fantasma", async () => {
+  const h = await createHarness();
+  try {
+    await h.addTasks(["Arreglar el manual poke de pi-poke"]);
+    await h.tool({ action: "start", task_id: "1" });
+    await h.runStart();
+    await h.toolResult("edit", { path: "src/index.ts" });
+    await h.turnEnd(
+      [
+        "Arreglado ✅ Commit 659f711 en main (npm publicará pi-poke@1.2.7).",
+        "",
+        "1. Mientras hay un run activo (isStreaming es true incluso durante tool calls), los mensajes inyectados solo se encolan como steer.",
+        "2. Y peor: cuando el run se aborta, pi hace restoreQueuedMessagesToEditor y el poke encolado se pierde.",
+        "3. Esc funciona porque abortHandler → agent.abort() mata el run.",
+        "",
+        "README y TEST.md actualizados.",
+      ].join("\n"),
+      "stop"
+    );
+    await h.settle();
+    const plan = await h.plan();
+    assert.equal(plan.length, 1, `la prosa no debe añadir tareas: ${JSON.stringify(plan)}`);
+    assert.equal(plan[0].status, "done", "el wrap-up cierra la tarea activa");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("wrap-up real de cierre completa las tareas en curso aunque el run sólo verifique", async () => {
+  const h = await createHarness();
+  try {
+    await h.addTasks([
+      "Fix manual poke: si hay run activo/bloqueado → ctx.abort() + esperar idle + resume",
+      "Y peor: cuando el run se aborta, pi hace restoreQueuedMessagesToEditor y se pierde el poke",
+    ]);
+    await h.tool({ action: "start", task_id: "1" });
+    await h.tool({ action: "start", task_id: "2" });
+    await h.runStart();
+    // Verificación read-only: no hay mutación, sólo git status/log.
+    await h.toolResult("bash", { command: "cd /home/j/repos/pi-poke && git status --short && git log --oneline -3" });
+    await h.turnEnd(
+      [
+        "Ya estaba commiteado y pusheado — el commit `659f711` se hizo en el turno anterior al terminar el fix. Verificado ahora:",
+        "- **Working tree**: limpio, sin cambios pendientes.",
+        "- **Push**: `main` local == `origin/main` == `659f711`.",
+        "- **npm**: `pi-poke@1.2.7` ya publicado.",
+        "No queda nada pendiente por commitear ni pushear. El fix del poke manual (interrupt + resume) está cerrado y desplegado. ¿Seguimos con otra mejora?",
+      ].join("\n"),
+      "stop"
+    );
+    await h.settle();
+    const s = await h.statusByRef();
+    assert.equal(s[1], "done", `tarea 1 debe cerrarse con el wrap-up: ${JSON.stringify(s)}`);
+    assert.equal(s[2], "done", `tarea 2 debe cerrarse con el wrap-up: ${JSON.stringify(s)}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("settle normal devuelve a pending una tarea que este run no trabajó (idle, timer parado)", async () => {
+  const h = await createHarness();
+  try {
+    await h.addTasks(["Revisar la arquitectura del módulo de pagos"]);
+    await h.tool({ action: "start", task_id: "1" });
+    await h.runStart();
+    await h.turnEnd("He revisado el estado del repo y no hay nada que hacer por ahora.", "stop");
+    await h.settle();
+    const s = await h.statusByRef();
+    assert.equal(s[1], "pending", `sin trabajo en el run ni lenguaje activo no debe quedar girando: ${JSON.stringify(s)}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("al restaurar una sesión, lo que quedó in_progress no arranca con el timer viejo", async () => {
+  const h = await createHarness();
+  try {
+    await h.addTasks(["Revisar el módulo de pagos"]);
+    await h.tool({ action: "start", task_id: "1" });
+    // Reload/resume de la sesión: nadie está trabajando ahora mismo.
+    await h.rt.onSessionStart({ type: "session_start" }, h.ctx);
+    const s = await h.statusByRef();
+    assert.equal(s[1], "pending", `tras restaurar no debe quedar con timer: ${JSON.stringify(s)}`);
+  } finally {
+    await h.cleanup();
+  }
+});

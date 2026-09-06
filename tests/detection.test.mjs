@@ -177,3 +177,43 @@ test("borrar una tarea no renumera los refs de las demás", () => {
   assert.deepEqual(surviving.map((t) => t.ref), [1, 3]);
   assert.deepEqual(u.parseDoneMarkers("[DONE:3]", surviving), ["c"]);
 });
+
+// ── v1.2.0: cierres reales de sesión (wrap-up) ─────────────────────────────────
+
+test("wrap-up real: commiteado/pusheado/working tree limpio/no queda nada pendiente", () => {
+  const text = [
+    "Ya estaba commiteado y pusheado — el commit `659f711` se hizo en el turno anterior al terminar el fix. Verificado ahora:",
+    "- **Working tree**: limpio, sin cambios pendientes.",
+    "- **npm**: `pi-poke@1.2.7` ya publicado.",
+    "No queda nada pendiente por commitear ni pushear. El fix del poke manual (interrupt + resume) está cerrado y desplegado. ¿Seguimos con otra mejora?",
+  ].join("\n");
+  const r = u.detectWorkConclusionClauses(text);
+  assert.equal(r.conclusion, true, JSON.stringify(r));
+});
+
+test("wrap-up: 'Arreglado ✅ …' al inicio de línea cierra la sesión", () => {
+  assert.equal(u.detectWorkConclusionClauses("Arreglado ✅ Commit 659f711 en main (npm publicará pi-poke@1.2.7).").conclusion, true);
+});
+
+test("no cierra cuando la cláusula dice que AÚN no está", () => {
+  for (const text of [
+    "No está hecho todavía, sigo trabajando.",
+    "El despliegue no está terminado.",
+    "Aún no he commiteado los cambios.",
+    "Working tree no limpio, hay cambios sin commitear.",
+  ]) {
+    assert.equal(u.detectWorkConclusionClauses(text).conclusion, false, text);
+  }
+});
+
+test("no cierra por 'no queda nada pendiente' aunque contenga la palabra pendiente", () => {
+  assert.equal(u.detectWorkConclusionClauses("Listo. No queda nada pendiente por commitear ni pushear.").conclusion, true);
+});
+
+test("hasRealPlanStructure distingue un plan de la prosa numerada", () => {
+  const prose = "Resumen del diagnóstico:\n1. Mientras hay un run activo (isStreaming es true incluso durante tool calls)…\n2. Y peor: cuando el run se aborta, pi hace restoreQueuedMessagesToEditor…\n3. Esc funciona porque abortHandler mata el run.\nREADME y TEST.md actualizados.";
+  assert.equal(u.hasRealPlanStructure(prose), false, "la prosa numerada no es un plan");
+  assert.equal(u.hasRealPlanStructure("## Todo\n1. Añadir JWT\n2. Escribir tests\n3. README"), true);
+  assert.equal(u.hasRealPlanStructure("## Resumen\n- [x] Añadir JWT en src/auth.ts\n- [x] Escribir tests"), true);
+  assert.equal(u.hasRealPlanStructure("## Done\n- [x] Tarea hecha"), true);
+});
