@@ -251,3 +251,20 @@ test("veto en inglés: 'not yet' / 'not deployed' / mixto con trabajo pendiente 
     assert.equal(u.detectWorkConclusionClauses(text).conclusion, false, text);
   }
 });
+
+test("artifactSet no entra en bucle infinito con puntos suspensivos o puntos terminales", () => {
+  const cases = [
+    "...src.matchAll",
+    "const values = [...src.matchAll(/value: \\\"(\\\\w+)\\\" as const/g)].map(m=>m[1]);",
+    "file...",
+    "a.b.",
+    "foo..bar",
+    "DEV=0/DEV=2.",
+    "/path/to/script.sh.bak-20260906",
+  ];
+  for (const c of cases) {
+    const res = u.artifactSet(c);
+    assert.ok(res.all instanceof Set, `artifactSet falló en: ${c}`);
+  }
+});
+

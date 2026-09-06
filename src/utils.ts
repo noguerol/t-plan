@@ -1317,7 +1317,9 @@ export function artifactSet(source: string): ArtifactSet {
     // login.test.ts → login.test → login
     let cur = base;
     while (cur.includes(".")) {
-      cur = cur.replace(/\.[\w+-]+$/, "");
+      const next = cur.replace(/\.[\w+-]+$/, "");
+      if (next === cur) break;
+      cur = next;
       if (cur.length >= 3) variants.add(cur);
     }
 
