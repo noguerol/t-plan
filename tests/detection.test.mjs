@@ -217,3 +217,37 @@ test("hasRealPlanStructure distingue un plan de la prosa numerada", () => {
   assert.equal(u.hasRealPlanStructure("## Resumen\n- [x] Añadir JWT en src/auth.ts\n- [x] Escribir tests"), true);
   assert.equal(u.hasRealPlanStructure("## Done\n- [x] Tarea hecha"), true);
 });
+
+// ── v1.2.1: los mismos cierres en inglés ───────────────────────────────────────
+
+test("wrap-up en inglés: already committed and pushed / fix is closed / working tree clean", () => {
+  const texts = [
+    "Already committed and pushed — the commit 659f711 landed in the previous turn.",
+    "The manual poke fix is closed and deployed.",
+    "Working tree is clean, no pending changes.",
+    "All committed and pushed to main.",
+    "npm: pi-poke@1.2.7 already published.",
+    "Resolved. Everything is wrapped up.",
+    "Everything is all set.",
+  ];
+  for (const text of texts) {
+    const r = u.detectWorkConclusionClauses(text);
+    assert.equal(r.conclusion, true, `EN wrap-up debería cerrar: ${text} → ${JSON.stringify(r)}`);
+  }
+});
+
+test("wrap-up en inglés: 'Fixed ✅ …' / 'Done. …' al inicio de línea", () => {
+  assert.equal(u.detectWorkConclusionClauses("Fixed ✅ Commit 659f711 on main (npm will publish pi-poke@1.2.7).").conclusion, true);
+  assert.equal(u.detectWorkConclusionClauses("Done. Implemented JWT auth, added tests, updated the README.").conclusion, true);
+});
+
+test("veto en inglés: 'not yet' / 'not deployed' / mixto con trabajo pendiente no cierra", () => {
+  for (const text of [
+    "Not done yet — will push after review.",
+    "The fix is not deployed yet.",
+    "Working tree is not clean.",
+    "We committed and pushed the fix, but the deploy is pending.",
+  ]) {
+    assert.equal(u.detectWorkConclusionClauses(text).conclusion, false, text);
+  }
+});
