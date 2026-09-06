@@ -44,6 +44,9 @@ import {
   planTitle,
   slugify,
   titleToProjectName,
+  hasRealPlanStructure,
+  splitSegments,
+  taskTextScore,
 } from "./utils.ts";
 import { readFile, writeFile, appendFile, access, unlink, mkdir, readdir, stat } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
@@ -1255,6 +1258,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       state = { ...DEFAULT_STATE, tasks: [], createdAt: Date.now(), updatedAt: Date.now() };
     }
     restoreState(entries);
+    // Estado restaurado de otra vida de la sesión (reload/resume): nadie está
+    // trabajando ahora mismo, así que ninguna tarea debe arrancar con el timer
+    // corriendo desde un startedAt viejo. El próximo run la reactiva si se trabaja.
+    if (hadSessionState) {
+      for (const t of state.tasks) {
+        if (t.status === "in_progress") {
+          t.status = "pending";
+          t.startedAt = undefined;
+        }
+      }
+      state.updatedAt = Date.now();
+    }
     ensureTitle(undefined, ctx);
 
     if (state.tasks.length === 0 && config.enabled) {
@@ -1414,7 +1429,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
       if (config.autoDetect && containsPlan(text)) {
         const refreshedTasks = extractPlanTasks(text);
-        if (shouldReconcilePlan(text, refreshedTasks, state.tasks)) {
+        // La prosa numerada de un resumen ("1. … 2. … 3. …") no es un plan:
+        // exigir estructura real (cabeceras/checkboxes) evita tareas fantasma.
+        if (hasRealPlanStructure(text) && shouldReconcilePlan(text, refreshedTasks, state.tasks)) {
           const refresh = reconcilePlanTasks(state.tasks, refreshedTasks, {
             removeMissing: shouldRemoveMissingTasksFromPlan(text),
           });
@@ -1582,6 +1599,23 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } catch (err) { logError("agent_end", err); }
   };
 
+  /**
+   * ¿El texto mantiene una tarea activa (el agente dice que sigue con ella)?
+   * Se usa al settle normal: si nadie trabaja ya en la tarea, no debe quedarse
+   * in_progress con el timer corriendo entre mensajes del usuario.
+   */
+  const ACTIVE_CUE_RE =
+    /(?:contin[uú]o|continuando|continuamos|contin[uú]a(?=\s+con)|sigo\s+con|siguiendo\s+con|seguimos\s+con|estoy\s+(?:con|en|trabajando\s+en)|still\s+working\s+on|keep\s+working\s+on|back\s+to|retomo|retomando|voy\s+a\s+seguir\s+con)|(?:继续|接着|还在|仍\s*在)/i;
+
+  function taskKeptActive(task: PlanTask, text: string): boolean {
+    if (!text) return false;
+    for (const segment of splitSegments(text)) {
+      if (!ACTIVE_CUE_RE.test(segment)) continue;
+      if (taskTextScore(task.text, segment) >= 0.5 - 1e-9) return true;
+    }
+    return false;
+  }
+
   const onAgentSettled = async (_event: unknown, ctx: ExtensionContext) => {
     try {
     if (!config.enabled) return;
@@ -1624,6 +1658,25 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (stillActive.length > 0) {
         changed = true;
         notes.push(`⏸ ${stillActive.length} paused`);
+      }
+    } else {
+      // Run normal: el agente queda idle. Una tarea que sigue in_progress pero que
+      // este run no trabajó (sin "sigo con…" en el texto final) no la está trabajando
+      // nadie ahora mismo: vuelve a pending y su timer se detiene. Antes quedaba
+      // girando indefinidamente entre mensajes del usuario (queja real: "las tareas
+      // siguen activas y con tu timer avanzando").
+      const idle = state.tasks.filter(
+        (t) =>
+          t.status === "in_progress" &&
+          !t.agentId && // tareas de agente (trimegisto) tienen su propio ciclo
+          !taskKeptActive(t, lastAssistantText)
+      );
+      for (const task of idle) {
+        markTaskStatus(task.id, "pending", ctx);
+      }
+      if (idle.length > 0) {
+        changed = true;
+        notes.push(`⏹ ${idle.length} idle → pending`);
       }
     }
 
