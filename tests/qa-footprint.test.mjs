@@ -111,22 +111,30 @@ test("(3) plan_manager accepts '3', '2,3', '2-4', 'all' and text; completion sho
     await h.addTasks(["alpha one", "beta two", "gamma three", "delta four", "epsilon five", "zeta six"]);
 
     const out = async (task_id) => (await h.tool({ action: "complete", task_id })).content[0].text;
+    // A real completion prints "✓ #<ref> <text>"; a rejected form prints
+    // "Task not found: ..." followed by the FULL ref list. Substring checks on
+    // "#n" therefore pass even when the form was never accepted, so assert the
+    // completion marker (and the exact set of refs) instead of mere presence.
+    const completedRefs = (text) => {
+      assert.doesNotMatch(text, /Task not found/, `task_id form was rejected: ${text}`);
+      return [...text.matchAll(/✓\s*#(\d+)\b/g)].map((m) => Number(m[1]));
+    };
 
     const single = await out("3");
-    assert.ok(single.includes("✓ #3"), `'3' must complete #3 and show it, got: ${single}`);
-    assert.match(single, /#[0-9]+/, "completion output must still show '#<ref>'");
+    assert.match(single, /✓\s*#3\b/, `'3' must complete #3 and show '#<ref>', got: ${single}`);
+    assert.deepEqual(completedRefs(single), [3], `'3' must complete exactly #3, got: ${single}`);
 
     const list = await out("2,3");
-    assert.ok(list.includes("#2") && list.includes("#3"), `'2,3' must resolve #2 and #3, got: ${list}`);
+    assert.deepEqual(completedRefs(list), [2, 3], `'2,3' must complete #2 and #3, got: ${list}`);
 
     const range = await out("2-4");
-    assert.ok(range.includes("#4"), `'2-4' must resolve the range up to #4, got: ${range}`);
+    assert.deepEqual(completedRefs(range), [2, 3, 4], `'2-4' must complete #2..#4, got: ${range}`);
 
     const all = await out("all");
-    assert.ok(all.includes("#5") && all.includes("#6"), `'all' must complete every non-done task, got: ${all}`);
+    assert.deepEqual(completedRefs(all), [1, 5, 6], `'all' must complete every non-done task, got: ${all}`);
 
     const byText = await out("beta two");
-    assert.ok(byText.includes("#2"), `text task_id must resolve #2, got: ${byText}`);
+    assert.deepEqual(completedRefs(byText), [2], `text task_id must resolve #2, got: ${byText}`);
   } finally {
     await h.cleanup();
   }
