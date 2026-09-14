@@ -58,6 +58,24 @@ host loads **~96% fewer chars / ~96% fewer estimated tokens** at startup.
 The remaining 105 KB / ~26k tokens now resolves lazily on first command,
 event, or tool invocation.
 
+## Text-footprint pass (v1.3.x)
+
+Second pass: shorter exposed metadata/descriptions and compressed runtime
+prompts/labels/injected messages. No API/behavior change — command names/args,
+config keys, tool name/params/schema and persisted state are identical.
+
+| Surface | Before | After | Δ |
+| --- | ---: | ---: | ---: |
+| `src/index.ts` (startup) | 4,889 | 4,615 | −274 (−5.6%) |
+| `src/runtime.ts` (lazy) | 76,421 | 76,185 | −236 (−0.3%) |
+| `package.json` (metadata) | 1,114 | 1,079 | −35 (−3.1%) |
+| **startup bundle** (esbuild, ext. peers) | **4,458** | **4,184** | **−274 (−6.1%)** |
+| **relevant source total** | **167,632** | **167,087** | **−545 (−0.3%)** |
+
+Bundles exclude `@earendil-works/*` and `typebox`; the startup bundle also
+excludes the lazy `./runtime.ts`. Verified: `node --check` OK, `npm test`
+113/113.
+
 ## Lazy-loaded modules
 All previously static imports in the entrypoint are now behind a single
 dynamic `import("./runtime.ts")` in `src/index.ts`:

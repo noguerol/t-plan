@@ -4,15 +4,15 @@ import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const tPlanCompletions = [
-  { value: "on", label: "on", description: "Enable" },
-  { value: "off", label: "off", description: "Disable" },
-  { value: "config", label: "config", description: "Config" },
-  { value: "show", label: "show", description: "Show plan" },
-  { value: "new", label: "new", description: "New plan" },
-  { value: "load", label: "load", description: "Load plan" },
-  { value: "save", label: "save", description: "Save plan" },
-  { value: "clear", label: "clear", description: "Clear tasks" },
-  { value: "purge", label: "purge", description: "Purge plan" },
+  { value: "on", label: "on", description: "On" },
+  { value: "off", label: "off", description: "Off" },
+  { value: "config", label: "config", description: "Cfg" },
+  { value: "show", label: "show", description: "Show" },
+  { value: "new", label: "new", description: "New" },
+  { value: "load", label: "load", description: "Load" },
+  { value: "save", label: "save", description: "Save" },
+  { value: "clear", label: "clear", description: "Clear" },
+  { value: "purge", label: "purge", description: "Purge" },
 ];
 
 const taskCompletions = [
@@ -23,7 +23,7 @@ const taskCompletions = [
   { value: "move", label: "move", description: "Move" },
   { value: "start", label: "start", description: "Start" },
   { value: "block", label: "block", description: "Block" },
-  { value: "tier", label: "tier", description: "Set tier" },
+  { value: "tier", label: "tier", description: "Tier" },
 ];
 
 type Runtime = ReturnType<(typeof import("./runtime.ts"))["createPlanRuntime"]>;
@@ -39,19 +39,19 @@ const completions = <T extends { value: string }>(items: T[], prefix: string) =>
 
 export default function planExtension(pi: ExtensionAPI): void {
   pi.registerCommand("t-plan", {
-    description: "Toggle/show t-plan",
+    description: "Toggle",
     handler: async (args: string | undefined, ctx: ExtensionContext) => (await runtime(pi)).tPlanCommand.handler(args, ctx),
     getArgumentCompletions: (prefix: string) => completions(tPlanCompletions, prefix),
   });
 
   pi.registerCommand("task", {
-    description: "Manage plan tasks",
+    description: "Tasks",
     handler: async (args: string | undefined, ctx: ExtensionContext) => (await runtime(pi)).taskCommand.handler(args, ctx),
     getArgumentCompletions: (prefix: string) => completions(taskCompletions, prefix),
   });
 
   pi.registerShortcut(Key.ctrlAlt("p"), {
-    description: "Toggle t-plan",
+    description: "Toggle",
     handler: async (ctx: ExtensionContext) => (await runtime(pi)).shortcut.handler(ctx),
   });
 
@@ -65,28 +65,28 @@ export default function planExtension(pi: ExtensionAPI): void {
 
   pi.registerTool({
     name: "plan_manager",
-    label: "T-Plan Manager",
-    description: "Manage plan tasks. Trimegisto: tier t1/t2/t3, fallback t0/active.",
-    promptSnippet: "Manage plan tasks: add/remove/update/start/block/complete/list.",
+    label: "Plan",
+    description: "Plan tasks; tiers t1/t2/t3, fallback t0.",
+    promptSnippet: "Plan tasks: add/remove/update/start/block/complete/list.",
     promptGuidelines: [
-      "Use for multi-step progress.",
-      "Complete finished tasks; add new tasks.",
-      "Before ending a turn, call complete for every finished task (task_id accepts \"3\", \"2,3\", \"2-4\" or task text).",
-      "Use the stable #ref shown in the plan context; display order can change.",
-      "Discard/split/rename/reprioritize: update/remove old tasks.",
-      "Plan files are PRIVATE runtime state: never commit/publish/force-add; keep gitignored.",
+      "Multi-step work.",
+      "Complete finished tasks; add new.",
+      "Before ending turn, complete every finished task (task_id: \"3\", \"2,3\", \"2-4\" or text).",
+      "Use stable #ref; display order varies.",
+      "Discard/split/rename/reprioritize: update/remove.",
+      "Plan files: PRIVATE; never commit/publish/force-add; keep gitignored.",
     ],
     parameters: Type.Object({
       action: StringEnum(["add", "complete", "update", "list", "start", "block", "remove"] as const),
-      task_text: Type.Optional(Type.String({ description: "Task text (add/update)" })),
+      task_text: Type.Optional(Type.String({ description: "Text (add/update)" })),
       task_id: Type.Optional(
-        Type.String({ description: "Task ref/order/text; accepts lists (\"2,3\") and ranges (\"2-4\")" })
+        Type.String({ description: "Ref/order/text; lists \"2,3\", ranges \"2-4\"" })
       ),
       status: Type.Optional(StringEnum(["pending", "in_progress", "done", "blocked"] as const)),
       notes: Type.Optional(Type.String({ description: "Notes" })),
       tier: Type.Optional(
         StringEnum(["t0", "t1", "t2", "t3", "active"] as const, {
-          description: "Trimegisto tier; t0/active fallback. Auto-classified if omitted.",
+          description: "Tier; t0/active fallback if omitted.",
         })
       ),
     }),

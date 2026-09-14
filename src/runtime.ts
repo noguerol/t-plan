@@ -455,7 +455,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       pendingForeignWrite = undefined;
       try {
         ctx.ui.notify(
-          "t-plan: plan file was updated by another session — session history merged; task state is last-write-wins.",
+          "t-plan: plan file was updated by another session — history merged; task state last-write-wins.",
           "warning"
         );
       } catch {
@@ -758,10 +758,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       await writePlanFile(ctx.cwd); // migrates a loaded legacy file to the unified name
       ctx.ui.notify(`loaded ${tasks.length}`, "info");
       if (target.legacy && target.sessionId) {
-        ctx.ui.notify(
-          `session ${target.sessionId}: pi --session ${target.sessionId}`,
-          "info"
-        );
+        ctx.ui.notify(`resume: pi --session ${target.sessionId}`, "info");
       }
     } catch (err) {
       logError("pickAndLoadPlan", err);
@@ -1123,8 +1120,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       }
 
       ctx.ui.notify(
-        `/task <action> [args]
-  add [text]   add [t0-t3]
+        `/task <action> [args]:
+  add [text] [t0-t3]
   done|remove|edit|move|start|block|tier [id]…`,
         "info"
       );
@@ -1258,8 +1255,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       config.toolEvidence = !config.toolEvidence;
       ctx.ui.notify(
         config.toolEvidence
-          ? "Tool evidence ON: touched files/commands complete tasks"
-          : "Tool evidence OFF: only text/markers drive status",
+          ? "Tool evidence ON: files/commands complete tasks"
+          : "Tool evidence OFF: text/markers only",
         "info"
       );
     } else if (choice.includes("Debug log")) {
@@ -1454,15 +1451,14 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         config.trimegisto ? ` (→ ${resolveEffectiveTier(t.tier, tgConfig)})` : "";
 
       const planFile = planFileNameFor(config.planFilePrefix, state.title);
-      let planContext = `[PLAN]\n${state.title} (file: ${planFile})\n`;
-      planContext += `Shared plan file: one per project, continues across sessions.\n`;
-      planContext += `Private: never git add/commit/publish plan files; gitignore ${config.planFilePrefix}_*.md; no force-add.\n`;
-      planContext += `Refs (#n) are stable handles: use them in task_id and [DONE:#n].\n\n`;
+      let planContext = `[PLAN]\n${state.title} (file: ${planFile}; one per project, continues across sessions)\n`;
+      planContext += `Private: never git add/commit/publish plan files (gitignore ${config.planFilePrefix}_*.md; no force-add)\n`;
+      planContext += `Refs (#n) are stable: use in task_id and [DONE:#n]\n\n`;
 
       if (config.trimegisto) {
         const available = (["t0", "t1", "t2", "t3"] as Tier[]).filter((tier) => isTierAvailable(tier, tgConfig));
         planContext += "[TG]\n";
-        planContext += "Use task →tier with trimegisto; unavailable => active. Batch independent tasks. Finish => plan_manager complete.\n";
+        planContext += "Use task →tier; unavailable => active. Batch independent. Finish => plan_manager complete.\n";
         planContext += "tiers: active=t0 default; t1=complex/planning; t2=medium/debug/review; t3=simple/mechanical\n";
         planContext += `available: ${available.map(tierToToolValue).join(", ")}\n\n`;
       }
@@ -1497,7 +1493,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         planContext += `Done (${done.length}): ${refs}${done.length > 12 ? ", ..." : ""}\n\n`;
       }
 
-      planContext += "Rules: before ending the turn call plan_manager complete task_id=<ref> for EVERY finished task (accepts \"2,3\" and text). Plan changed? add/remove/update. Starting? plan_manager start or name the task. Auto-tracking also uses the files/commands you touch.\n";
+      planContext += "Rules: before ending the turn, plan_manager complete task_id=<ref> for EVERY finished task (accepts \"2,3\" or text). Plan changed => add/remove/update; starting => plan_manager start or name it. Auto-tracking uses touched files/commands.\n";
 
       return {
         message: {
@@ -1894,7 +1890,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         case "complete": {
           if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
             return {
-              content: [{ type: "text", text: `task_id is required for complete action. Refs:\n${taskRefList()}` }],
+              content: [{ type: "text", text: `task_id required for complete. Refs:\n${taskRefList()}` }],
               details: {},
             };
           }
@@ -1917,7 +1913,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
         case "start": {
           if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
-            return { content: [{ type: "text", text: `task_id is required for start action. Refs:\n${taskRefList()}` }], details: {} };
+            return { content: [{ type: "text", text: `task_id required for start. Refs:\n${taskRefList()}` }], details: {} };
           }
           const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
@@ -1935,7 +1931,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
         case "block": {
           if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
-            return { content: [{ type: "text", text: `task_id is required for block action. Refs:\n${taskRefList()}` }], details: {} };
+            return { content: [{ type: "text", text: `task_id required for block. Refs:\n${taskRefList()}` }], details: {} };
           }
           const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
@@ -1954,7 +1950,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
         case "update": {
           if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
-            return { content: [{ type: "text", text: `task_id is required for update action. Refs:\n${taskRefList()}` }], details: {} };
+            return { content: [{ type: "text", text: `task_id required for update. Refs:\n${taskRefList()}` }], details: {} };
           }
           const task = resolveTaskIds(params.task_id)[0];
           if (!task) {
@@ -1981,7 +1977,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
         case "remove": {
           if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
-            return { content: [{ type: "text", text: `task_id is required for remove action. Refs:\n${taskRefList()}` }], details: {} };
+            return { content: [{ type: "text", text: `task_id required for remove. Refs:\n${taskRefList()}` }], details: {} };
           }
           const targets = resolveTaskIds(params.task_id);
           if (targets.length === 0) {
