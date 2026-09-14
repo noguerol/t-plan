@@ -150,3 +150,30 @@ test("fast consecutive writes from two sessions still merge both histories", asy
     }
   }
 });
+
+// ── Regresión QA: tareas cortas ("CI", "v2") se guardaban pero se perdían al
+// adoptar el archivo, porque extractPlanTasks filtraba textos <= 3 chars. ────────
+test("extractPlanTasks: short items are kept for files, filtered for prose", () => {
+  const md = "# p Plan\n\n## ⏳ Pending\n\n- [ ] #1. CI\n";
+  assert.equal(u.extractPlanTasks(md).length, 0, "default minLength still filters tiny prose items");
+  assert.equal(u.extractPlanTasks(md, { minLength: 1 }).length, 1, "file adoption keeps short tasks");
+});
+
+test("short tasks survive cross-session adoption", async () => {
+  const cwd = join(await mkdtemp(join(tmpdir(), "tplan-short-")), "proj");
+  await mkdir(cwd, { recursive: true });
+  const h1 = await createHarness({ cwd, sessionId: "sessA" });
+  await h1.addTasks(["CI", "v2", "deploy the app"]);
+  await h1.cleanup();
+
+  const h2 = await createHarness({ cwd, sessionId: "sessB" });
+  try {
+    const list = (await h2.tool({ action: "list" })).content[0].text;
+    assert.match(list, /#1\. CI/);
+    assert.match(list, /#2\. v2/);
+    assert.match(list, /#3\. deploy the app/);
+  } finally {
+    await h2.cleanup();
+    await rm(cwd, { recursive: true, force: true });
+  }
+});

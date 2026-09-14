@@ -134,8 +134,11 @@ export function planTitle(projectName: string, lang: PlanLanguage): string {
   return `${name} Plan`;
 }
 
-export function extractPlanTasks(text: string): PlanTask[] {
+export function extractPlanTasks(text: string, options: { minLength?: number } = {}): PlanTask[] {
   const tasks: PlanTask[] = [];
+  // `minLength` defaults to 4 for model-prose detection (filters noise like "1. a"),
+  // but plan-file adoption passes 1 so short user tasks ("CI", "v2") are not lost.
+  const minLength = options.minLength ?? 4;
   const lines = text.split(/\r?\n/);
   
   const patterns = [
@@ -189,7 +192,7 @@ export function extractPlanTasks(text: string): PlanTask[] {
       const ref = refFromTaskText(numberedMatch[2]);
       const tier = tierFromTaskText(numberedMatch[2]);
       const text = cleanTaskText(numberedMatch[2]);
-      if (text.length > 3 && !isSummaryLine(text)) {
+      if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
           ref: ref ?? 0, // present when read back from a plan file
@@ -208,7 +211,7 @@ export function extractPlanTasks(text: string): PlanTask[] {
       const ref = refFromTaskText(checkboxMatch[2]);
       const tier = tierFromTaskText(checkboxMatch[2]);
       const text = cleanTaskText(checkboxMatch[2]);
-      if (text.length > 3 && !isSummaryLine(text)) {
+      if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
           ref: ref ?? 0, // present when read back from a plan file
@@ -227,7 +230,7 @@ export function extractPlanTasks(text: string): PlanTask[] {
       const ref = refFromTaskText(stepMatch[3] ?? "");
       const tier = tierFromTaskText(stepMatch[3] ?? "");
       const text = cleanTaskText(stepMatch[3] ?? "");
-      if (text.length > 3 && !isSummaryLine(text)) {
+      if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
           ref: ref ?? 0, // present when read back from a plan file
@@ -246,7 +249,7 @@ export function extractPlanTasks(text: string): PlanTask[] {
         const ref = refFromTaskText(dashMatch[1]);
         const tier = tierFromTaskText(dashMatch[1]);
         const text = cleanTaskText(dashMatch[1]);
-        if (text.length > 3 && !text.startsWith("#") && !isSummaryLine(text)) {
+        if (text.length >= minLength && !text.startsWith("#") && !isSummaryLine(text)) {
           tasks.push({
             id: generateId(),
             ref: ref ?? 0, // present when read back from a plan file
