@@ -2,11 +2,11 @@
  * Arnés mínimo para ejercitar el runtime de t-plan sin pi: `createPlanRuntime(pi)`
  * sólo usa pi.appendEntry, y el ctx de extensión se limita a ui.* + cwd + sessionManager.
  */
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export async function createHarness() {
+export async function createHarness(options = {}) {
   // HOME temporal: ni el config global del usuario (~/.pi/agent/t-plan/config.json)
   // ni el de trimegisto pueden alterar el comportamiento bajo test.
   const prevHome = process.env.HOME;
@@ -17,7 +17,9 @@ export async function createHarness() {
   const entries = [];
   const notes = [];
   const widgets = new Map();
-  const cwd = await mkdtemp(join(tmpdir(), "tplan-test-"));
+  const reuseCwd = !!options.cwd;
+  const cwd = options.cwd ?? (await mkdtemp(join(tmpdir(), "tplan-test-")));
+  const sessionId = options.sessionId ?? "sess1234abcd";
 
   const pi = {
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
@@ -43,7 +45,7 @@ export async function createHarness() {
       input: async () => "",
     },
     sessionManager: {
-      getSessionId: () => "sess1234abcd",
+      getSessionId: () => sessionId,
       getEntries: () => entries,
     },
   };
@@ -109,7 +111,12 @@ export async function createHarness() {
     return "";
   }
 
-  async function cleanup() {
+  async function planFiles() {
+    return (await readdir(cwd)).filter((name) => name.endsWith(".md"));
+  }
+
+  /** Detiene el runtime sin borrar `cwd` (para encadenar sesiones sobre el mismo proyecto). */
+  async function stop() {
     // Para el runtime: sin esto, los timers de animación/highlight mantienen vivo
     // el event loop y node --test cuelga al final.
     try {
@@ -117,10 +124,14 @@ export async function createHarness() {
     } catch {
       // ya parado
     }
-    await rm(cwd, { recursive: true, force: true });
     await rm(home, { recursive: true, force: true });
     process.env.HOME = prevHome;
   }
 
-  return { rt, ctx, pi, entries, notes, widgets, cwd, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, cleanup };
+  async function cleanup() {
+    await stop();
+    if (!reuseCwd) await rm(cwd, { recursive: true, force: true });
+  }
+
+  return { rt, ctx, pi, entries, notes, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup };
 }

@@ -6,21 +6,22 @@
 
 # t-plan — Implementation Plan Tracking for pi
 
-t-plan keeps a live, persistent implementation plan for every pi session. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a **session-scoped plan file** in your project directory — so your plan survives restarts, session switches and compaction.
+t-plan keeps a live, persistent implementation plan for every project. It auto-detects plans from the model's output, tracks progress in real time as the model works, renders a compact animated TUI widget, and maintains a **single unified plan file per project** in your working directory — so your plan survives restarts, session switches and compaction.
 
 The model gets a `plan_manager` tool plus automatic plan-context injection, so it can create, update and complete tasks itself. Progress detection also works without any tool calls: the extension reads the model's natural language (English, Spanish **and Mandarin Chinese**) and its tool activity to mark tasks in progress and done.
 
-**Per-session plans:** every plan file is bound to the pi session that created it (`plan_<title>_<session-id>.md`), so several pi instances can work on different plans in the same directory without ever colliding. Resuming a session brings its plan back; loading a foreign plan file tells you which session owns it and how to resume it.
+**One plan file per project:** the file is named `${prefix}_<title-slug>.md` (e.g. `plan_my-app.md`) — the session id is never part of the name. Every pi session working in the same directory reads and updates the *same* file, so the task history is unique instead of multiplying into one file per session. The file also records which sessions worked on it — see [The unified plan file](#the-unified-plan-file).
 
 **Trimegisto integration:** with Trimegisto mode enabled, every task is classified by complexity and assigned a tier — **t1** (complex → deep thinking), **t2** (medium → solver), **t3** (simple → mechanical) — so the model launches each task on the right agent tier. Task timers show a live `HH:MM:SS` counter for every in-progress task.
 
 ## What's new
 
+- **v1.3.0 — one plan file, no more session copies** — the plan file is no longer session-scoped: the session id is gone from the filename and there is **one plan file per project**, kept across sessions. Any session started in the same directory adopts the plan already on disk, so task history stops multiplying into `plan_<title>_<session>.md` copies. The plan file now also carries a **Sessions section** recording which pi sessions worked on it (id, first/last seen, optional title). Legacy session-scoped files are still detected and are renamed to the unified name when they match the project or when you load them, and `.gitignore` now ignores `<prefix>_*.md`. Task lines now persist their stable `#ref` (`#3. …`), so task identity, statuses and session history all survive a reload. If another pi session edits the file between our writes, that session's history is merged into the `## 🗂 Sessions` section so no session record is lost, and a warning notes that task state remains last-write-wins.
 - **v1.2.1 — same wrap-up closers in English** — the new session-closers from v1.2.0 are language-mirrored: “Already committed and pushed”, “The fix is closed and deployed”, “Working tree is clean, no pending changes”, “All committed and pushed to main”, “already published”, “Resolved. Everything is wrapped up.”, and line-start “Fixed ✅…” / “Done.” all conclude a session now, with the same “not yet / not deployed / …but the deploy is pending” vetoes. (EN was already the core language of the fuzzy detector; this closes the gap for the exact equivalents that were failing in real sessions.)
 - **v1.2.0 — no more tasks stuck “in progress” with the timer running** — real sessions still left finished tasks spinning: (a) a summary with three numbered diagnosis points plus a cue word like “actualizados” made the plan reconciler add **phantom tasks** from plain prose; (b) real wrap-up sentences (“Ya estaba commiteado y pusheado…”, “Working tree: limpio, sin cambios pendientes.”, “No queda nada pendiente por commitear ni pushear.”, “está cerrado y desplegado”, “ya publicado”, “Arreglado ✅…”) never matched any completion detector; (c) when the agent run settled normally the model is **idle**, but tasks it had started stayed `in_progress` forever with the `HH:MM:SS` timer counting idle time — across messages, unrelated runs and even session restarts. Fixed: plan refreshes now require **real plan structure** (headings/checkboxes) so prose never spawns tasks; new **wrap-up patterns** recognize the closers real sessions produce (imperfect tense “estaba”, double-m “commiteado”, git-clean prose, “no queda nada pendiente”) with a negation veto (“no está hecho todavía” never concludes); on a normal settle tasks nobody worked on and no longer mentions revert to `pending` (timer stops), and restoring a session parks stale `in_progress` tasks instead of resuming old timers. 43 tests green.
 - **v1.1.0 — no more "done-but-pending" tasks** — completed work used to stay pending because (a) `agent_settled` reset every in-progress task to pending at the end of *any* run (even successful ones), (b) the fuzzy detector dropped sentences over 300 chars, required a completion verb that was missing for ~20 Spanish participles, and failed by a floating-point epsilon on `0.55`, (c) real tool activity (edited files, run tests) never completed anything, (d) `[DONE:1,2,3]` only marked the first id, (e) task numbers shifted mid-run when tasks were removed, (f) only 10 pending tasks were injected into the model context. Fixed: abort-aware settle (only interrupted runs pause), clause-level detection with an epsilon-safe threshold and a full participle set, deterministic **tool-evidence completion**, multi-id/range/`all` `[DONE:…]`, stable **#refs** that never renumber, the full plan injected with refs, and per-task (never bulk) touch tracking so conclusions drop only what nobody acted on.
 - **Stable task refs** — every task carries a `#ref` assigned once and never renumbered (`[DONE:#3]`, `task_id="3"`, `task_id="2,3"`, `task_id="2-4"`, `task_id="all"`). Display order may change; refs don't.
-- **Plan files are private — never commit or publish them** — t-plan now enforces this in three ways: it keeps the session-scoped pattern (`plan_*_[0-9a-zA-Z]*.md`, plus legacy `plan.md`) in your `.gitignore` automatically, it instructs the model never to `git add`/commit/publish plan files, and every generated plan file carries a private-runtime-state marker.
+- **Plan files are private — never commit or publish them** — t-plan now enforces this in three ways: it keeps the pattern `<prefix>_*.md` (which covers unified and legacy session-scoped names, and adds legacy `plan.md` when the prefix is `plan`) in your `.gitignore` automatically, it instructs the model never to `git add`/commit/publish plan files, and every generated plan file carries a private-runtime-state marker.
 - **Mandarin Chinese support** — automatic language detection now recognizes Mandarin/Chinese text and localizes auto-generated plan titles as `{project} 计划`.
 - **Chinese plan parsing** — t-plan detects headings and task formats such as `## 计划`, `1、任务`, `## 步骤 1：...`, and status groups like `已完成`, `进行中`, `待办`, and `阻塞`.
 - **Trilingual fuzzy progress detection** — Mandarin completion/start/removal/conclusion phrases like `已完成`, `正在`, `移除`, `不再需要`, and `全部完成` now work alongside English and Spanish.
@@ -31,8 +32,9 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 ## Features
 
 - **Auto-detect plans** from model output — numbered lists, checkboxes, step headers, plan sections
-- **Session-scoped plan files** — `plan_<title-slug>_<session-id>.md`: one file per pi session, zero collisions between parallel instances
-- **Session ↔ plan binding** — resuming a session restores its plan (and keeps writing the same file); loading another session's plan hints `pi --session <id>`
+- **Unified plan file** — `plan_<title-slug>.md`: one file per project, no session id in the name and no per-session copies
+- **Session history in the file** — a `## 🗂 Sessions` section records which pi sessions worked on the plan (first/last seen, optional title, newest first, capped at 20)
+- **Cross-session continuity** — a new session in the same directory continues the plan already on disk; legacy session-scoped files are adopted and renamed to the unified name instead of multiplying
 - **Localized plan title** — `{project} Plan` / `Plan de {project}` / `{project} 计划` following the conversation language; shown in the widget and used in the file name
 - **Live TUI widget** — compact, animated, always-visible progress above or below the editor
 - **Automatic progress tracking** — fuzzy trilingual (EN/ES/ZH Mandarin) matching of completion/starting/removal language plus tool-call evidence; no `[DONE:n]` markers required
@@ -77,7 +79,7 @@ pi remove git:github.com/noguerol/t-plan
 1. Start (or continue) a conversation about a multi-step project.
 2. The model produces a plan — a numbered list, checkboxes or a `## Plan` section. t-plan detects it automatically and creates the task list.
 3. Watch the widget: tasks turn 🔄 in progress (with a live timer) as the model works on them and ✅ done as they complete — detected from its responses and tool activity.
-4. The session's plan file (`plan_<title>_<session>.md`) appears in your working directory and stays up to date.
+4. The project's plan file (`plan_<title-slug>.md`, e.g. `plan_myapp.md`) appears in your working directory and stays up to date — the same file is continued by every later session.
 5. Correct or drive anything manually at any time:
 
 ```
@@ -88,21 +90,23 @@ pi remove git:github.com/noguerol/t-plan
 
 The extension is enabled by default. Toggle it anytime with `/t-plan` or `Ctrl+Alt+P`.
 
-## Session-Scoped Plan Files
+## The unified plan file
 
-Each plan belongs to exactly one pi session, and its file name carries both the plan title and the session id:
+One plan file per project, maintained across sessions — no session id in the name:
 
 ```
-plan_<title-slug>_<session-id>.md      e.g. plan_myapp_01a048c3.md
+<prefix>_<title-slug>.md      e.g. plan_myapp.md
 ```
 
-- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten.
-- **Parallel instances** — two pi processes in the same directory produce `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`; they never intersect.
-- **Resume a session → get its plan back.** Plan state rides in the session file, and updates keep landing on the same plan file.
-- **Private by design — never commit or publish plan files.** Plan files are runtime state, not source: t-plan keeps the pattern `<prefix>_*_[0-9a-zA-Z]*.md` (plus legacy `plan.md`) in your `.gitignore` automatically — best-effort, and only inside a git working tree — and the model is explicitly instructed never to `git add`, commit, force-add or publish them. A fixed-filename rule like `plan.md` is not enough: the session id in the name changes per session, so the ignore entry must be the pattern. If you commit or share plan files, you leak session-internal state.
-- **Load a plan → find its session.** `/t-plan load` lists every plan file in the directory (title, session id, task count, last modified). Picking one adopts its tasks into the current session, and if it belongs to another session the extension tells you how to jump back: `pi --session <id>`.
-- **Purge** (`/t-plan purge`) removes only this session's plan file.
-- Old single-file setups keep working: a legacy `plan.md` shows up in the `/t-plan load` picker.
+- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten. Renaming the title writes the plan under the new name and leaves the previous file on disk.
+- **One file, every session** — a new pi session in the same directory adopts the tasks already on disk and keeps writing the same file; resuming a session brings its plan back too. Two pi processes in one directory share the same plan instead of producing `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`.
+- **One writer at a time** — the unified file is last-write-wins. Work on a project from a single pi session at a time; a second concurrent session in the same directory can overwrite the first one's latest state on disk (each session still keeps its own plan state in the session log, so resuming it recovers that session's view).
+- **Concurrent sessions keep their session history** — if the unified file was modified by another pi session between our writes, t-plan merges that session's history into the `## 🗂 Sessions` section so no session record is lost, and warns that task state remains last-write-wins.
+- **Sessions section** — the file includes a `## 🗂 Sessions` section (written before the footer) listing the pi sessions that worked on it (session id, first/last seen timestamps and an optional title), newest first, capped at the 20 most recent. The plan file therefore carries a short runtime history, not source.
+- **Private by design — never commit or publish plan files.** Plan files are runtime state, not source: t-plan keeps the pattern `<prefix>_*.md` (plus `plan.md` when the prefix is `plan`) in your `.gitignore` automatically — best-effort, and only inside a git working tree — and the model is explicitly instructed never to `git add`, commit, force-add or publish them. If you commit or share plan files, you leak session-internal state.
+- **Load a plan.** `/t-plan load` lists every plan file in the directory as `1. <title> · <n> tasks · <date>`, marking the current project file `← current` and old session-scoped files `(legacy)`. Picking one adopts its title, tasks and session history into the current session, and the extension then writes the unified file. Legacy candidates keep their session id as a hint — the extension still tells you how to jump back with `pi --session <id>`.
+- **Legacy files are migrated, not duplicated.** A session-scoped `plan_<slug>_<session-id>.md` (or `plan_<slug>_noid.md`) is still detected and read; when it matches the current project title (or you load it), it is **renamed** to `plan_<slug>.md` and becomes *the* unified file (the most recently modified matching legacy file is adopted first).
+- **Purge** (`/t-plan purge`) deletes all tasks, resets the plan state and removes the project's plan file.
 
 ## Trimegisto Mode
 
@@ -136,10 +140,10 @@ Every in-progress task can show a live `HH:MM:SS` counter since it started (spin
 | `/t-plan on` / `/t-plan off` | Enable/disable tracking |
 | `/t-plan show` | Display current plan status |
 | `/t-plan new` | Create a new (empty) plan |
-| `/t-plan load` | Pick a plan file in the directory and load it |
-| `/t-plan save` | Save tasks to this session's plan file |
-| `/t-plan clear` | Remove all tasks (keep state) |
-| `/t-plan purge` | Delete all tasks, reset state and remove this session's plan file |
+| `/t-plan load` | List the project's plan files (legacy ones highlighted) and load one into the current session |
+| `/t-plan save` | Save tasks to the project's plan file |
+| `/t-plan clear` | Remove all tasks from the live plan (the plan file is left as-is) |
+| `/t-plan purge` | Delete all tasks, reset state and remove the project's plan file |
 
 ### `/task` — manual task management
 
@@ -197,7 +201,7 @@ The widget is designed to stay compact and readable during long projects:
 
 - **At most 5 tasks** shown, with a `... N more` summary line
 - **One line per task** — long descriptions are truncated with a single `…` ellipsis
-- **Ordering:** in-progress tasks first (animated braille spinner), then blocked, then upcoming by priority
+- **Ordering:** in-progress and blocked tasks first (in-progress with an animated braille spinner), then upcoming by priority
 - **Completed tasks** are struck through, briefly illuminated, then fade out after ~2.4s
 - **Trimegisto mode:** colored `[tN]` badge per task and a header distribution like `📋 Title  2/7 done • 1 active • t1×1 t2×3 t3×2`
 - **Timers:** `⏱ HH:MM:SS` next to each in-progress task
@@ -220,7 +224,7 @@ Task status also updates automatically from the model's language and tool activi
 
 ## Plan File Format
 
-The extension maintains one plan file per pi session in your working directory:
+The extension maintains one plan file per project in your working directory — shared and continued across sessions:
 
 ```markdown
 # Project Plan
@@ -233,23 +237,32 @@ The extension maintains one plan file per pi session in your working directory:
 
 ## 🔄 In Progress
 
-- [ ] Implement authentication module ⏱ 00:04:12 (→ t2) (agent: auth-worker)
-- [ ] Set up database schema (→ t2)
+- [ ] #1. Implement authentication module ⏱ 00:04:12 (→ t2) (agent: auth-worker)
+- [ ] #2. Set up database schema (→ t2)
 
 ## ⏳ Pending
 
-- [ ] Create API endpoints (→ t2)
-- [ ] Translate error messages (→ t3)
+- [ ] #3. Create API endpoints (→ t2)
+- [ ] #4. Translate error messages (→ t3)
 
 ## ✅ Completed
 
-- [x] Initialize project structure (took 00:01:48) (→ t3)
+- [x] #5. Initialize project structure (took 00:01:48) (→ t3)
+
+## 🗂 Sessions
+
+- `01a04f9f` — first seen 2026-08-30 00:24:33, last seen 2026-08-30 00:34:53 — "Optimize startup"
+- `01a048c3` — first seen 2026-08-29 19:05:21, last seen 2026-08-29 20:10:03
 
 ---
 *Last updated: 1/1/2026, 12:00:00*
 ```
 
-Edit the file by hand if you like — `/t-plan load` parses it back, including the status-group sections, summary counters, tier markers and timers.
+The `## 🗂 Sessions` section is written after the last task group and before the footer, only when at least one session has been recorded; sessions are sorted by most recent activity and capped at 20. It is history metadata, not tasks — the parser never turns its entries into tasks.
+
+Each task line carries its stable `#ref` (`#5. Initialize project structure`) so refs, statuses and the task history survive a reload and continue in the next session.
+
+Edit the file by hand if you like — `/t-plan load` parses it back, including the status-group sections, summary counters, stable refs, tier markers, timers and the session history.
 
 ## Configuration
 
@@ -261,7 +274,7 @@ Open with `/t-plan config`:
 | Auto-detect plans | ON | Detect plans in model output |
 | Show widget | ON | Display the task widget |
 | Widget placement | aboveEditor | Widget position (above/below editor) |
-| Plan file prefix | `plan` | Plan files: `<prefix>_<title>_<session>.md` |
+| Plan file prefix | `plan` | Plan file: `<prefix>_<title-slug>.md` — one per project, never session-scoped. The prefix prompt is labelled `File prefix (<prefix>_<title>.md):` |
 | Track agents | ON | Monitor parallel agent tasks |
 | Trimegisto mode | OFF | Tier classification + agent assignment per task |
 | Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
@@ -281,7 +294,8 @@ t-plan/
 ├── LICENSE             # MIT
 ├── README.md
 └── src/
-    ├── index.ts        # Extension entry point (commands, widget, tool, hooks)
+    ├── index.ts        # Extension entry point (registers commands, shortcut, tool, events)
+    ├── runtime.ts      # Lazy-loaded extension body (handlers, widget, file I/O, detection)
     ├── types.ts        # Task/state/config types and defaults
     ├── tiers.ts        # Trimegisto tier classification, availability and timers
     └── utils.ts        # Plan parsing, fuzzy matching and reconciliation engine

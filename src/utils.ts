@@ -1,5 +1,5 @@
 
-import type { PlanTask, PlanState, TaskStatus } from "./types.ts";
+import type { PlanTask, PlanState, PlanSession, TaskStatus, Tier } from "./types.ts";
 import { formatElapsed, tierBadge, tierColor } from "./tiers.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -29,28 +29,74 @@ export function titleToProjectName(title: string): string {
   return stripped || title;
 }
 
-export function planFileNameFor(prefix: string, title: string, sessionId: string | undefined): string {
+/** Unified, session-independent plan file name: `${prefix}_${slug}.md`. */
+export function planFileNameFor(prefix: string, title: string): string {
   const slug = slugify(titleToProjectName(title)) || "untitled";
-  const id = sessionId ? sessionId.replace(/[^0-9a-zA-Z]/g, "").slice(0, 8) : "noid";
-  return `${prefix}_${slug}_${id}.md`;
+  return `${prefix}_${slug}.md`;
 }
 
 export interface ParsedPlanFileName {
   titleSlug: string;
-    sessionId: string | undefined;
+  sessionId?: string;   // only for legacy session-scoped names
+  legacy: boolean;
 }
 
 const SHORT_ID_RE = "[0-9a-zA-Z]{6,12}|noid";
 
+/**
+ * Resolves a plan file name: LEGACY session-scoped names first
+ * (`${prefix}_${slug}_${id}.md`), then the unified `${prefix}_${slug}.md`.
+ */
 export function parsePlanFileName(name: string, prefix: string): ParsedPlanFileName | null {
+  // Tolerate a trailing \r from CRLF reads and surrounding whitespace from listings.
+  const clean = name.trim();
   const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`^${escaped}_(?<slug>.+)_(?<id>${SHORT_ID_RE})\\.md$`, "i");
-  const m = name.match(re);
-  if (!m || !m.groups) return null;
-  return {
-    titleSlug: m.groups.slug,
-    sessionId: m.groups.id === "noid" ? undefined : m.groups.id,
-  };
+  const legacyRe = new RegExp(`^${escaped}_(?<slug>.+)_(?<id>${SHORT_ID_RE})\\.md$`, "i");
+  const legacyMatch = clean.match(legacyRe);
+  if (legacyMatch?.groups) {
+    return {
+      titleSlug: legacyMatch.groups.slug,
+      sessionId: legacyMatch.groups.id === "noid" ? undefined : legacyMatch.groups.id,
+      legacy: true,
+    };
+  }
+
+  const unifiedRe = new RegExp(`^${escaped}_(?<slug>.+)\\.md$`, "i");
+  const unifiedMatch = clean.match(unifiedRe);
+  if (unifiedMatch?.groups) {
+    return { titleSlug: unifiedMatch.groups.slug, sessionId: undefined, legacy: false };
+  }
+
+  return null;
+}
+
+/** Local `YYYY-MM-DD HH:mm:ss`, built by hand so the reverse parse is deterministic. */
+export function formatSessionStamp(ts: number): string {
+  if (!Number.isFinite(ts)) return ""; // NaN/Infinity have no wall-clock stamp
+  const d = new Date(ts);
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+/** Accepts `YYYY-MM-DD[ T]HH:mm(:ss)?` and builds a local Date. NaN if unparseable. */
+export function parseSessionStamp(s: string): number {
+  if (typeof s !== "string") return NaN;
+  const m = s.trim().match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return NaN;
+  const year = Number(m[1]);
+  const month = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  const hour = Number(m[4]);
+  const minute = Number(m[5]);
+  const second = Number(m[6] ?? "0");
+  if (month < 0 || month > 11 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 59) {
+    return NaN;
+  }
+  const d = new Date(year, month, day, hour, minute, second);
+  // Reject impossible calendar dates (2026-13-45, 2026-02-30) but still accept
+  // DST-nonexistent local times, which JS normalises within the same calendar day.
+  if (d.getFullYear() !== year || d.getMonth() !== month || d.getDate() !== day) return NaN;
+  return d.getTime();
 }
 
 export function deslugTitle(slug: string): string {
@@ -90,7 +136,7 @@ export function planTitle(projectName: string, lang: PlanLanguage): string {
 
 export function extractPlanTasks(text: string): PlanTask[] {
   const tasks: PlanTask[] = [];
-  const lines = text.split("\n");
+  const lines = text.split(/\r?\n/);
   
   const patterns = [
     /^\s*(\d+)[.)、．]\s*(.+)$/,
@@ -101,10 +147,19 @@ export function extractPlanTasks(text: string): PlanTask[] {
 
   let inPlanSection = false;
   let planSectionFound = false;
+  let inSessionsSection = false;
   let currentStatus: TaskStatus = "pending";
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // La sección `## 🗂 Sessions` es metadato de sesiones, no tareas: sus bullets
+    // (aunque parezcan checkboxes numerados) nunca deben importarse como plan.
+    // Cualquier heading posterior vuelve a habilitar el parseo normal.
+    const lineHeading = headingText(line);
+    if (lineHeading !== undefined) inSessionsSection = lineHeading === "Sessions";
+    if (inSessionsSection) continue;
+
     const headingStatus = statusFromHeading(line);
     
     if (headingStatus) {
@@ -121,8 +176,8 @@ export function extractPlanTasks(text: string): PlanTask[] {
       continue;
     }
 
-    if (inPlanSection && /^#{1,2}\s+(?!(?:Step|步骤|第\s*\d+\s*步))/i.test(line) && planSectionFound) {
-      if (!/^#{1,4}\s+(?:(?:Step|步骤)\s*\d+|第\s*\d+\s*步)/i.test(line)) {
+    if (inPlanSection && /^#{1,6}\s+(?!(?:Step|步骤|第\s*\d+\s*步))/i.test(line) && planSectionFound) {
+      if (!/^#{1,6}\s+(?:(?:Step|步骤)\s*\d+|第\s*\d+\s*步)/i.test(line)) {
         inPlanSection = false;
         currentStatus = "pending";
       }
@@ -131,14 +186,17 @@ export function extractPlanTasks(text: string): PlanTask[] {
     const numberedMatch = line.match(patterns[0]);
     if (numberedMatch && (inPlanSection || !planSectionFound)) {
       const step = parseInt(numberedMatch[1]);
+      const ref = refFromTaskText(numberedMatch[2]);
+      const tier = tierFromTaskText(numberedMatch[2]);
       const text = cleanTaskText(numberedMatch[2]);
       if (text.length > 3 && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
-          ref: 0, // asignado por assignRefs() al final
+          ref: ref ?? 0, // present when read back from a plan file
           text,
           status: currentStatus,
           order: step,
+          ...(tier ? { tier } : {}),
         });
       }
       continue;
@@ -147,14 +205,17 @@ export function extractPlanTasks(text: string): PlanTask[] {
     const checkboxMatch = line.match(patterns[1]);
     if (checkboxMatch) {
       const isDone = checkboxMatch[1].toLowerCase() === "x";
+      const ref = refFromTaskText(checkboxMatch[2]);
+      const tier = tierFromTaskText(checkboxMatch[2]);
       const text = cleanTaskText(checkboxMatch[2]);
       if (text.length > 3 && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
-          ref: 0, // asignado por assignRefs() al final
+          ref: ref ?? 0, // present when read back from a plan file
           text,
           status: isDone ? "done" : currentStatus,
           order: tasks.length + 1,
+          ...(tier ? { tier } : {}),
         });
       }
       continue;
@@ -163,14 +224,17 @@ export function extractPlanTasks(text: string): PlanTask[] {
     const stepMatch = line.match(patterns[2]);
     if (stepMatch) {
       const step = parseInt(stepMatch[1] ?? stepMatch[2] ?? "0");
+      const ref = refFromTaskText(stepMatch[3] ?? "");
+      const tier = tierFromTaskText(stepMatch[3] ?? "");
       const text = cleanTaskText(stepMatch[3] ?? "");
       if (text.length > 3 && !isSummaryLine(text)) {
         tasks.push({
           id: generateId(),
-          ref: 0, // asignado por assignRefs() al final
+          ref: ref ?? 0, // present when read back from a plan file
           text,
           status: currentStatus,
           order: step,
+          ...(tier ? { tier } : {}),
         });
       }
       continue;
@@ -179,14 +243,17 @@ export function extractPlanTasks(text: string): PlanTask[] {
     if (inPlanSection) {
       const dashMatch = line.match(patterns[3]);
       if (dashMatch) {
+        const ref = refFromTaskText(dashMatch[1]);
+        const tier = tierFromTaskText(dashMatch[1]);
         const text = cleanTaskText(dashMatch[1]);
         if (text.length > 3 && !text.startsWith("#") && !isSummaryLine(text)) {
           tasks.push({
             id: generateId(),
-            ref: 0, // asignado por assignRefs() al final
+            ref: ref ?? 0, // present when read back from a plan file
             text,
             status: currentStatus,
             order: tasks.length + 1,
+            ...(tier ? { tier } : {}),
           });
         }
       }
@@ -197,8 +264,21 @@ export function extractPlanTasks(text: string): PlanTask[] {
   return tasks;
 }
 
+/** Captures the `(→ tN)` tier marker before `cleanTaskText` strips it. */
+function tierFromTaskText(text: string): Tier | undefined {
+  const m = text.match(/\(?\s*(?:→|->)\s*(t[0-3])\s*\)?/i);
+  return m ? (m[1].toLowerCase() as Tier) : undefined;
+}
+
+/** Captures the stable `#N.` ref written by `generatePlanMarkdown` (space required). */
+export function refFromTaskText(text: string): number | undefined {
+  const m = text.match(/^\s*#(\d+)\.\s+/);
+  return m ? Number.parseInt(m[1], 10) : undefined;
+}
+
 function cleanTaskText(text: string): string {
   return text
+    .replace(/^\s*#\d+\.\s+/, "")           // stable ref written by generatePlanMarkdown
     .replace(/\((?:→|->)\s*t[0-3]\)/gi, "")   // tier marker written by generatePlanMarkdown
     .replace(/\(took\s+[\d:]+\)/gi, "")        // completion timer written by generatePlanMarkdown
     .replace(/⏱\s*[\d:]+/g, "")                 // running timer written by generatePlanMarkdown
@@ -212,7 +292,7 @@ function cleanTaskText(text: string): string {
 }
 
 function headingText(line: string): string | undefined {
-  const match = line.match(/^#{1,6}\s+(.+)$/);
+  const match = line.replace(/\r+$/, "").match(/^#{1,6}\s+(.+)$/);
   if (!match) return undefined;
   return match[1]
     .replace(/^[^\p{L}\p{N}]+/u, "")
@@ -250,16 +330,17 @@ function statusFromHeading(line: string): TaskStatus | undefined {
 }
 
 export function containsPlan(text: string): boolean {
-  if (text.split("\n").some((line) => isPlanSectionHeading(line) || statusFromHeading(line))) {
+  const normalized = text.replace(/\r\n?/g, "\n");
+  if (normalized.split("\n").some((line) => isPlanSectionHeading(line) || statusFromHeading(line))) {
     return true;
   }
 
-  const numberedItems = text.match(/^\s*\d+[.)]\s+.+$/gm);
+  const numberedItems = normalized.match(/^\s*\d+[.)]\s+.+$/gm);
   if (numberedItems && numberedItems.length >= 3) {
     return true;
   }
 
-  const checkboxItems = text.match(/^\s*[-*]\s+\[[ xX]\]\s+.+$/gm);
+  const checkboxItems = normalized.match(/^\s*[-*]\s+\[[ xX]\]\s+.+$/gm);
   if (checkboxItems && checkboxItems.length >= 3) {
     return true;
   }
@@ -277,10 +358,11 @@ export function containsPlan(text: string): boolean {
  * la adopción inicial (state vacío) sigue usando containsPlan sin esta exigencia.
  */
 export function hasRealPlanStructure(text: string): boolean {
-  const lines = text.split("\n");
+  const normalized = text.replace(/\r\n?/g, "\n");
+  const lines = normalized.split("\n");
   if (lines.some((line) => isPlanSectionHeading(line) || statusFromHeading(line))) return true;
-  if (/^\s*[-*]\s+\[[ xX]\]\s+/m.test(text)) return true; // línea de checkbox
-  if (/\[PLAN\]|Refs\s*\(#n\)|plan_manager\b|##\s*Done|##\s*Todo/i.test(text)) return true;
+  if (/^\s*[-*]\s+\[[ xX]\]\s+/m.test(normalized)) return true; // línea de checkbox
+  if (/\[PLAN\]|Refs\s*\(#n\)|plan_manager\b|##\s*Done|##\s*Todo/i.test(normalized)) return true;
   return false;
 }
 
@@ -329,13 +411,16 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     return ` (→ ${task.tier})`;
   };
 
+  const refPrefix = (task: PlanTask): string =>
+    typeof task.ref === "number" && task.ref > 0 ? `#${task.ref}. ` : "";
+
   if (inProgressTasks.length > 0) {
     lines.push("## 🔄 In Progress");
     lines.push("");
     for (const task of inProgressTasks.sort((a, b) => a.order - b.order)) {
       const agent = task.agentName ? ` (agent: ${task.agentName})` : "";
       const timer = showTimers && task.startedAt ? ` ⏱ ${formatElapsed(now - task.startedAt)}` : "";
-      lines.push(`- [ ] ${task.text}${timer}${tierSuffix(task)}${agent}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${timer}${tierSuffix(task)}${agent}`);
     }
     lines.push("");
   }
@@ -344,7 +429,7 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("## ⏳ Pending");
     lines.push("");
     for (const task of pendingTasks.sort((a, b) => a.order - b.order)) {
-      lines.push(`- [ ] ${task.text}${tierSuffix(task)}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}`);
     }
     lines.push("");
   }
@@ -354,7 +439,7 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("");
     for (const task of blockedTasks.sort((a, b) => a.order - b.order)) {
       const note = task.notes ? ` — ${task.notes}` : "";
-      lines.push(`- [ ] ${task.text}${tierSuffix(task)}${note}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}${note}`);
     }
     lines.push("");
   }
@@ -366,7 +451,19 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
       const took = showTimers && task.startedAt && task.completedAt
         ? ` (took ${formatElapsed(task.completedAt - task.startedAt)})`
         : "";
-      lines.push(`- [x] ${task.text}${took}${tierSuffix(task)}`);
+      lines.push(`- [x] ${refPrefix(task)}${task.text}${took}${tierSuffix(task)}`);
+    }
+    lines.push("");
+  }
+
+  const sessions = state.sessions ?? [];
+  if (sessions.length > 0) {
+    lines.push("## 🗂 Sessions");
+    lines.push("");
+    const recent = [...sessions].sort((a, b) => b.lastSeenAt - a.lastSeenAt).slice(0, 20);
+    for (const session of recent) {
+      const title = session.title ? ` — "${session.title}"` : "";
+      lines.push(`- \`${session.id}\` — first seen ${formatSessionStamp(session.startedAt)}, last seen ${formatSessionStamp(session.lastSeenAt)}${title}`);
     }
     lines.push("");
   }
@@ -377,6 +474,38 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   lines.push("<!-- PRIVATE RUNTIME STATE — generated by the t-plan extension. Never commit or publish this file; keep it in your .gitignore. -->");
 
   return lines.join("\n");
+}
+
+/**
+ * Reads the `## 🗂 Sessions` section written by `generatePlanMarkdown`.
+ * Returns [] when the section/entries are absent; malformed lines are ignored.
+ */
+export function parsePlanSessions(content: string): PlanSession[] {
+  const sessions: PlanSession[] = [];
+  let inSection = false;
+
+  for (const line of content.split(/\r?\n/)) {
+    const heading = headingText(line);
+    if (heading !== undefined) {
+      if (inSection) break; // any following heading closes the section
+      inSection = heading === "Sessions";
+      continue;
+    }
+    if (!inSection) continue;
+
+    const m = line.match(/^\s*-\s+`([^`]+)`\s+—\s+first seen\s+([^,]+),\s*last seen\s+([^—]+?)(?:\s+—\s+"(.*)")?\s*$/);
+    if (!m) continue;
+
+    const startedAt = parseSessionStamp(m[2].trim());
+    const lastSeenAt = parseSessionStamp(m[3].trim());
+    if (Number.isNaN(startedAt) || Number.isNaN(lastSeenAt)) continue;
+
+    const session: PlanSession = { id: m[1].trim(), startedAt, lastSeenAt };
+    if (m[4] !== undefined) session.title = m[4];
+    sessions.push(session);
+  }
+
+  return sessions;
 }
 
 export function getStatusIcon(status: TaskStatus): string {
@@ -542,12 +671,20 @@ export function resolveTaskRef(tasks: PlanTask[], identifier: unknown): PlanTask
  * `order` sigue siendo sólo posición de presentación.
  */
 export function assignRefs(tasks: PlanTask[]): void {
-  let next = 1;
+  // Keep every valid, unique ref (stable across reloads) and resolve duplicates/zeros
+  // deterministically after the current maximum. A hand-edited file with two "#1."
+  // must not leave two tasks sharing ref 1.
+  const used = new Set<number>();
   for (const t of tasks) {
-    if (typeof t.ref === "number" && t.ref >= next) next = t.ref + 1;
+    if (typeof t.ref === "number" && t.ref > 0 && !used.has(t.ref)) used.add(t.ref);
+    else t.ref = 0;
   }
+  let next = used.size > 0 ? Math.max(...used) + 1 : 1;
   for (const t of tasks) {
-    if (typeof t.ref !== "number" || t.ref <= 0) t.ref = next++;
+    if (t.ref > 0) continue;
+    while (used.has(next)) next++;
+    t.ref = next;
+    used.add(next);
   }
 }
 

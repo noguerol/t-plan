@@ -14,10 +14,11 @@ Thumbs.db
 .pi/
 
 # Generated plan files (runtime output of the t-plan extension) — PRIVATE,
-# never commit or publish them. Session-scoped names embed a session id
-# (plan_<title>_<session-id>.md), so the pattern covers the whole family.
+# never commit or publish them. One unified file per project:
+# <prefix>_<title-slug>.md (no session id). The pattern also covers the
+# legacy session-scoped names (plan_<title>_<session-id>.md).
 plan.md
-plan_*_[0-9a-zA-Z]*.md
+plan_*.md
 
 # punched-memory — never commit project-local memory
 pi.md
