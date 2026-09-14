@@ -79,6 +79,16 @@ test("(1) 15 consecutive normal writes never emit a self-warning", async () => {
       `H1 FAIL: our own writes self-warned ${warns(h).length} time(s): ${msgs(h)}. ` +
         `Minimal fix: compare with a tolerance / record mtime before the write too, in writePlanFile().`
     );
+
+    // Positive control: the same guard must still detect a real foreign write,
+    // otherwise the "no warning" assertion above cannot be trusted.
+    const name = await planName(h);
+    await sleep(30);
+    await writeFile(join(h.cwd, name), foreignPlan("H1 PC", "h1 pc", ["h1Positive1"]), "utf-8");
+    h.notes.length = 0;
+    await h.addTasks(["h1 pc trigger"]);
+    await h.tool({ action: "complete", task_id: "1" });
+    assert.ok(warns(h).length >= 1, `H1 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
   } finally {
     await h.cleanup();
   }
@@ -114,6 +124,22 @@ test("(2) after adopting a file via the load path, the next normal write does no
     );
     const final = await readFile(join(h.cwd, unified), "utf-8");
     assert.ok(final.includes("after load"), "the post-load task must be written");
+
+    // Positive control: load adoption did not disable the guard.
+    await sleep(30);
+    await writeFile(
+      join(h.cwd, unified),
+      foreignPlan("Loaded Project", "h2 pc foreign", ["h2Positive1"]),
+      "utf-8"
+    );
+    h.notes.length = 0;
+    await h.addTasks(["h2 pc"]);
+    await h.tool({ action: "complete", task_id: "1" });
+    assert.ok(warns(h).length >= 1, `H2 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
+    assert.ok(
+      sessionIds(await readFile(join(h.cwd, unified), "utf-8")).includes("h2Positive1"),
+      "H2 positive control: foreign session must be merged"
+    );
   } finally {
     await h.cleanup();
   }
@@ -226,6 +252,18 @@ test("(5) prefix change then normal writes do not warn", async () => {
     await planName(h, newName);
     const final = await readFile(join(h.cwd, newName), "utf-8");
     assert.ok(final.includes("prefix write"), "writes must land on the new-prefix file");
+
+    // Positive control: the guard is live on the new-prefix path.
+    await sleep(30);
+    await writeFile(
+      join(h.cwd, newName),
+      foreignPlan("Prefix Race", "h5 pc foreign", ["h5Positive1"]),
+      "utf-8"
+    );
+    h.notes.length = 0;
+    await h.addTasks(["h5 pc"]);
+    await h.tool({ action: "complete", task_id: "1" });
+    assert.ok(warns(h).length >= 1, `H5 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
   } finally {
     await h.cleanup();
   }
@@ -321,12 +359,17 @@ test("(8) an oversized foreign Sessions section (1000 entries) parses and is cap
 
     const final = await readFile(join(h.cwd, name), "utf-8");
     const bullets = sessionBullets(final);
-    assert.ok(
-      bullets.length <= 20,
-      `H8 FAIL: sessions were not capped at 20, got ${bullets.length}. ` +
+    assert.equal(
+      bullets.length,
+      20,
+      `H8 FAIL: sessions must be capped at exactly 20, got ${bullets.length}. ` +
         `Minimal fix: mergeSessionsIntoState()/generatePlanMarkdown() cap at 20 (they do).`
     );
     assert.ok(sessionIds(final).includes("bigRace0001"), "own session must remain");
+    assert.ok(
+      sessionIds(final).some((id) => id.startsWith("foreignBig")),
+      `H8 FAIL: the merge did not keep any foreign session: [${sessionIds(final).join(", ")}]`
+    );
     assert.ok(u.extractPlanTasks(final).some((t) => t.text.includes("after big")), "file must stay parseable");
     assert.ok(warns(h).length >= 1, "the foreign write must still be detected");
   } finally {
@@ -385,6 +428,14 @@ test("(10) writePlanFile no-ops with zero tasks (no file created, no warning)", 
         "Minimal fix: keep the `state.tasks.length === 0` early return in writePlanFile()."
     );
     assert.equal(warns(h).length, 0, `H10 FAIL: zero-task save warned: ${msgs(h)}`);
+
+    // Positive control: the same runtime DOES write once a task exists, so the
+    // no-op is the zero-task guard, not a dead runtime.
+    await h.addTasks(["h10 writes now"]);
+    assert.ok(
+      (await h.planFiles()).some((n) => n.endsWith(".md")),
+      `H10 positive control: expected a plan file once a task exists, got ${JSON.stringify(await h.planFiles())}`
+    );
   } finally {
     await h.cleanup();
   }
