@@ -3,7 +3,7 @@ import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-cor
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier } from "./types.ts";
+import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
 import {
   classifyTask,
@@ -40,6 +40,7 @@ import {
   detectLanguage,
   deslugTitle,
   parsePlanFileName,
+  parsePlanSessions,
   planFileNameFor,
   planTitle,
   slugify,
@@ -48,7 +49,7 @@ import {
   splitSegments,
   taskTextScore,
 } from "./utils.ts";
-import { readFile, writeFile, appendFile, access, unlink, mkdir, readdir, stat } from "node:fs/promises";
+import { readFile, writeFile, appendFile, access, unlink, mkdir, readdir, stat, rename } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -77,6 +78,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   let globalConfigPartial: Partial<PlanConfig> = {};
   let sessionId: string | undefined;
   let lastPlanFile: string | undefined;
+  // Concurrencia entre sesiones: mtime del último plan que escribimos y marca de
+  // que el fichero lo tocó otro proceso (se avisa en el siguiente updateUI).
+  let lastPlanMtime: number | undefined;
+  let pendingForeignWrite: number | undefined;
 
   // ── Evidencia del run en curso ────────────────────────────────────────
   // Qué ficheros/comandos tocó realmente el agente: señal determinista e
@@ -115,7 +120,50 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     writeFile(GLOBAL_CONFIG_PATH, JSON.stringify({ config }, null, 2), "utf-8").catch(() => {});
   }
 
+  /**
+   * Records the current pi session in the plan's session history (shared plan file).
+   * Capped to the newest 20 by last activity, newest first.
+   */
+  function touchSession(id: string | undefined, at: number, title?: string): void {
+    if (!id) return;
+    const sessions = state.sessions ?? [];
+    const existing = sessions.find((s) => s.id === id);
+    if (existing) {
+      existing.lastSeenAt = at;
+      if (title) existing.title = title;
+    } else {
+      sessions.push({ id, startedAt: at, lastSeenAt: at, ...(title ? { title } : {}) });
+    }
+    state.sessions = sessions.sort((a, b) => b.lastSeenAt - a.lastSeenAt).slice(0, 20);
+  }
+
+  /**
+   * Merges parsed sessions into state.sessions: dedupe by id keeping the earliest
+   * startedAt and the latest lastSeenAt, newest-first, capped to 20. Shared by the
+   * adopt path and the foreign-write guard so both produce the same shape.
+   */
+  function mergeSessionsIntoState(fileSessions: PlanSession[]): void {
+    if (fileSessions.length === 0) return;
+    const byId = new Map<string, PlanSession>();
+    for (const s of [...(state.sessions ?? []), ...fileSessions]) {
+      const prev = byId.get(s.id);
+      byId.set(
+        s.id,
+        prev
+          ? {
+              ...prev,
+              startedAt: Math.min(prev.startedAt, s.startedAt),
+              lastSeenAt: Math.max(prev.lastSeenAt, s.lastSeenAt),
+              title: prev.title ?? s.title,
+            }
+          : s
+      );
+    }
+    state.sessions = [...byId.values()].sort((a, b) => b.lastSeenAt - a.lastSeenAt).slice(0, 20);
+  }
+
   function persistState(): void {
+    touchSession(sessionId, Date.now());
     pi.appendEntry("plan-state", {
       config,
       state,
@@ -169,7 +217,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   async function writePlanFile(cwd: string): Promise<void> {
     if (!config.enabled || state.tasks.length === 0) return;
 
-    const fileName = planFileNameFor(config.planFilePrefix, state.title, sessionId);
+    const fileName = planFileNameFor(config.planFilePrefix, state.title);
     const filePath = join(cwd, fileName);
     if (lastPlanFile && lastPlanFile !== filePath) {
       try {
@@ -180,6 +228,21 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const displayState: PlanState = config.trimegisto
       ? { ...state, tasks: state.tasks.map((t) => ({ ...t, tier: resolveEffectiveTier(t.tier, tgConfig) })) }
       : state;
+
+    // Foreign-write guard: otra sesión pudo escribir el mismo plan compartido desde
+    // nuestro último write. Se comprueba ANTES de serializar para que el historial
+    // ajeno quede incluido en el fichero; las tareas siguen siendo last-write-wins.
+    try {
+      const st = await stat(filePath);
+      if (lastPlanMtime !== undefined && st.mtimeMs > lastPlanMtime + 1) {
+        const disk = await readFile(filePath, "utf-8");
+        mergeSessionsIntoState(parsePlanSessions(disk));
+        pendingForeignWrite = Date.now();
+      }
+    } catch {
+      // El fichero aún no existe (primer write): no hay nada con qué comparar.
+    }
+
     const content = generatePlanMarkdown(displayState, {
       trimegisto: config.trimegisto,
       showTimers: config.showTimers,
@@ -189,31 +252,93 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       await writeFile(filePath, content, "utf-8");
       planFilePath = filePath;
       lastPlanFile = filePath;
+      const st2 = await stat(filePath);
+      lastPlanMtime = st2.mtimeMs;
       await ensurePlanFileGitIgnored(cwd, config.planFilePrefix);
     } catch (err) {
       logError("writePlanFile", err);
     }
   }
 
-  async function readPlanFile(cwd: string): Promise<boolean> {
-    const filePath = join(cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId));
+  /** Slug of the current plan title, used to match legacy files to this project. */
+  function currentPlanSlug(): string {
+    return slugify(titleToProjectName(state.title)) || "untitled";
+  }
 
+  /**
+   * Adopts title, tasks and session history parsed from a plan file. Tasks are only
+   * replaced when the file carries tasks; the session history is merged so a shared
+   * file never loses sessions already recorded by the current run.
+   */
+  async function adoptPlanContent(content: string, filePath: string): Promise<boolean> {
+    const tasks = extractPlanTasks(content);
+    const fileSessions = parsePlanSessions(content);
+    const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
+    if (h1 && h1 !== state.title) {
+      state.title = h1;
+      state.titleAuto = false; // a different title belongs to that project
+    }
+    if (tasks.length > 0) {
+      assignRefs(tasks);
+      state.tasks = tasks;
+    }
+    mergeSessionsIntoState(fileSessions);
+    // Best-effort: recuerda el mtime del fichero adoptado para poder distinguir
+    // después un write ajeno (otra sesión) de nuestro propio write.
+    try {
+      const st = await stat(filePath);
+      lastPlanMtime = st.mtimeMs;
+    } catch {
+      lastPlanMtime = undefined;
+    }
+    const adopted = tasks.length > 0 || fileSessions.length > 0;
+    if (adopted) {
+      state.updatedAt = Date.now();
+      planFilePath = filePath;
+      lastPlanFile = filePath;
+    }
+    return adopted;
+  }
+
+  async function readPlanFile(cwd: string): Promise<boolean> {
+    const filePath = join(cwd, planFileNameFor(config.planFilePrefix, state.title));
     try {
       await access(filePath);
       const content = await readFile(filePath, "utf-8");
-      const tasks = extractPlanTasks(content);
-      if (tasks.length > 0) {
-        assignRefs(tasks);
-        state.tasks = tasks;
-        state.updatedAt = Date.now();
-        planFilePath = filePath;
-        lastPlanFile = filePath;
-        return true;
-      }
+      return adoptPlanContent(content, filePath);
     } catch (err) {
       logError("readPlanFile", err);
     }
-    return false;
+
+    // Migration: plans used to live in session-scoped files. Adopt the newest legacy
+    // file that matches this project's title by renaming it to the unified name.
+    const slug = currentPlanSlug();
+    const candidates = await scanPlanFiles({ cwd } as ExtensionContext);
+    const legacy = candidates
+      .filter((c) => c.legacy && (c.titleSlug ?? "").toLowerCase() === slug)
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const source = legacy[0];
+    if (!source) return false;
+
+    try {
+      await rename(source.file, filePath);
+    } catch (err) {
+      logError("readPlanFile:rename", err);
+      try {
+        const content = await readFile(source.file, "utf-8");
+        return adoptPlanContent(content, source.file);
+      } catch (inner) {
+        logError("readPlanFile:legacy", inner);
+        return false;
+      }
+    }
+    try {
+      const content = await readFile(filePath, "utf-8");
+      return adoptPlanContent(content, filePath);
+    } catch (err) {
+      logError("readPlanFile:migrated", err);
+      return false;
+    }
   }
 
     async function findGitRoot(start: string): Promise<string | undefined> {
@@ -241,7 +366,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         content = await readFile(gitignorePath, "utf-8");
       } catch {
       }
-      const patterns = [`${prefix}_*_[0-9a-zA-Z]*.md`];
+      const patterns = [`${prefix}_*.md`];
       if (prefix === "plan") patterns.push("plan.md"); // legacy single-file plans
       const lines = content.split("\n");
       const missing = patterns.filter((p) => !lines.some((l) => l.trim() === p));
@@ -320,6 +445,16 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
   function updateUI(ctx: ExtensionContext): void {
     if (disposed) return; // tras reload, el runtime viejo no actualiza UI
+    if (pendingForeignWrite !== undefined) {
+      pendingForeignWrite = undefined;
+      try {
+        ctx.ui.notify(
+          "t-plan: plan file was updated by another session — session history merged; task state is last-write-wins.",
+          "warning"
+        );
+      } catch {
+      }
+    }
     if (!config.enabled || !config.showWidget) {
       stopWidgetAnimation();
       ctx.ui.setStatus("t-plan", undefined);
@@ -539,7 +674,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     file: string;
     name: string;
     title: string;
+    titleSlug: string;
     sessionId: string | undefined;
+    legacy: boolean;
     mtimeMs: number;
     taskCount: number;
     isCurrentSession: boolean;
@@ -553,11 +690,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } catch {
       return out;
     }
+    const currentPath = join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title));
     for (const name of names) {
       if (!name.endsWith(".md")) continue;
       const parsed = parsePlanFileName(name, config.planFilePrefix);
-      const legacy = name === `${config.planFilePrefix}.md`;
-      if (!parsed && !legacy) continue;
+      const legacySingle = name === `${config.planFilePrefix}.md`;
+      if (!parsed && !legacySingle) continue;
       const path = join(ctx.cwd, name);
       try {
         const st = await stat(path);
@@ -569,10 +707,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           file: path,
           name,
           title,
+          titleSlug: parsed?.titleSlug ?? "",
           sessionId: parsed?.sessionId,
+          legacy: parsed ? parsed.legacy : true,
           mtimeMs: st.mtimeMs,
           taskCount: tasks.length,
-          isCurrentSession: !!parsed?.sessionId && !!sessionId && parsed.sessionId === sessionId.slice(0, 8),
+          isCurrentSession: path === currentPath,
         });
       } catch {
       }
@@ -590,8 +730,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const fmt = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
     const labels = candidates.map((c, i) => {
       const mark = c.isCurrentSession ? " ← current" : "";
-      const sess = c.sessionId ? ` · session ${c.sessionId}` : "";
-      return `${i + 1}. ${c.title}${mark}${sess} · ${c.taskCount} tasks · ${fmt.format(c.mtimeMs)}`;
+      const legacyTag = c.legacy ? " (legacy)" : "";
+      return `${i + 1}. ${c.title}${mark}${legacyTag} · ${c.taskCount} tasks · ${fmt.format(c.mtimeMs)}`;
     });
     const choice = await ctx.ui.select("Load plan:", labels);
     if (!choice) return;
@@ -606,20 +746,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         ctx.ui.notify(`no tasks in ${target.name}`, "warning");
         return;
       }
-      const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
-      if (h1) {
-        state.title = h1;
-        state.titleAuto = false; // adopted title belongs to that project
-      }
-      assignRefs(tasks);
-      state.tasks = tasks;
-      state.updatedAt = Date.now();
-      lastPlanFile = target.isCurrentSession ? target.file : undefined;
+      await adoptPlanContent(content, target.file);
       updateUI(ctx);
       persistState();
-      await writePlanFile(ctx.cwd);
+      await writePlanFile(ctx.cwd); // migrates a loaded legacy file to the unified name
       ctx.ui.notify(`loaded ${tasks.length}`, "info");
-      if (target.sessionId && sessionId && target.sessionId !== sessionId.slice(0, 8)) {
+      if (target.legacy && target.sessionId) {
         ctx.ui.notify(
           `session ${target.sessionId}: pi --session ${target.sessionId}`,
           "info"
@@ -673,6 +805,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           state.createdAt = Date.now();
           state.updatedAt = Date.now();
           lastPlanFile = undefined; // next write lands on the new title's file
+          lastPlanMtime = undefined;
           ctx.ui.notify(`new: ${title}`, "info");
           updateUI(ctx);
           persistState();
@@ -707,9 +840,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (subcommand === "purge") {
         const ok = await ctx.ui.confirm(
           "Purge plan?",
-          "Delete all tasks, state, and this session's plan file (no undo)."
+          "Delete all tasks, state, and this project's plan file (no undo)."
         );
         if (ok) {
+          // Resolve the file name BEFORE resetting the title, otherwise the answer is
+          // "plan_untitled.md" and the real project file survives the purge.
+          const planFile = join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title));
           state = {
             ...DEFAULT_STATE,
             tasks: [],
@@ -718,11 +854,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             updatedAt: Date.now(),
           };
           try {
-            await unlink(join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId)));
+            await unlink(planFile);
             lastPlanFile = undefined;
           } catch {
           }
           planFilePath = "";
+          lastPlanMtime = undefined;
           ctx.ui.notify("purged", "info");
           updateUI(ctx);
           persistState();
@@ -1084,10 +1221,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       config.widgetPlacement = config.widgetPlacement === "aboveEditor" ? "belowEditor" : "aboveEditor";
       state.widgetPlacement = config.widgetPlacement;
     } else if (choice.includes("Prefix:")) {
-      const name = await ctx.ui.input("File prefix (<prefix>_<title>_<session>.md):", config.planFilePrefix);
+      const name = await ctx.ui.input("File prefix (<prefix>_<title>.md):", config.planFilePrefix);
       if (name) {
         config.planFilePrefix = slugify(name) || "plan";
         lastPlanFile = undefined;
+        lastPlanMtime = undefined;
       }
     } else if (choice.includes("Agents:")) {
       config.trackAgents = !config.trackAgents;
@@ -1142,9 +1280,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } else if (choice.startsWith("🧹")) {
       const ok = await ctx.ui.confirm(
         "Purge plan?",
-        "Delete all tasks, state, and this session's plan file?"
+        "Delete all tasks, state, and this project's plan file?"
       );
       if (ok) {
+        const planFile = join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title));
         state = {
           ...DEFAULT_STATE,
           tasks: [],
@@ -1154,11 +1293,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           updatedAt: Date.now(),
         };
         try {
-          await unlink(join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title, sessionId)));
+          await unlink(planFile);
           lastPlanFile = undefined;
         } catch {
         }
         planFilePath = "";
+        lastPlanMtime = undefined;
         ctx.ui.notify("purged", "info");
       }
     }
@@ -1251,6 +1391,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     tgConfig = readTrimegistoConfig();
     sessionId = ctx.sessionManager.getSessionId();
     lastPlanFile = undefined;
+    lastPlanMtime = undefined; // antes de leer: el mtime del disco aún no se conoce
     const entries = ctx.sessionManager.getEntries();
     config = { ...DEFAULT_CONFIG, ...globalConfigPartial };
     const hadSessionState = entries.some((e: any) => e.type === "custom" && e.customType === "plan-state");
@@ -1272,8 +1413,15 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
     ensureTitle(undefined, ctx);
 
-    if (state.tasks.length === 0 && config.enabled) {
-      await readPlanFile(ctx.cwd);
+    if (config.enabled) {
+      // A brand-new session continues the project's shared plan file; a resumed one
+      // keeps its richer in-session state and only falls back to disk when empty.
+      if (!hadSessionState || state.tasks.length === 0) {
+        await readPlanFile(ctx.cwd);
+      }
+      touchSession(sessionId, Date.now());
+      if (state.tasks.length > 0) await writePlanFile(ctx.cwd);
+      persistState();
     }
 
     updateUI(ctx);
@@ -1299,9 +1447,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const tierTag = (t: PlanTask) =>
         config.trimegisto ? ` (→ ${resolveEffectiveTier(t.tier, tgConfig)})` : "";
 
-      const planFile = planFileNameFor(config.planFilePrefix, state.title, sessionId);
+      const planFile = planFileNameFor(config.planFilePrefix, state.title);
       let planContext = `[PLAN]\n${state.title} (file: ${planFile})\n`;
-      planContext += `Private: never git add/commit/publish plan files; gitignore ${config.planFilePrefix}_*_[0-9a-zA-Z]*.md; no force-add.\n`;
+      planContext += `Shared plan file: one per project, continues across sessions.\n`;
+      planContext += `Private: never git add/commit/publish plan files; gitignore ${config.planFilePrefix}_*.md; no force-add.\n`;
       planContext += `Refs (#n) are stable handles: use them in task_id and [DONE:#n].\n\n`;
 
       if (config.trimegisto) {

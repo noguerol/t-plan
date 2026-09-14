@@ -47,6 +47,14 @@ export interface ToolEvidence {
   calls: number;
 }
 
+/** One pi session that worked on the shared plan file. */
+export interface PlanSession {
+  id: string;            // pi session id, as returned by ctx.sessionManager.getSessionId()
+  startedAt: number;     // ms epoch, first time this session touched the plan
+  lastSeenAt: number;    // ms epoch, most recent update from that session
+  title?: string;        // optional human label
+}
+
 export interface PlanState {
   enabled: boolean;
   tasks: PlanTask[];
@@ -58,6 +66,7 @@ export interface PlanState {
   autoDetect: boolean;     // Auto-detect plans from model output
   showWidget: boolean;     // Show the TUI widget
   widgetPlacement: "aboveEditor" | "belowEditor";
+  sessions?: PlanSession[];  // history of sessions that worked on the plan, persisted in the plan file
 }
 
 export interface PlanConfig {
@@ -65,7 +74,7 @@ export interface PlanConfig {
   autoDetect: boolean;
   showWidget: boolean;
   widgetPlacement: "aboveEditor" | "belowEditor";
-  planFilePrefix: string;  // Plan files: <prefix>_<title-slug>_<session-id>.md. Default: "plan"
+  planFilePrefix: string;  // Plan files: <prefix>_<title-slug>.md (one per project). Default: "plan"
   trackAgents: boolean;    // Track parallel agent tasks
   animateWidget: boolean;  // Animate in-progress spinners and completion highlights
   compactTaskLines: boolean; // Truncate task lines to fit the widget width

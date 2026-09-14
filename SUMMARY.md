@@ -19,10 +19,11 @@ or persisted config shape.
   persistence schema (`plan-state` custom entry, global config JSON shape).
 - Trimegisto tier values (`t0`/`t1`/`t2`/`t3` and `active`), classification
   rules, and tier-availability fallback.
-- Plan file name pattern `<prefix>_<title>_<sessionId>.md` and `.gitignore`
-  pattern enforcement.
-- All event handlers (`session_start`, `before_agent_start`, `turn_end`,
-  `agent_end`, `agent_settled`, `session_shutdown`).
+- Unified plan file name pattern `<prefix>_<title-slug>.md` (no session id)
+  and `.gitignore` pattern enforcement; external edits by another session merge
+  into `## 🗂 Sessions` and warn that task state remains last-write-wins.
+- All event handlers (`session_start`, `before_agent_start`, `tool_result`,
+  `turn_end`, `agent_end`, `agent_settled`, `session_shutdown`).
 - All help/notify text meaning (e.g. `Disabled` → `Plan OFF`,
   `Completed: foo` → `✓ foo`, but still reports completion).
 
@@ -70,7 +71,8 @@ dynamic `import("./runtime.ts")` in `src/index.ts`:
   `formatElapsed`, `completedTimerText`, and the weighted keyword classifier).
 - `./utils.ts` (plan extraction, markdown serialization, fuzzy progress
   detection, language detection, slug helpers, file-name builder).
-- `node:fs/promises`, `node:path`, `node:os` — only used inside `runtime.ts`.
+- `node:fs/promises`, `node:fs`, `node:path`, `node:os` — used inside `runtime.ts`
+  and `tiers.ts`.
 
 Note: `./runtime.ts` and its downstream modules are still loaded together on
 first interaction; splitting further (e.g. separating file I/O vs. detection)
@@ -88,8 +90,8 @@ the entrypoint never pulls them in anymore.
   - `promptSnippet` collapsed to a single phrase.
   - Four `promptGuidelines` collapsed from full sentences to bullet-style
     directives; safety rule (private plan files, no commit/force-add) kept.
-- Argument-completion descriptions rewritten to one-word labels
-  (`"Enable"`, `"Disable"`, `"Load"`, `"Purge"`, `"Add"`, `"Done"`,
+- Argument-completion descriptions rewritten to short labels
+  (`"Enable"`, `"Disable"`, `"Load plan"`, `"Purge plan"`, `"Add"`, `"Done"`,
   `"Set tier"`, …).
 - Parameter descriptions shortened while preserving meaning:
   - `task_text`: `"Task description (for add/update)"` →
@@ -105,7 +107,7 @@ The `[PLAN]` block now uses compact headers and inline rules:
 - Header `[PLAN TRACKING ACTIVE]` → `[PLAN]`; second blank-and-title line
   merged onto one line.
 - Long privacy paragraph replaced by a single line
-  `Private: never git add/commit/publish plan files; gitignore <prefix>_*_[0-9a-zA-Z]*.md; no force-add.`
+  `Private: never git add/commit/publish plan files; gitignore <prefix>_*.md; no force-add.`
 - Trimegisto block header `[TRIMEGISTO DISTRIBUTION]` → `[TG]`; multi-line
   tier-role table collapsed to one line (`active=t0 default; t1=complex/planning;
   t2=medium/debug/review; t3=simple/mechanical`); batch/complete guidance kept
@@ -125,10 +127,10 @@ The `[PLAN]` block now uses compact headers and inline rules:
 - `Completed: <text>` → `✓ <text>`; `Started: <text>` → `▶ <text>`;
   `Blocked: <text>` → `✗ <text>`.
 - `Moved to position N` → `→ #N`.
-- `T<n> → <tier>` for tier-set action.
+- `#<ref>→<tier>` for tier-set action.
 - `Loaded N tasks from <file>` → `loaded N`.
 - `This plan belongs to session <id> — resume with: pi --session <id>` →
-  `session <id>: pi --session <id>`.
+  `session <id>: pi --session <id>` (legacy session-scoped files only).
 - Auto-notes (`autoNotes.push`): refreshed / stale / auto-completed /
   in-progress / concluded messages shortened to `↻ refreshed …`,
   `-N stale`, `+N done`, `N in-progress`, `done: a, b`.

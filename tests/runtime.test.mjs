@@ -242,7 +242,7 @@ test("el fichero de plan refleja los estados y no se pierde al releerlo", async 
 
     const md = await h.planFile();
     assert.match(md, /## ✅ Completed/);
-    assert.match(md, /- \[x\] Añadir autenticación JWT/);
+    assert.match(md, /- \[x\] #\d+\. Añadir autenticación JWT/);
 
     const { extractPlanTasks } = await import("../src/utils.ts");
     const reparsed = extractPlanTasks(md);

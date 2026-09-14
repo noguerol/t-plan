@@ -1,6 +1,6 @@
 {
   "name": "pi-t-plan",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "description": "pi plan tracker: TUI progress, plan_manager tool, Trimegisto tiers, timers, EN/ES/ZH fuzzy progress.",
   "keywords": [
     "pi-package",
@@ -41,6 +41,6 @@
     "src"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/detection.test.mjs tests/runtime.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs"
   }
 }
