@@ -1,41 +1,31 @@
-/**
- * Adversarial QA of the SHORTENED (compressed) strings: the string-trimming
- * commits (v1.3.x) must not have silently broken the externally-observable
- * contract. Each test asserts an OBSERVABLE behavior, not a source literal,
- * except test (8) which is the explicit registration-contract grep.
- *
- * Owns ONLY this file. It never modifies src/ or any other test. Every runtime
- * test uses tests/helpers/harness.mjs with a temp HOME and temp cwd, so no real
- * project file or user config is ever read or written.
- *
- * Hypotheses:
- *   (1) onBeforeAgentStart context still carries [PLAN], the plan file name, the
- *       privacy line (never git add/commit/publish + plan_*.md), the stable-refs
- *       line and the Rules line (plan_manager + "2,3"/text task_id forms).
- *   (2) The Doing/Todo/Blocked/Done group headers are still emitted per status.
- *   (3) plan_manager still accepts task_id "3", "2,3", "2-4", "all" and text,
- *       and completion output still shows "#<ref>".
- *   (4) The foreign-write warning still says "another session"; load/resume
- *       notifications still mention the session id.
- *   (5) ensurePlanFileGitIgnored still writes a "plan_*.md" pattern line.
- *   (6) The registered contract (2 commands, 7 events, plan_manager + params)
- *       is intact in src/index.ts.
- */
+// Adversarial QA by execution: the "compressed text footprint" refactor
+// (commits 52dcd27 / 9361c5b / 8686d03) must NOT change the externally-observable
+// contract. This suite asserts the shortened strings still carry every semantic
+// anchor other sessions/agents depend on.
+//
+// Owns ONLY this file. It never modifies src/ or any other test. Every runtime
+// test uses the shared harness (tests/helpers/harness.mjs) with a temp HOME and a
+// temp cwd, so no real project file or user config is ever read or written.
+//
+// One test per hypothesis (1)-(6). Any failure is kept as evidence; the minimal
+// fix is reported in the failure message (src/ is never edited from here).
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { ensurePeers } from "./helpers/ensure-peers.mjs";
 import { createHarness } from "./helpers/harness.mjs";
 
 await ensurePeers();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const allText = (h) => JSON.stringify(h.notes.map((n) => n.msg));
 
-/** Name of the unified plan file the runtime writes in the harness cwd. */
+/** Minimal plan markdown the runtime's own parser (extractPlanTasks) understands. */
+const planMd = (title, task) => `# ${title}\n\n## ⏳ Pending\n\n- [ ] #1. ${task}\n`;
+
 async function planFileName(h) {
   const names = await h.planFiles();
   const name = names.find((n) => n.startsWith("plan_") && n.endsWith(".md"));
@@ -43,204 +33,206 @@ async function planFileName(h) {
   return name;
 }
 
-/** Minimal foreign plan file with a Sessions section (drives the merge guard). */
-function foreignPlan(title, task, sid) {
-  return [
-    `# ${title}`,
-    "",
-    "## ⏳ Pending",
-    "",
-    `- [ ] #1. ${task}`,
-    "",
-    "## 🗂 Sessions",
-    "",
-    `- \`${sid}\` — first seen 2026-01-01 00:00:00, last seen 2026-01-02 00:00:00`,
-    "",
-  ].join("\n");
-}
-
-// ── (1) injected context keeps the whole observable contract ───────────────────
-test("(1) [PLAN] context keeps file name, privacy, stable refs and Rules line", async () => {
-  const h = await createHarness({ sessionId: "fpCtx000001" });
+// ── (1) the injected onBeforeAgentStart context ────────────────────────────────
+test("(1) injected context keeps [PLAN], file, privacy, refs and Rules contract", async () => {
+  const h = await createHarness({ sessionId: "footprint001" });
   try {
-    await h.addTasks(["alpha task"]);
+    await h.addTasks(["anchor task"]);
     const name = await planFileName(h);
 
-    const start = await h.runStart();
-    const text = start?.message?.content;
-    assert.equal(typeof text, "string", "onBeforeAgentStart must return injected context");
+    const res = await h.runStart();
+    const c = res?.message?.content;
+    assert.equal(res?.message?.customType, "plan-context", "onBeforeAgentStart must still return the plan-context message");
+    assert.ok(typeof c === "string" && c.length > 0, "injected plan context is empty");
 
-    assert.ok(text.includes("[PLAN]"), "missing [PLAN] header");
-    assert.ok(text.includes(name), `context must name the plan file (${name})`);
-    assert.ok(text.includes("never git add/commit/publish"), "missing privacy line");
-    assert.ok(text.includes("plan_*.md"), "missing gitignore pattern in the privacy line");
-    assert.ok(text.includes("Refs (#n) are stable"), "missing stable-refs line");
-    assert.ok(text.includes("Rules:"), "missing Rules: line");
-    assert.match(text, /Rules:[^\n]*plan_manager/, "Rules line must mention plan_manager");
-    assert.ok(text.includes("2,3"), 'Rules line must document the "2,3" task_id form');
-    assert.match(text.split("\n").find((l) => l.startsWith("Rules:")) ?? "", /\btext\b/, "Rules line must document the text task_id form");
+    assert.ok(c.includes("[PLAN]"), "missing '[PLAN]' marker");
+    assert.ok(c.includes(name), `injected context must name the plan file (${name})`);
+
+    // Privacy line — the exact wording may change, the contract may not.
+    assert.ok(c.includes("never git add/commit/publish"), "missing 'never git add/commit/publish' privacy clause");
+    assert.ok(c.includes("plan_*.md"), "privacy line must mention the gitignore pattern plan_*.md");
+
+    assert.ok(c.includes("Refs (#n) are stable"), "missing 'Refs (#n) are stable' guarantee");
+
+    // Rules line: must still tell the model to call plan_manager with the
+    // accepted task_id formats ("2,3" list and free text).
+    const rulesLine = c.split("\n").find((l) => l.startsWith("Rules:"));
+    assert.ok(rulesLine, "missing the 'Rules:' line");
+    assert.ok(rulesLine.includes("plan_manager"), "Rules line must mention plan_manager");
+    assert.ok(rulesLine.includes('"2,3"'), 'Rules line must show the "2,3" task_id list form');
+    assert.ok(rulesLine.includes("text"), "Rules line must mention the text task_id form");
   } finally {
     await h.cleanup();
   }
 });
 
-// ── (2) group headers survive the string trimming ──────────────────────────────
-test("(2) Doing/Todo/Blocked/Done headers are emitted when those statuses exist", async () => {
-  const h = await createHarness({ sessionId: "fpGrp000001" });
+test("(1b) trimegisto-enabled context still emits a [TG] block with available:", async () => {
+  const h = await createHarness({ sessionId: "footprintTG1" });
   try {
-    await h.addTasks(["doing one", "blocked two", "done three", "todo four"]);
-    await h.tool({ action: "start", task_id: "1" });
-    await h.tool({ action: "block", task_id: "2" });
-    await h.tool({ action: "complete", task_id: "3" });
-
-    const start = await h.runStart();
-    const text = start?.message?.content;
-    assert.equal(typeof text, "string", "context must be injected with tasks present");
-    assert.ok(text.includes("Doing:"), "missing Doing: group header");
-    assert.ok(text.includes("Todo:"), "missing Todo: group header");
-    assert.ok(text.includes("Blocked:"), "missing Blocked: group header");
-    assert.ok(text.includes("Done ("), "missing Done (...) group header");
-  } finally {
-    await h.cleanup();
-  }
-});
-
-// ── (3) the [TG] block is still injected when trimegisto is on ─────────────────
-test("(3) trimegisto mode still injects a [TG] block with available:", async () => {
-  const h = await createHarness({ sessionId: "fpTg0000001" });
-  try {
-    await h.addTasks(["tg task"]);
-    // Enable trimegisto through the real config menu (label while currently OFF).
+    await h.addTasks(["tg anchor"]);
+    // Enable TG through the real config menu (same path a user takes).
     h.ctx.ui.select = async () => "❌ TG: OFF";
     await h.rt.tPlanCommand.handler("config", h.ctx);
 
-    const start = await h.runStart();
-    const text = start?.message?.content;
-    assert.ok(text.includes("[TG]"), "trimegisto mode must inject a [TG] block");
-    assert.ok(text.includes("available:"), "the [TG] block must list available tiers");
+    const res = await h.runStart();
+    const c = res?.message?.content ?? "";
+    assert.ok(c.includes("[TG]"), "trimegisto mode must still inject a [TG] block");
+    const tgBlock = c.slice(c.indexOf("[TG]"));
+    assert.ok(tgBlock.includes("available:"), "[TG] block must still list 'available:' tiers");
   } finally {
     await h.cleanup();
   }
 });
 
-// ── (4) task_id forms + completion output still shows #<ref> ───────────────────
-test("(4) plan_manager accepts 3 / 2,3 / 2-4 / all / text and shows '#<ref>'", async () => {
-  const h = await createHarness({ sessionId: "fpIds000001" });
+// ── (2) plan group headers survive the string trim ─────────────────────────────
+test("(2) Doing/Todo/Blocked/Done group headers are emitted when statuses exist", async () => {
+  const h = await createHarness({ sessionId: "footprint002" });
   try {
-    await h.addTasks(["alpha one", "beta two", "gamma three", "delta four", "epsilon five"]);
+    await h.addTasks(["do me", "todo me", "block me", "done me"]);
+    await h.tool({ action: "start", task_id: "1" });
+    await h.tool({ action: "block", task_id: "3" });
+    await h.tool({ action: "complete", task_id: "4" });
 
-    const single = await h.tool({ action: "complete", task_id: "3" });
-    assert.match(single.content[0].text, /✓\s*#3\b/, `task_id "3": ${single.content[0].text}`);
-
-    const list = await h.tool({ action: "complete", task_id: "2,3" });
-    assert.match(list.content[0].text, /#2\b/, `task_id "2,3" must resolve #2: ${list.content[0].text}`);
-    assert.match(list.content[0].text, /#3\b/, `task_id "2,3" must resolve #3: ${list.content[0].text}`);
-
-    const range = await h.tool({ action: "complete", task_id: "2-4" });
-    for (const ref of [2, 3, 4]) {
-      assert.match(range.content[0].text, new RegExp(`#${ref}\\b`), `task_id "2-4" must resolve #${ref}: ${range.content[0].text}`);
-    }
-
-    const all = await h.tool({ action: "complete", task_id: "all" });
-    assert.match(all.content[0].text, /#1\b/, `task_id "all" must resolve #1: ${all.content[0].text}`);
-    assert.match(all.content[0].text, /#5\b/, `task_id "all" must resolve #5: ${all.content[0].text}`);
-
-    const byText = await h.tool({ action: "complete", task_id: "alpha" });
-    assert.match(byText.content[0].text, /✓\s*#1\b/, `task_id by text: ${byText.content[0].text}`);
+    const c = (await h.runStart())?.message?.content ?? "";
+    assert.ok(c.includes("Doing:"), "missing 'Doing:' group header for in_progress tasks");
+    assert.ok(c.includes("Todo:"), "missing 'Todo:' group header for pending tasks");
+    assert.ok(c.includes("Blocked:"), "missing 'Blocked:' group header for blocked tasks");
+    assert.ok(/Done \(\d+\):/.test(c), "missing 'Done (n):' group header for completed tasks");
+    assert.ok(c.includes("#4"), "Done header must list the completed refs");
   } finally {
     await h.cleanup();
   }
 });
 
-// ── (5) foreign-write warning still says "another session" ─────────────────────
-test("(5) the foreign-write warning still contains 'another session'", async () => {
-  const h = await createHarness({ sessionId: "fpFrn000001" });
+// ── (3) plan_manager task_id forms + completion output ─────────────────────────
+test("(3) plan_manager accepts '3', '2,3', '2-4', 'all' and text; completion shows #ref", async () => {
+  const h = await createHarness({ sessionId: "footprint003" });
   try {
-    await h.addTasks(["base"]);
+    await h.addTasks(["alpha one", "beta two", "gamma three", "delta four", "epsilon five", "zeta six"]);
+
+    const out = async (task_id) => (await h.tool({ action: "complete", task_id })).content[0].text;
+
+    const single = await out("3");
+    assert.ok(single.includes("✓ #3"), `'3' must complete #3 and show it, got: ${single}`);
+    assert.match(single, /#[0-9]+/, "completion output must still show '#<ref>'");
+
+    const list = await out("2,3");
+    assert.ok(list.includes("#2") && list.includes("#3"), `'2,3' must resolve #2 and #3, got: ${list}`);
+
+    const range = await out("2-4");
+    assert.ok(range.includes("#4"), `'2-4' must resolve the range up to #4, got: ${range}`);
+
+    const all = await out("all");
+    assert.ok(all.includes("#5") && all.includes("#6"), `'all' must complete every non-done task, got: ${all}`);
+
+    const byText = await out("beta two");
+    assert.ok(byText.includes("#2"), `text task_id must resolve #2, got: ${byText}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ── (4) foreign-write warning + load/resume session id ─────────────────────────
+test("(4a) foreign-write warning still says 'another session'", async () => {
+  const h = await createHarness({ sessionId: "footprint004" });
+  try {
+    await h.addTasks(["first"]);
     const name = await planFileName(h);
 
     await sleep(30);
-    await writeFile(join(h.cwd, name), foreignPlan("Foreign FP", "foreign fp", "foreignFP01"), "utf-8");
+    await writeFile(join(h.cwd, name), planMd("Foreign Plan", "foreign task"), "utf-8");
 
     h.notes.length = 0;
-    await h.addTasks(["after"]); // detects the foreign write + merges + writes
-    await h.addTasks(["flush"]); // updateUI flushes the pending warning
+    // The add branch calls updateUI() BEFORE writePlanFile(), so the foreign guard
+    // arms pendingForeignWrite on this write and the warning surfaces on the next
+    // UI refresh (same double-write pattern as tests/qa-adversarial.test.mjs).
+    await h.addTasks(["second"]); // detects the foreign mtime + merges + writes
+    await h.addTasks(["third"]); // next updateUI flushes the pending warning
 
+    const warning = h.notes.find((n) => String(n.msg).includes("another session"));
     assert.ok(
-      h.notes.some((n) => String(n.msg).includes("another session")),
-      `expected the foreign-write warning; notes=${JSON.stringify(h.notes.map((n) => n.msg))}`
+      warning,
+      `foreign-write warning must still contain 'another session'. notes=${allText(h)} ` +
+        `→ minimal fix: keep the "updated by another session" substring in updateUI's warning.`
     );
+    assert.equal(warning.level, "warning", "foreign-write notice must still be a warning");
   } finally {
     await h.cleanup();
   }
 });
 
-// ── (6) load/resume notification still mentions the session id ─────────────────
-test("(6) the resume notification still mentions the legacy session id", async () => {
-  const root = await mkdtemp(join(tmpdir(), "tplan-fp-load-"));
-  const cwd = join(root, "loadproj");
-  await mkdir(cwd, { recursive: true });
-  await writeFile(
-    join(cwd, "plan_legacyproj_sessAB12.md"),
-    ["# Legacy Title", "", "## ⏳ Pending", "", "- [ ] #1. legacy task", ""].join("\n"),
-    "utf-8"
-  );
-
-  const h = await createHarness({ cwd, sessionId: "fpLoad00001" });
+test("(4b) load/resume notification still names the session id", async () => {
+  const h = await createHarness({ sessionId: "cur0000001" });
   try {
-    h.ctx.ui.select = async () => "1";
+    // Legacy session-scoped file name: plan_<slug>_<shortId>.md → sessionId recovered.
+    const legacyName = "plan_legacyproj_abcd1234.md";
+    await writeFile(join(h.cwd, legacyName), planMd("Legacy Proj", "legacy task"), "utf-8");
+
+    h.ctx.ui.select = async () => "1"; // pick the only candidate
+    h.notes.length = 0;
     await h.rt.tPlanCommand.handler("load", h.ctx);
+
+    const joined = allText(h);
     assert.ok(
-      h.notes.some((n) => String(n.msg).includes("sessAB12")),
-      `expected a load/resume notification with the session id; notes=${JSON.stringify(h.notes.map((n) => n.msg))}`
+      joined.includes("abcd1234"),
+      `load/resume notification must still mention the session id. notes=${joined} ` +
+        `→ minimal fix: keep the "resume: pi --session <sessionId>" line in pickAndLoadPlan.`
     );
   } finally {
     await h.cleanup();
-    await rm(root, { recursive: true, force: true });
   }
 });
 
-// ── (7) gitignore still gets a plan_*.md pattern line ──────────────────────────
-test("(7) ensurePlanFileGitIgnored still writes a 'plan_*.md' pattern line", async () => {
-  const root = await mkdtemp(join(tmpdir(), "tplan-fp-git-"));
-  const cwd = join(root, "gitproj");
-  await mkdir(join(cwd, ".git"), { recursive: true }); // findGitRoot only needs the .git dir
-
-  const h = await createHarness({ cwd, sessionId: "fpGit000001" });
+// ── (5) ensurePlanFileGitIgnored still writes the plan_*.md pattern ────────────
+test("(5) ensurePlanFileGitIgnored writes a 'plan_*.md' pattern line", async () => {
+  const h = await createHarness({ sessionId: "footprint005" });
   try {
-    await h.addTasks(["gitignore task"]);
-    const gi = await readFile(join(cwd, ".gitignore"), "utf-8");
-    assert.match(gi, /^plan_\*\.md$/m, `.gitignore must contain the plan_*.md pattern; got:\n${gi}`);
+    // Make the harness cwd a git root so findGitRoot() succeeds.
+    await mkdir(join(h.cwd, ".git"), { recursive: true });
+
+    await h.addTasks(["ignore me"]); // triggers writePlanFile → ensurePlanFileGitIgnored
+
+    const gitignore = await readFile(join(h.cwd, ".gitignore"), "utf-8");
+    const lines = gitignore.split(/\r?\n/).map((l) => l.trim());
+    assert.ok(
+      lines.includes("plan_*.md"),
+      `expected a literal 'plan_*.md' pattern line (header wording may differ). got:\n${gitignore}`
+    );
   } finally {
     await h.cleanup();
-    await rm(root, { recursive: true, force: true });
   }
 });
 
-// ── (8) src/index.ts registration contract is intact ───────────────────────────
-test("(8) src/index.ts keeps 2 commands, 7 events, plan_manager and its params", async () => {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const src = await readFile(join(here, "..", "src", "index.ts"), "utf-8");
+// ── (6) the registered contract in src/index.ts is intact ──────────────────────
+test("(6) src/index.ts still registers 2 commands, 7 events, plan_manager + params", async () => {
+  const src = await readFile(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf-8");
 
-  const required = [
-    'registerCommand("t-plan"',
-    'registerCommand("task"',
-    '"session_start"',
-    '"before_agent_start"',
-    '"tool_result"',
-    '"turn_end"',
-    '"agent_end"',
-    '"agent_settled"',
-    '"session_shutdown"',
-    'name: "plan_manager"',
-    "action:",
-    "task_text:",
-    "task_id:",
-    "status:",
-    "notes:",
-    "tier:",
-  ];
-  for (const token of required) {
-    assert.ok(src.includes(token), `src/index.ts is missing registered contract token: ${token}`);
-  }
+  const required = {
+    "command t-plan": 'pi.registerCommand("t-plan"',
+    "command task": 'pi.registerCommand("task"',
+    "event session_start": 'pi.on("session_start"',
+    "event before_agent_start": 'pi.on("before_agent_start"',
+    "event tool_result": 'pi.on("tool_result"',
+    "event turn_end": 'pi.on("turn_end"',
+    "event agent_end": 'pi.on("agent_end"',
+    "event agent_settled": 'pi.on("agent_settled"',
+    "event session_shutdown": 'pi.on("session_shutdown"',
+    "tool plan_manager": 'name: "plan_manager"',
+    "param action": "action:",
+    "param task_text": "task_text:",
+    "param task_id": "task_id:",
+    "param status": "status:",
+    "param notes": "notes:",
+    "param tier": "tier:",
+  };
+
+  const missing = Object.entries(required)
+    .filter(([, needle]) => !src.includes(needle))
+    .map(([label]) => label);
+
+  assert.deepEqual(
+    missing,
+    [],
+    `src/index.ts registration contract broken; missing: ${missing.join(", ")}`
+  );
 });
