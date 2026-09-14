@@ -276,7 +276,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
    * file never loses sessions already recorded by the current run.
    */
   async function adoptPlanContent(content: string, filePath: string): Promise<boolean> {
-    const tasks = extractPlanTasks(content);
+    // minLength 1: un fichero de plan puede contener tareas cortas legítimas ("CI", "v2").
+    const tasks = extractPlanTasks(content, { minLength: 1 });
     const fileSessions = parsePlanSessions(content);
     const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
     if (h1 && h1 !== state.title) {
@@ -707,7 +708,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         const content = await readFile(path, "utf-8");
         const h1 = content.match(/^#\s+(.+)$/m)?.[1]?.trim();
         const title = h1 || (parsed ? deslugTitle(parsed.titleSlug) : config.planFilePrefix);
-        const tasks = extractPlanTasks(content);
+        const tasks = extractPlanTasks(content, { minLength: 1 });
         out.push({
           file: path,
           name,
@@ -746,7 +747,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
     try {
       const content = await readFile(target.file, "utf-8");
-      const tasks = extractPlanTasks(content);
+      const tasks = extractPlanTasks(content, { minLength: 1 });
       if (tasks.length === 0) {
         ctx.ui.notify(`no tasks in ${target.name}`, "warning");
         return;
