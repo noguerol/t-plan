@@ -377,7 +377,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const lines = content.split("\n");
       const missing = patterns.filter((p) => !lines.some((l) => l.trim() === p));
       if (missing.length === 0) return; // already covered
-      const header = "# t-plan: plan files are private runtime state — never commit or publish them";
+      const header = "# t-plan: private runtime state — never commit or publish";
       const block = [header, ...missing, ""].join("\n");
       const next = content.length === 0 || content.endsWith("\n") ? content + block : content + "\n" + block;
       await writeFile(gitignorePath, next, "utf-8");
@@ -553,7 +553,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           );
         }
         if (remainingCount > 0) {
-          lines.push(truncateToWidth(ctx.ui.theme.fg("muted", `  ... ${remainingCount} more`), 78, "…"));
+          lines.push(truncateToWidth(ctx.ui.theme.fg("muted", `  +${remainingCount} more`), 78, "…"));
         }
       }
 
@@ -829,7 +829,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       }
 
       if (subcommand === "clear") {
-        const ok = await ctx.ui.confirm("Clear plan?", "Remove all tasks from the current plan?");
+        const ok = await ctx.ui.confirm("Clear plan?", "Remove all tasks?");
         if (ok) {
           state.tasks = [];
           state.updatedAt = Date.now();
@@ -843,7 +843,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (subcommand === "purge") {
         const ok = await ctx.ui.confirm(
           "Purge plan?",
-          "Delete all tasks, state, and this project's plan file (no undo)."
+          "Delete all tasks, state, and the plan file (no undo)."
         );
         if (ok) {
           // Resolve the file name BEFORE resetting the title, otherwise the answer is
@@ -1086,7 +1086,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             }
             return parsed;
           }
-          const pick = await ctx.ui.select("Trimegisto tier:", ["t0 (active)", "t1 (complex)", "t2 (medium)", "t3 (simple)"]);
+          const pick = await ctx.ui.select("Tier:", ["t0 (active)", "t1 (complex)", "t2 (medium)", "t3 (simple)"]);
           if (!pick) return undefined;
           return toolValueToTier(pick.split(" ")[0]);
         };
@@ -1207,7 +1207,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       "🧹 Purge",
     ];
 
-    const choice = await ctx.ui.select("Plan Configuration:", options);
+    const choice = await ctx.ui.select("Plan config:", options);
 
     if (!choice) return;
 
@@ -1224,7 +1224,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       config.widgetPlacement = config.widgetPlacement === "aboveEditor" ? "belowEditor" : "aboveEditor";
       state.widgetPlacement = config.widgetPlacement;
     } else if (choice.includes("Prefix:")) {
-      const name = await ctx.ui.input("File prefix (<prefix>_<title>.md):", config.planFilePrefix);
+      const name = await ctx.ui.input("Prefix (<prefix>_<title>.md):", config.planFilePrefix);
       if (name) {
         config.planFilePrefix = slugify(name) || "plan";
         lastPlanFile = undefined;
@@ -1283,7 +1283,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } else if (choice.startsWith("🧹")) {
       const ok = await ctx.ui.confirm(
         "Purge plan?",
-        "Delete all tasks, state, and this project's plan file?"
+        "Delete all tasks, state, and the plan file?"
       );
       if (ok) {
         const planFile = join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title));
@@ -1317,7 +1317,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
 
     const choice = await ctx.ui.select(
-      "Select task to move:",
+      "Move task:",
       state.tasks.map((t) => `${t.order}. ${t.text}`)
     );
 
@@ -1327,7 +1327,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const task = state.tasks.find((t) => t.order === order);
     if (!task) return;
 
-    const newOrderStr = await ctx.ui.input("Move to position:", order.toString());
+    const newOrderStr = await ctx.ui.input("New position:", order.toString());
     if (!newOrderStr) return;
 
     const newOrder = parseInt(newOrderStr);
@@ -1480,7 +1480,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         for (const t of pending.slice(0, PENDING_CAP)) {
           planContext += `- ⏳ #${t.ref}. ${t.text}${tierTag(t)}\n`;
         }
-        if (pending.length > PENDING_CAP) planContext += `- ... +${pending.length - PENDING_CAP} more (plan_manager list)\n`;
+        if (pending.length > PENDING_CAP) planContext += `- … +${pending.length - PENDING_CAP} more (plan_manager list)\n`;
         planContext += "\n";
       }
 
