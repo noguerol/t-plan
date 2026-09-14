@@ -67,10 +67,11 @@ config keys, tool name/params/schema and persisted state are identical.
 | Surface | Before | After | Δ |
 | --- | ---: | ---: | ---: |
 | `src/index.ts` (startup) | 4,889 | 4,615 | −274 (−5.6%) |
-| `src/runtime.ts` (lazy) | 76,421 | 76,185 | −236 (−0.3%) |
+| `src/runtime.ts` (lazy) | 76,421 | 76,081 | −340 (−0.4%) |
 | `package.json` (metadata) | 1,114 | 1,079 | −35 (−3.1%) |
 | **startup bundle** (esbuild, ext. peers) | **4,458** | **4,184** | **−274 (−6.1%)** |
-| **relevant source total** | **167,632** | **167,087** | **−545 (−0.3%)** |
+| **lazy runtime bundle** (esbuild) | **133,270** | **132,932** | **−338 (−0.3%)** |
+| **relevant source total** | **167,632** | **166,983** | **−649 (−0.4%)** |
 
 Bundles exclude `@earendil-works/*` and `typebox`; the startup bundle also
 excludes the lazy `./runtime.ts`. Verified: `node --check` OK, `npm test`
