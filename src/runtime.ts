@@ -225,16 +225,15 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       } catch {
       }
     }
-    const displayState: PlanState = config.trimegisto
-      ? { ...state, tasks: state.tasks.map((t) => ({ ...t, tier: resolveEffectiveTier(t.tier, tgConfig) })) }
-      : state;
-
     // Foreign-write guard: otra sesión pudo escribir el mismo plan compartido desde
     // nuestro último write. Se comprueba ANTES de serializar para que el historial
     // ajeno quede incluido en el fichero; las tareas siguen siendo last-write-wins.
+    // Comparación estricta: nuestro propio write deja el mtime exactamente igual
+    // (lo guardamos del stat posterior), así que sólo un tercero lo hace mayor.
+    // Sin tolerancia: dos sesiones en ráfaga (<1 ms) también deben detectarse.
     try {
       const st = await stat(filePath);
-      if (lastPlanMtime !== undefined && st.mtimeMs > lastPlanMtime + 1) {
+      if (lastPlanMtime !== undefined && st.mtimeMs > lastPlanMtime) {
         const disk = await readFile(filePath, "utf-8");
         mergeSessionsIntoState(parsePlanSessions(disk));
         pendingForeignWrite = Date.now();
@@ -242,6 +241,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } catch {
       // El fichero aún no existe (primer write): no hay nada con qué comparar.
     }
+
+    // Se construye DESPUÉS del merge: en modo trimegisto es una copia y debe
+    // capturar el `sessions` ya fusionado (si no, la sesión ajena no se escribe).
+    const displayState: PlanState = config.trimegisto
+      ? { ...state, tasks: state.tasks.map((t) => ({ ...t, tier: resolveEffectiveTier(t.tier, tgConfig) })) }
+      : state;
 
     const content = generatePlanMarkdown(displayState, {
       trimegisto: config.trimegisto,

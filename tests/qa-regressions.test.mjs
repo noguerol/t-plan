@@ -1,6 +1,6 @@
 import { test, before } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, readdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ensurePeers } from "./helpers/ensure-peers.mjs";
@@ -97,4 +97,56 @@ test("/t-plan load adopts a legacy file and migrates it to the unified name", as
     await h.cleanup();
   }
   await rm(cwd, { recursive: true, force: true });
+});
+
+// ── Regresión QA: con trimegisto activo, `displayState` es una copia y se
+// construía antes del merge, así que la sesión ajena nunca llegaba al disco. ────
+test("trimegisto mode: a foreign session is merged into the file written in the same pass", async () => {
+  const h = await createHarness({ sessionId: "sessHOST" });
+  try {
+    // Enable trimegisto through the config menu (label when currently OFF).
+    const realSelect = h.ctx.ui.select;
+    h.ctx.ui.select = async () => "❌ TG: OFF";
+    await h.rt.tPlanCommand.handler("config", h.ctx);
+    h.ctx.ui.select = realSelect;
+
+    await h.addTasks(["host task one"]);
+    const file = join(h.cwd, (await h.planFiles())[0]);
+    await new Promise((r) => setTimeout(r, 30));
+    const disk = await readFile(file, "utf-8");
+    const other = "- `sessOTHER` — first seen 2026-01-01 00:00:00, last seen 2026-01-01 01:00:00";
+    await writeFile(file, disk.replace(/(\n## [^\n]*Sessions\n)/, `$1\n${other}\n`), "utf-8");
+
+    await h.addTasks(["host task two"]);
+    const after = await readFile(file, "utf-8");
+    assert.match(after, /sessOTHER/, "trimegisto mode must serialize the merged session in the same write");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ── Regresión QA: dos sesiones que escriben en el mismo milisegundo. La guarda
+// usaba `mtimeMs > lastPlanMtime + 1` y no detectaba la escritura ajena. ──────────
+test("fast consecutive writes from two sessions still merge both histories", async () => {
+  for (let i = 0; i < 5; i++) {
+    const cwd = join(await mkdtemp(join(tmpdir(), "tplan-race-")), "proj");
+    await mkdir(cwd, { recursive: true });
+    const h1 = await createHarness({ cwd, sessionId: "sessA" });
+    const h2 = await createHarness({ cwd, sessionId: "sessB" });
+    try {
+      await h1.addTasks(["from A"]);
+      await h2.addTasks(["from B"]);
+      await h1.addTasks(["from A again"]);
+      const md = await readFile(join(cwd, "plan_proj.md"), "utf-8");
+      const sessions = u.parsePlanSessions(md);
+      assert.ok(
+        sessions.some((s) => s.id === "sessA") && sessions.some((s) => s.id === "sessB"),
+        `iteration ${i}: both sessions must survive fast consecutive writes (got ${sessions.map((s) => s.id).join(",")})`
+      );
+    } finally {
+      await h2.cleanup();
+      await h1.cleanup();
+      await rm(cwd, { recursive: true, force: true });
+    }
+  }
 });
