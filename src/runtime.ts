@@ -90,6 +90,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   let lastStopReason: string | undefined;   // "stop" | "aborted" | "error" | ...
   let lastAssistantText = "";               // último texto del modelo (para el settle)
 
+  // ── Liveness: ¿esta tarea la está ejecutando alguien AHORA? ──────────
+  // `in_progress` es una intención persistida, no una prueba de ejecución: sin
+  // run activo ni agente vivo el widget debe pintarla parada (ver isTaskLive).
+  // runActive va de before_agent_start a agent_settled; las tareas de agente
+  // (trimegisto) se consideran vivas mientras su agentId siga tracked.
+  let runActive = false;
+  const liveAgentTaskIds = new Set<string>();
+
+  function isTaskLive(task: PlanTask): boolean {
+    return task.status === "in_progress" && (runActive || liveAgentTaskIds.has(task.id));
+  }
+
   const DEBUG_LOG_PATH = join(homedir(), ".pi", "agent", "t-plan", "debug.log");
 
   /** Los catch vacíos hacían invisibles estos fallos; con `debug` se registran. */
@@ -201,6 +213,26 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         }
       }
     }
+  }
+
+  /**
+   * Aparca a `pending` todo `in_progress` (limpiando `startedAt`) cuando no hay
+   * ningún run/agente en marcha. Se usa al arrancar la sesión: un `in_progress`
+   * leído del plan file o restaurado de otra vida no lo está ejecutando nadie, y
+   * dejarlo animado con un timer viejo es exactamente el bug que se corrige.
+   * Devuelve true si cambió algo.
+   */
+  function parkStaleInProgress(): boolean {
+    let changed = false;
+    for (const t of state.tasks) {
+      if (t.status === "in_progress") {
+        t.status = "pending";
+        t.startedAt = undefined;
+        changed = true;
+      }
+    }
+    if (changed) liveAgentTaskIds.clear();
+    return changed;
   }
 
   function ensureTitle(sampleText: string | undefined, ctx?: ExtensionContext): void {
@@ -386,7 +418,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   }
 
   function startWidgetAnimation(ctx: ExtensionContext): void {
-    const anyInProgress = state.tasks.some((t) => t.status === "in_progress");
+    const anyInProgress = state.tasks.some(isTaskLive);
     const anyActivity = anyInProgress || highlightedTasks.size > 0;
     const wantSpin = config.animateWidget;
     const wantTimer = config.showTimers && anyInProgress;
@@ -471,11 +503,14 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
     const total = state.tasks.length;
     const done = state.tasks.filter((t) => t.status === "done").length;
-    const inProgress = state.tasks.filter((t) => t.status === "in_progress").length;
+    // Ojo: `live` (ejecutándose ahora) ≠ `in_progress` (marcada, quizá huérfana).
+    // La cabecera y el spinner cuentan sólo las vivas; las in_progress sin dueño
+    // activo se pintan paradas y viajan en la lista de pendientes.
+    const liveCount = state.tasks.filter(isTaskLive).length;
 
     if (total > 0) {
       const progress = `${done}/${total}`;
-      const active = inProgress > 0 ? ` ${SPINNER_FRAMES[spinnerFrame]}${inProgress}` : "";
+      const active = liveCount > 0 ? ` ${SPINNER_FRAMES[spinnerFrame]}${liveCount}` : "";
       ctx.ui.setStatus("t-plan", ctx.ui.theme.fg("accent", `📋 ${progress}${active}`));
     } else {
       ctx.ui.setStatus("t-plan", ctx.ui.theme.fg("muted", "📋 no plan"));
@@ -493,12 +528,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         config.trimegisto ? { ...t, tier: resolveEffectiveTier(t.tier, tgConfig) } : t;
 
       const active = state.tasks
-        .filter((t) => t.status === "in_progress" || t.status === "blocked")
+        .filter((t) => isTaskLive(t) || t.status === "blocked")
         .sort((a, b) => a.order - b.order)
         .map(withTier);
 
       const upcoming = state.tasks
-        .filter((t) => t.status === "pending")
+        .filter((t) => t.status === "pending" || (t.status === "in_progress" && !isTaskLive(t)))
         .sort((a, b) => a.order - b.order)
         .map(withTier);
 
@@ -528,7 +563,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const lines: string[] = [
         truncateToWidth(
           ctx.ui.theme.bold(ctx.ui.theme.fg("accent", `📋 ${state.title || "Plan"}`)) +
-            `  ${ctx.ui.theme.fg("muted", `${done}/${total} done${inProgress > 0 ? ` • ${inProgress} active` : ""}${tierSummary}`)}`,
+            `  ${ctx.ui.theme.fg("muted", `${done}/${total} done${liveCount > 0 ? ` • ${liveCount} active` : ""}${tierSummary}`)}`,
           78,
           "…"
         ),
@@ -548,6 +583,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
               compact: config.compactTaskLines,
               showTier: config.trimegisto,
               showTimers: config.showTimers,
+              live: isTaskLive(task),
               now,
             })
           );
@@ -599,6 +635,19 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const task = state.tasks.find((t) => t.id === taskId);
     if (!task) return false;
     Object.assign(task, updates);
+    // Sincroniza el timer con el estado, igual que markTaskStatus. Sin esto un
+    // `plan_manager update` a pending dejaba el startedAt viejo y otro a
+    // in_progress resucitaba un timer de días antes (el widget lo pinta parado,
+    // pero el dato quedaba inconsistente).
+    if (updates.status === "in_progress") {
+      if (!updates.startedAt) task.startedAt = Date.now();
+    } else if (updates.status === "pending") {
+      task.startedAt = undefined;
+      liveAgentTaskIds.delete(task.id);
+    } else if (updates.status === "done") {
+      task.completedAt = Date.now();
+      liveAgentTaskIds.delete(task.id);
+    }
     state.updatedAt = Date.now();
     return true;
   }
@@ -656,12 +705,14 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       existing.text = taskText;
       existing.agentName = agentName;
       existing.status = "in_progress";
+      liveAgentTaskIds.add(existing.id);
     } else {
       const task = addTask(taskText, "in_progress");
       task.everTouched = true;
       task.agentId = agentId;
       task.agentName = agentName;
       task.startedAt = Date.now();
+      liveAgentTaskIds.add(task.id);
     }
     state.updatedAt = Date.now();
   }
@@ -672,6 +723,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       task.everTouched = true;
       task.status = "done";
       task.completedAt = Date.now();
+      liveAgentTaskIds.delete(task.id);
       state.updatedAt = Date.now();
     }
   }
@@ -1359,12 +1411,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       ...state.tasks
         .sort((a, b) => a.order - b.order)
         .map((t) => {
-          const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? "🔄" : t.status === "blocked" ? "🚫" : "⏳";
+          const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? (isTaskLive(t) ? "🔄" : "⏸") : t.status === "blocked" ? "🚫" : "⏳";
           const agent = t.agentName ? ` [${t.agentName}]` : "";
           const tier = config.trimegisto ? ` → ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
           let timer = "";
           if (config.showTimers) {
-            if (t.status === "in_progress" && t.startedAt) {
+            if (isTaskLive(t) && t.startedAt) {
               timer = ` ⏱ ${formatElapsed(Date.now() - t.startedAt)}`;
             } else if (t.status === "done") {
               const took = completedTimerText(t.startedAt, t.completedAt);
@@ -1402,18 +1454,6 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       state = { ...DEFAULT_STATE, tasks: [], createdAt: Date.now(), updatedAt: Date.now() };
     }
     restoreState(entries);
-    // Estado restaurado de otra vida de la sesión (reload/resume): nadie está
-    // trabajando ahora mismo, así que ninguna tarea debe arrancar con el timer
-    // corriendo desde un startedAt viejo. El próximo run la reactiva si se trabaja.
-    if (hadSessionState) {
-      for (const t of state.tasks) {
-        if (t.status === "in_progress") {
-          t.status = "pending";
-          t.startedAt = undefined;
-        }
-      }
-      state.updatedAt = Date.now();
-    }
     ensureTitle(undefined, ctx);
 
     if (config.enabled) {
@@ -1422,6 +1462,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (!hadSessionState || state.tasks.length === 0) {
         await readPlanFile(ctx.cwd);
       }
+      // Nadie está ejecutando nada al arrancar: cualquier in_progress (heredado de
+      // otra vida de la sesión o adoptado del plan_*.md, con startedAt de hace días)
+      // se aparca a pending. Antes sólo se hacía con hadSessionState, así que un
+      // fichero de plan con in_progress antiguo se cargaba tal cual y salía girando.
+      if (parkStaleInProgress()) state.updatedAt = Date.now();
       touchSession(sessionId, Date.now());
       if (state.tasks.length > 0) await writePlanFile(ctx.cwd);
       persistState();
@@ -1440,6 +1485,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     lastAssistantText = "";
 
     if (!config.enabled) return;
+
+    // Run en marcha: mientras dure, las tareas in_progress se consideran vivas
+    // (el agente las está trabajando) y el widget las anima. agent_settled lo baja.
+    runActive = true;
+    // Repinta ya: si el settle anterior dejó una tarea "parada" (⏸) que ahora
+    // retomamos, debe volver a girar desde el primer momento del run.
+    updateUI(ctx);
 
     if (state.tasks.length > 0) {
       const pending = state.tasks.filter((t) => t.status === "pending");
@@ -1769,6 +1821,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
   const onAgentSettled = async (_event: unknown, ctx: ExtensionContext) => {
     try {
+    // El run ha terminado (o se ha abortado): bajar la liveness cuanto antes para
+    // que cualquier updateUI posterior pinte paradas —no girando— las in_progress
+    // que sobrevivan, aunque config esté deshabilitado a mitad de run.
+    runActive = false;
+    liveAgentTaskIds.clear();
     if (!config.enabled) return;
 
     // agent_settled se emite en un `finally` tras CUALQUIER run (éxito, aborto o error).
@@ -1845,6 +1902,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     // Síncrono y primero: el runtime viejo queda inerte antes de que pi lo
     // invalide; ningún timer ni continuación tocará un ctx stale tras reload.
     disposed = true;
+    runActive = false;
+    liveAgentTaskIds.clear();
     stopAllTimers();
     try {
       if (config.enabled && state.tasks.length > 0) {
