@@ -357,3 +357,39 @@ test("(f) un checkbox dentro de Sessions no se importa como tarea", () => {
   assert.deepEqual(tasks.map((t) => t.text), ["real task"]);
   assert.deepEqual(tasks.map((t) => t.ref), [1]);
 });
+
+// ── Liveness en el widget: in_progress sólo se anima si alguien lo ejecuta ──────
+// `formatTaskForWidget` distingue "marcada como in_progress" (intención) de
+// "ejecutándose ahora" (`live`). Sin run/agente vivo debe leerse parada: ⏸,
+// sin spinner, sin timer y en muted (nunca en acento).
+const mkTheme = () => ({
+  bold: (s) => s,
+  fg: (_c, s) => s,
+  bg: (_c, s) => s,
+  strikethrough: (s) => s,
+  accent: (s) => `ACCENT(${s})`,
+});
+const widgetCtx = { ui: { theme: mkTheme() } };
+const SPINNERS = (await import("../src/types.ts")).SPINNER_FRAMES;
+const hasSpinner = (line) => SPINNERS.some((f) => line.includes(f));
+
+test("(live) in_progress con live:false se pinta parada (⏸, sin spinner ni timer)", () => {
+  const task = { id: "a", ref: 1, text: "Tarea en curso", status: "in_progress", order: 1, startedAt: Date.now() - 5000 };
+  const line = u.formatTaskForWidget(widgetCtx, task, { live: false, now: Date.now() });
+  assert.match(line, /⏸/, `debe marcarse parada: ${line}`);
+  assert.equal(hasSpinner(line), false, `no debe girar: ${line}`);
+  assert.ok(!line.includes("⏱"), `no debe tener timer: ${line}`);
+});
+
+test("(live) in_progress con live:true gira y muestra timer", () => {
+  const task = { id: "a", ref: 1, text: "Tarea en curso", status: "in_progress", order: 1, startedAt: Date.now() - 5000 };
+  const line = u.formatTaskForWidget(widgetCtx, task, { live: true, now: Date.now() });
+  assert.equal(hasSpinner(line), true, `debe girar: ${line}`);
+  assert.match(line, /⏱ \d\d:\d\d:\d\d/, `debe tener timer: ${line}`);
+});
+
+test("(live) sin opción live se preserva el comportamiento clásico (gira)", () => {
+  const task = { id: "a", ref: 1, text: "Tarea en curso", status: "in_progress", order: 1, startedAt: Date.now() - 5000 };
+  const line = u.formatTaskForWidget(widgetCtx, task, { now: Date.now() });
+  assert.equal(hasSpinner(line), true, `default = running: ${line}`);
+});

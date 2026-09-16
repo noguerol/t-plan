@@ -534,6 +534,7 @@ export interface FormatTaskForWidgetOptions {
   spinnerFrames?: string[];
   showTier?: boolean;   // show trimegisto tier badge
   showTimers?: boolean; // show elapsed timer on in-progress tasks
+  live?: boolean;       // task is really executing (run/agent active) → animate it
   now?: number;         // current timestamp (injectable for tests)
 }
 
@@ -542,11 +543,17 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
   const spinnerFrames = options.spinnerFrames ?? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
   const spinner = spinnerFrames[options.spinnerFrame ?? 0] ?? spinnerFrames[0];
 
-  const prefix = task.status === "in_progress" ? `${spinner}` : "";
-  const marker = task.status === "in_progress" ? "" : getStatusIcon(task.status) + " ";
+  // `in_progress` sólo se anima si alguien lo está ejecutando AHORA (`live`).
+  // Sin run/agente activo se pinta parada (⏸), igual que una pendiente: así el
+  // widget nunca muestra girando una tarea que nadie está trabajando.
+  const running = task.status === "in_progress" && options.live !== false;
+  const stopped = task.status === "in_progress" && !running;
+
+  const prefix = running ? `${spinner}` : "";
+  const marker = running ? "" : stopped ? "⏸ " : getStatusIcon(task.status) + " ";
   const rawAgent = task.agentName ? ` [${task.agentName}]` : "";
   const agent = task.agentName ? theme.fg?.("muted", rawAgent) ?? rawAgent : "";
-  const spacer = task.status === "in_progress" ? " " : "";
+  const spacer = running ? " " : "";
 
   const showTier = options.showTier === true;
   const tierValue = showTier ? task.tier : undefined;
@@ -555,7 +562,7 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
 
   const showTimers = options.showTimers !== false;
   const rawTimer =
-    showTimers && task.status === "in_progress" && task.startedAt
+    showTimers && running && task.startedAt
       ? ` ⏱ ${formatElapsed((options.now ?? Date.now()) - task.startedAt)}`
       : "";
   const timer = rawTimer ? theme.fg?.("muted", rawTimer) ?? rawTimer : "";
@@ -569,9 +576,13 @@ export function formatTaskForWidget(ctx: { ui: { theme: PlanWidgetTheme } }, tas
       const strikethrough = theme.strikethrough?.(muted) ?? muted;
       return highlight ? theme.bg?.("selectedBg", strikethrough) ?? theme.fg?.("success", strikethrough) ?? strikethrough : strikethrough;
     }
-    if (task.status === "in_progress") {
+    if (running) {
       const accent = theme.fg?.("accent", value) ?? value;
       return highlight ? theme.bg?.("selectedBg", accent) ?? accent : accent;
+    }
+    if (stopped) {
+      // Parada (in_progress heredado, nadie ejecutándola) → se lee como pendiente.
+      return theme.fg?.("muted", value) ?? value;
     }
     if (task.status === "blocked") {
       const error = theme.fg?.("error", value) ?? value;

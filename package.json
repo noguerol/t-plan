@@ -1,6 +1,6 @@
 {
   "name": "pi-t-plan",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "description": "pi plan tracker: TUI, plan_manager tool, tiers, timers, progress.",
   "keywords": [
     "pi-package",

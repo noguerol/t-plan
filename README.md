@@ -16,6 +16,7 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 ## What's new
 
+- **v1.4.0 — in-progress ≠ girando (liveness del widget)** — el widget sólo anima (spinner + ⏱ timer + color acento) una tarea `in_progress` cuando hay un run de agente activo o una tarea de agente viva; en caso contrario se muestra parada (`⏸`, muted, sin spinner ni timer) y cuenta como pendiente en la cabecera. Al arrancar/restaurar sesión, cualquier `in_progress` heredado del `plan_*.md` se aparca a `pending`. `plan_manager list` sigue mostrando el estado almacenado (`in_progress`) para el modelo; `/t-plan show` refleja la liveness (`⏸` si nadie la ejecuta).
 - **v1.3.3 — smaller startup and text footprint** — trimmed the entrypoint's exposed metadata/descriptions and compressed the injected plan context, labels, notifications and menu text. Startup bundle 4,458 → 4,184 bytes (−6.1%); no change to command names/args, tool name/params/schema, config keys, persisted state or behavior.
 - **v1.3.2 — short task names survive across sessions** — task text shorter than 4 characters (`CI`, `v2`) was written to the plan file but silently dropped when a new session adopted it, because the file parser reused the model-prose noise filter (`text.length > 3`). That filter now defaults to 4 for prose detection and is relaxed to 1 when reading a plan file, so cross-session adoption is lossless for short tasks.
 - **v1.3.1 — concurrency guard hardened** — two edge cases in the shared-file guard: with Trimegisto mode enabled, the merged history of another session was computed but not written, because `displayState` was snapshotted before the merge; and a foreign write landing within ~1 ms of ours was missed by the `mtime + 1` tolerance. The merged history is now serialized in the same write, and any strictly newer `mtime` counts as a foreign write (our own write leaves it exactly equal, so no self-warnings). Both are covered by regression tests.
@@ -208,6 +209,10 @@ The widget is designed to stay compact and readable during long projects:
 - **Completed tasks** are struck through, briefly illuminated, then fade out after ~2.4s
 - **Trimegisto mode:** colored `[tN]` badge per task and a header distribution like `📋 Title  2/7 done • 1 active • t1×1 t2×3 t3×2`
 - **Timers:** `⏱ HH:MM:SS` next to each in-progress task
+
+### Tareas en curso vs paradas (liveness)
+
+El widget sólo **anima** (spinner + ⏱ timer + color acento) una tarea en estado `in_progress` cuando hay un **run de agente activo** o una **tarea de agente viva**; si no, se muestra con `⏸` (muted, sin spinner ni timer) y **cuenta como pendiente** en la cabecera. Al arrancar una sesión, cualquier `in_progress` heredado del `plan_*.md` se **aparca a `pending`** (nadie está ejecutándolo), así que no quedan timers girando por trabajo de días anteriores. El estado almacenado no cambia (`plan_manager list` sigue mostrando `in_progress` para el modelo), pero `/t-plan show` refleja la liveness: `⏸` cuando nadie la ejecuta.
 
 ## The `plan_manager` Tool
 
