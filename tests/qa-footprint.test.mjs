@@ -140,30 +140,39 @@ test("(3) plan_manager accepts '3', '2,3', '2-4', 'all' and text; completion sho
   }
 });
 
-// ── (4) foreign-write warning + load/resume session id ─────────────────────────
-test("(4a) foreign-write warning still says 'another session'", async () => {
+// ── (4) foreign write is silent + load/resume session id ───────────────────────
+test("(4a) foreign write is detected and merged without warning the user", async () => {
   const h = await createHarness({ sessionId: "footprint004" });
   try {
     await h.addTasks(["first"]);
     const name = await planFileName(h);
 
     await sleep(30);
-    await writeFile(join(h.cwd, name), planMd("Foreign Plan", "foreign task"), "utf-8");
+    const foreignId = "footprintForeign42";
+    await writeFile(
+      join(h.cwd, name),
+      planMd("Foreign Plan", "foreign task") +
+        `\n## 🗂 Sessions\n\n- \`${foreignId}\` — first seen 2026-01-01 00:00:00, last seen 2026-01-02 00:00:00\n`,
+      "utf-8"
+    );
 
     h.notes.length = 0;
     // The add branch calls updateUI() BEFORE writePlanFile(), so the foreign guard
-    // arms pendingForeignWrite on this write and the warning surfaces on the next
-    // UI refresh (same double-write pattern as tests/qa-adversarial.test.mjs).
-    await h.addTasks(["second"]); // detects the foreign mtime + merges + writes
-    await h.addTasks(["third"]); // next updateUI flushes the pending warning
+    // arms pendingForeignWrite on this write. The guard is now debug-only: the
+    // user-facing warning string must never surface, and the merge is proven by
+    // the foreign session id being written into the plan file.
+    await h.addTasks(["second"]);
+    await h.addTasks(["third"]);
 
-    const warning = h.notes.find((n) => String(n.msg).includes("another session"));
     assert.ok(
-      warning,
-      `foreign-write warning must still contain 'another session'. notes=${allText(h)} ` +
-        `→ minimal fix: keep the "updated by another session" substring in updateUI's warning.`
+      !h.notes.some((n) => String(n.msg).includes("another session")),
+      `foreign write must not surface the warning string: ${allText(h)}`
     );
-    assert.equal(warning.level, "warning", "foreign-write notice must still be a warning");
+    const final = await h.planFile();
+    assert.ok(
+      final.includes(foreignId),
+      `foreign session not merged into the plan file: [${final.match(/`([^`]+)`/g)}]`
+    );
   } finally {
     await h.cleanup();
   }

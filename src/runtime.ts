@@ -2,7 +2,8 @@
 import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth } from "@earendil-works/pi-tui";
+import { getSettingsListTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
+import { Container, truncateToWidth, type SettingItem, SettingsList, SelectList, Text } from "@earendil-works/pi-tui";
 import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
 import {
@@ -484,13 +485,12 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   function updateUI(ctx: ExtensionContext): void {
     if (disposed) return; // tras reload, el runtime viejo no actualiza UI
     if (pendingForeignWrite !== undefined) {
+      // Foreign writes are the norm in multi-agent development (several sessions
+      // sharing one plan file). The merge is automatic and harmless, so we no
+      // longer warn about it — it is only logged when the debug log is enabled.
       pendingForeignWrite = undefined;
-      try {
-        ctx.ui.notify(
-          "t-plan: plan file was updated by another session — history merged; task state last-write-wins.",
-          "warning"
-        );
-      } catch {
+      if (config.debug) {
+        logError("foreignWrite", "plan file updated by another session; history merged (last-write-wins)");
       }
     }
     if (!config.enabled || !config.showWidget) {
@@ -1237,55 +1237,248 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     return out;
   }
 
-  async function showConfigMenu(ctx: ExtensionContext): Promise<void> {
-    const options = [
-      `${config.enabled ? "✅" : "❌"} Track: ${config.enabled ? "ON" : "OFF"}`,
-      `${config.autoDetect ? "✅" : "❌"} Auto-detect: ${config.autoDetect ? "ON" : "OFF"}`,
-      `${config.showWidget ? "✅" : "❌"} Widget: ${config.showWidget ? "ON" : "OFF"}`,
-      `📐 Placement: ${config.widgetPlacement}`,
-      `📄 Prefix: ${config.planFilePrefix}`,
-      `${config.trackAgents ? "✅" : "❌"} Agents: ${config.trackAgents ? "ON" : "OFF"}`,
-      `${config.trimegisto ? "✅" : "❌"} TG: ${config.trimegisto ? "ON" : "OFF"}`,
-      `${config.showTimers ? "✅" : "❌"} Timers: ${config.showTimers ? "ON" : "OFF"}`,
-      `${config.toolEvidence ? "✅" : "❌"} Tool evidence: ${config.toolEvidence ? "ON" : "OFF"}`,
-      `${config.debug ? "✅" : "❌"} Debug log: ${config.debug ? "ON" : "OFF"}`,
-      `${config.animateWidget ? "✅" : "❌"} Animate: ${config.animateWidget ? "ON" : "OFF"}`,
-      `${config.compactTaskLines ? "✅" : "❌"} Compact: ${config.compactTaskLines ? "ON" : "OFF"}`,
-      `${config.highlightCompleted ? "✅" : "❌"} Highlight: ${config.highlightCompleted ? "ON" : "OFF"}`,
-      "──",
-      "💾 Save",
-      "📂 Load",
-      "🗑️ Clear",
-      "🧹 Purge",
+  // ── Config menu ───────────────────────────────────────────────────────
+  // One item per setting, each with a description that is rendered under the
+  // list when the item is selected (same shape as pi's native /settings).
+  const ON = "on";
+  const OFF = "off";
+
+  function toggle(ctx: ExtensionContext, id: string, on: boolean): void {
+    switch (id) {
+      case "enabled":
+        config.enabled = on;
+        state.enabled = on;
+        break;
+      case "autoDetect":
+        config.autoDetect = on;
+        state.autoDetect = on;
+        break;
+      case "showWidget":
+        config.showWidget = on;
+        state.showWidget = on;
+        break;
+      case "trackAgents":
+        config.trackAgents = on;
+        break;
+      case "showTimers":
+        config.showTimers = on;
+        break;
+      case "toolEvidence":
+        config.toolEvidence = on;
+        ctx.ui.notify(on ? "Tool evidence ON: files/commands complete tasks" : "Tool evidence OFF: text/markers only", "info");
+        break;
+      case "debug":
+        config.debug = on;
+        ctx.ui.notify(on ? `Debug log ON: ${DEBUG_LOG_PATH}` : "Debug log OFF", "info");
+        break;
+      case "animateWidget":
+        config.animateWidget = on;
+        break;
+      case "compactTaskLines":
+        config.compactTaskLines = on;
+        break;
+      case "highlightCompleted":
+        config.highlightCompleted = on;
+        break;
+    }
+  }
+
+  /**
+   * A one-entry SelectList used as the submenu for action items (Save/Load/Clear/
+   * Purge). Selecting the entry calls done("run"), which makes SettingsList fire
+   * onChange(id, "run") → applyConfigChoice. Escape cancels without running.
+   */
+  function actionSubmenu(action: string, done: (value?: string) => void, fallbackTheme?: { fg: (c: string, s: string) => string }): SelectList {
+    const t = fallbackTheme;
+    const selectTheme = {
+      selectedPrefix: (s) => (t ? t.fg("accent", s) : s),
+      selectedText: (s) => (t ? t.fg("accent", s) : s),
+      description: (s) => (t ? t.fg("muted", s) : s),
+      scrollInfo: (s) => (t ? t.fg("muted", s) : s),
+      noMatch: (s) => (t ? t.fg("muted", s) : s),
+    };
+    const labels: Record<string, string> = {
+      save: "Run — write the plan file now",
+      load: "Run — parse the plan file now",
+      clear: "Run — remove every task (file untouched)",
+      purge: "Run — delete tasks, state and the plan file",
+    };
+    const list = new SelectList(
+      [{ value: "run", label: action, description: labels[action] ?? "Run" }],
+      5,
+      selectTheme
+    );
+    list.onSelect = (item) => done(item.value);
+    list.onCancel = () => done(undefined);
+    return list;
+  }
+
+  function configItems(fallbackTheme?: { fg: (c: string, s: string) => string; bold?: (s: string) => string }): SettingItem[] {
+    const onOff = (v: boolean) => (v ? ON : OFF);
+    return [
+      {
+        id: "enabled",
+        label: "📋 Plan tracking",
+        currentValue: onOff(config.enabled),
+        values: [ON, OFF],
+        description: "Enable or disable the whole extension: the widget, the plan_manager tool and plan detection. /t-plan alone flips the same flag.",
+      },
+      {
+        id: "autoDetect",
+        label: "🔎 Auto-detect plans",
+        currentValue: onOff(config.autoDetect),
+        values: [ON, OFF],
+        description: "Read the plan out of the model's own output (numbered steps, TODO lists, 'Done (3/8)') and reconcile it with the live task list. Off: only explicit plan_manager / task calls change the plan.",
+      },
+      {
+        id: "showWidget",
+        label: "🎛️ Task widget",
+        currentValue: onOff(config.showWidget),
+        values: [ON, OFF],
+        description: "Show the plan above or below the editor: every task with its #ref, status, tier and elapsed time.",
+      },
+      {
+        id: "widgetPlacement",
+        label: "📐 Widget placement",
+        currentValue: config.widgetPlacement,
+        values: ["aboveEditor", "belowEditor"],
+        description: "Where the widget sits. 'aboveEditor' is the default so the plan stays visible while you type.",
+      },
+      {
+        id: "planFilePrefix",
+        label: "📄 Plan file prefix",
+        currentValue: config.planFilePrefix,
+        submenu: (_current, done) => {
+          // Free-text prefix. A one-entry SelectList is the only submenu shape
+          // SettingsList accepts, so the prompt itself lives in this item's
+          // description and the single entry opens the input dialog.
+          const t = fallbackTheme;
+          const selectTheme = {
+            selectedPrefix: (s) => (t ? t.fg("accent", s) : s),
+            selectedText: (s) => (t ? t.fg("accent", s) : s),
+            description: (s) => (t ? t.fg("muted", s) : s),
+            scrollInfo: (s) => (t ? t.fg("muted", s) : s),
+            noMatch: (s) => (t ? t.fg("muted", s) : s),
+          };
+          const list = new SelectList(
+            [{ value: "prompt", label: "Change prefix…", description: "Opens a prompt for the new prefix" }],
+            5,
+            selectTheme
+          );
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done(undefined);
+          return list;
+        },
+        description: "Name of the plan file: <prefix>_<project-slug>.md, one file per project (never session-scoped), kept gitignored. Changing it merges the old file into the new name so no task is orphaned. Enter to change; Esc cancels.",
+      },
+      {
+        id: "trackAgents", label: "🤝 Track agents", currentValue: onOff(config.trackAgents), values: [ON, OFF],
+        description: "Count Trimegisto sub-agents as live work: an in_progress task stays 'running' while its agent is still alive, and shows as paused when nobody is executing it.",
+      },
+      {
+        id: "trimegisto", label: "⚡ Trimegisto mode", currentValue: onOff(config.trimegisto), values: [ON, OFF],
+        description: "Classify every task into tiers (t1 plan / t2 solve / t3 execute) and show which tiers are actually spawnable from ~/.pi/agent/trimegisto/config.json. Unavailable tiers fall back to active.",
+      },
+      {
+        id: "showTimers", label: "⏱️ Task timers", currentValue: onOff(config.showTimers), values: [ON, OFF],
+        description: "Live HH:MM:SS counter on in-progress tasks; completed tasks record '(took HH:MM:SS)' in the plan file.",
+      },
+      {
+        id: "toolEvidence", label: "🧪 Tool evidence", currentValue: onOff(config.toolEvidence), values: [ON, OFF],
+        description: "Let real work count as proof: writing a file or running a command that matches a task advances or completes it, instead of relying only on what the model says.",
+      },
+      {
+        id: "debug", label: "🐛 Debug log", currentValue: onOff(config.debug), values: [ON, OFF],
+        description: `Write swallowed errors to ~/.pi/agent/t-plan/debug.log. Off by default: no disk writes except the plan file.`,
+      },
+      {
+        id: "animateWidget", label: "✨ Animate widget", currentValue: onOff(config.animateWidget), values: [ON, OFF],
+        description: "Spinner on running tasks and a short flash on completed ones. Off keeps the widget static (cheaper renders).",
+      },
+      {
+        id: "compactTaskLines", label: "📝 Compact task lines", currentValue: onOff(config.compactTaskLines), values: [ON, OFF],
+        description: "Truncate each task to one line in the widget so the plan fits in a few rows.",
+      },
+      {
+        id: "highlightCompleted", label: "💡 Highlight completed", currentValue: onOff(config.highlightCompleted), values: [ON, OFF],
+        description: "Briefly illuminate a task after it finishes before it leaves the pending list, so closures are visible.",
+      },
+      // Actions are one-shot, not settings. SettingsList.activateItem() is a no-op
+      // for items without `values`, so they use a submenu: selecting its only entry
+      // calls done("run") → onChange("save", "run") → applyConfigChoice. Esc cancels.
+      // currentValue is required by SettingItem (it is rendered), and applyConfigChoice
+      // only ever writes keys it knows, so the placeholder never reaches config.
+      {
+        id: "save", label: "💾 Save plan file", currentValue: "—",
+        submenu: (_current, done) => actionSubmenu("save", done, fallbackTheme),
+        description: "Write the live plan to <prefix>_<project-slug>.md in this project.",
+      },
+      {
+        id: "load", label: "📂 Load plan file", currentValue: "—",
+        submenu: (_current, done) => actionSubmenu("load", done, fallbackTheme),
+        description: "Parse the project's plan file back into the live plan (status sections, refs, tiers, timers and session history included).",
+      },
+      {
+        id: "clear", label: "🗑️ Clear tasks", currentValue: "—",
+        submenu: (_current, done) => actionSubmenu("clear", done, fallbackTheme),
+        description: "Remove every task from the live plan. The plan file on disk is left untouched.",
+      },
+      {
+        id: "purge", label: "🧹 Purge plan", currentValue: "—",
+        submenu: (_current, done) => actionSubmenu("purge", done, fallbackTheme),
+        description: "Delete all tasks, reset state and remove the project's plan file. Runs from the submenu, then asks for confirmation.",
+      },
     ];
+  }
 
-    const choice = await ctx.ui.select("Plan config:", options);
-
-    if (!choice) return;
-
-    if (choice.includes("Track")) {
-      config.enabled = !config.enabled;
-      state.enabled = config.enabled;
-    } else if (choice.includes("Auto-detect")) {
-      config.autoDetect = !config.autoDetect;
-      state.autoDetect = config.autoDetect;
-    } else if (choice.includes("Widget:")) {
-      config.showWidget = !config.showWidget;
-      state.showWidget = config.showWidget;
-    } else if (choice.includes("Placement")) {
-      config.widgetPlacement = config.widgetPlacement === "aboveEditor" ? "belowEditor" : "aboveEditor";
+  async function applyConfigChoice(ctx: ExtensionContext, id: string, value: string): Promise<void> {
+    if (id === "widgetPlacement") {
+      config.widgetPlacement = value === "belowEditor" ? "belowEditor" : "aboveEditor";
       state.widgetPlacement = config.widgetPlacement;
-    } else if (choice.includes("Prefix:")) {
+      return;
+    }
+    if (id === "planFilePrefix") {
       const name = await ctx.ui.input("Prefix (<prefix>_<title>.md):", config.planFilePrefix);
-      if (name) {
-        config.planFilePrefix = slugify(name) || "plan";
+      if (!name) return;
+      const next = slugify(name) || "plan";
+      if (next === config.planFilePrefix) return;
+      const before = planFileNameFor(config.planFilePrefix, state.title);
+      const after = planFileNameFor(next, state.title);
+      if (before === after) {
+        config.planFilePrefix = next;
         lastPlanFile = undefined;
         lastPlanMtime = undefined;
+        return;
       }
-    } else if (choice.includes("Agents:")) {
-      config.trackAgents = !config.trackAgents;
-    } else if (choice.includes("TG")) {
-      config.trimegisto = !config.trimegisto;
+      // The name would change for this project. If a file already lives at the
+      // new name, merge both plans (the live state wins) so no task is orphaned;
+      // otherwise the single plan file simply moves.
+      try {
+        // Commit the rename first: writePlanFile() derives its path from the
+        // prefix, so it must see the new one. We then explicitly remove the
+        // old-named file: writePlanFile only unlinks `lastPlanFile`, which a
+        // prior rename in this same session may have cleared to undefined, so
+        // the explicit unlink is the authoritative move (no-op if already gone).
+        config.planFilePrefix = next;
+        if (await access(join(ctx.cwd, after)).then(() => true, () => false)) {
+          const saved = state.tasks; // keep the live task list as the source of truth
+          await adoptPlanContent(await readFile(join(ctx.cwd, after), "utf-8"), join(ctx.cwd, after));
+          state.tasks = saved.length > 0 ? saved : state.tasks;
+          state.updatedAt = Date.now();
+        }
+        await writePlanFile(ctx.cwd);
+        try { await unlink(join(ctx.cwd, before)); } catch { }
+        lastPlanFile = undefined;
+        lastPlanMtime = undefined;
+        ctx.ui.notify(`Prefix '${next}': ${before} -> ${after}`, "info");
+      } catch (err) {
+        logError("prefixChange", err);
+        ctx.ui.notify(`Prefix '${next}' ignored: this project already uses '${before}'`, "warning");
+      }
+      return;
+    }
+    if (id === "trimegisto") {
+      config.trimegisto = value === ON;
       if (config.trimegisto) {
         tgConfig = readTrimegistoConfig();
         let assigned = 0;
@@ -1301,42 +1494,28 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       } else {
         ctx.ui.notify("TG OFF", "info");
       }
-    } else if (choice.includes("Timers")) {
-      config.showTimers = !config.showTimers;
-    } else if (choice.includes("Tool evidence")) {
-      config.toolEvidence = !config.toolEvidence;
-      ctx.ui.notify(
-        config.toolEvidence
-          ? "Tool evidence ON: files/commands complete tasks"
-          : "Tool evidence OFF: text/markers only",
-        "info"
-      );
-    } else if (choice.includes("Debug log")) {
-      config.debug = !config.debug;
-      ctx.ui.notify(config.debug ? `Debug log ON: ${DEBUG_LOG_PATH}` : "Debug log OFF", "info");
-    } else if (choice.includes("Animate")) {
-      config.animateWidget = !config.animateWidget;
-    } else if (choice.includes("Compact")) {
-      config.compactTaskLines = !config.compactTaskLines;
-    } else if (choice.includes("Highlight")) {
-      config.highlightCompleted = !config.highlightCompleted;
-    } else if (choice.startsWith("💾")) {
+      return;
+    }
+    if (id === "save") {
       await writePlanFile(ctx.cwd);
       ctx.ui.notify("Saved", "info");
-    } else if (choice.startsWith("📂")) {
+      return;
+    }
+    if (id === "load") {
       const loaded = await readPlanFile(ctx.cwd);
       ctx.ui.notify(loaded ? "Loaded" : "No plan file", loaded ? "info" : "warning");
-    } else if (choice.startsWith("🗑️")) {
+      return;
+    }
+    if (id === "clear") {
       const ok = await ctx.ui.confirm("Clear?", "Remove all tasks?");
       if (ok) {
         state.tasks = [];
         state.updatedAt = Date.now();
       }
-    } else if (choice.startsWith("🧹")) {
-      const ok = await ctx.ui.confirm(
-        "Purge plan?",
-        "Delete all tasks, state, and the plan file?"
-      );
+      return;
+    }
+    if (id === "purge") {
+      const ok = await ctx.ui.confirm("Purge plan?", "Delete all tasks, state, and the plan file?");
       if (ok) {
         const planFile = join(ctx.cwd, planFileNameFor(config.planFilePrefix, state.title));
         state = {
@@ -1356,10 +1535,104 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         lastPlanMtime = undefined;
         ctx.ui.notify("purged", "info");
       }
+      return;
+    }
+    toggle(ctx, id, value === ON);
+  }
+
+  async function showConfigMenu(ctx: ExtensionContext): Promise<void> {
+
+    // No TUI (rpc/json/print): fall back to the plain select dialog so the
+    // command still works headlessly and in tests.
+    if (typeof ctx.ui.custom !== "function") {
+      const legacy = [
+        `${config.enabled ? "✅" : "❌"} Track: ${config.enabled ? "ON" : "OFF"}`,
+        `${config.autoDetect ? "✅" : "❌"} Auto-detect: ${config.autoDetect ? "ON" : "OFF"}`,
+        `${config.showWidget ? "✅" : "❌"} Widget: ${config.showWidget ? "ON" : "OFF"}`,
+        `📐 Placement: ${config.widgetPlacement}`,
+        `📄 Prefix: ${config.planFilePrefix}`,
+        `${config.trackAgents ? "✅" : "❌"} Agents: ${config.trackAgents ? "ON" : "OFF"}`,
+        `${config.trimegisto ? "✅" : "❌"} TG: ${config.trimegisto ? "ON" : "OFF"}`,
+        `${config.showTimers ? "✅" : "❌"} Timers: ${config.showTimers ? "ON" : "OFF"}`,
+        `${config.toolEvidence ? "✅" : "❌"} Tool evidence: ${config.toolEvidence ? "ON" : "OFF"}`,
+        `${config.debug ? "✅" : "❌"} Debug log: ${config.debug ? "ON" : "OFF"}`,
+        `${config.animateWidget ? "✅" : "❌"} Animate: ${config.animateWidget ? "ON" : "OFF"}`,
+        `${config.compactTaskLines ? "✅" : "❌"} Compact: ${config.compactTaskLines ? "ON" : "OFF"}`,
+        `${config.highlightCompleted ? "✅" : "❌"} Highlight: ${config.highlightCompleted ? "ON" : "OFF"}`,
+        "──",
+        "💾 Save",
+        "📂 Load",
+        "🗑️ Clear",
+        "🧹 Purge",
+      ];
+      const choice = await ctx.ui.select("Plan config:", legacy);
+      if (!choice) return;
+      if (choice.includes("Track")) await applyConfigChoice(ctx, "enabled", config.enabled ? OFF : ON);
+      else if (choice.includes("Auto-detect")) await applyConfigChoice(ctx, "autoDetect", config.autoDetect ? OFF : ON);
+      else if (choice.includes("Widget:")) await applyConfigChoice(ctx, "showWidget", config.showWidget ? OFF : ON);
+      else if (choice.includes("Placement")) await applyConfigChoice(ctx, "widgetPlacement", config.widgetPlacement === "aboveEditor" ? "belowEditor" : "aboveEditor");
+      else if (choice.includes("Prefix:")) await applyConfigChoice(ctx, "planFilePrefix", "pick");
+      else if (choice.includes("Agents:")) await applyConfigChoice(ctx, "trackAgents", config.trackAgents ? OFF : ON);
+      else if (choice.includes("TG")) await applyConfigChoice(ctx, "trimegisto", config.trimegisto ? OFF : ON);
+      else if (choice.includes("Timers")) await applyConfigChoice(ctx, "showTimers", config.showTimers ? OFF : ON);
+      else if (choice.includes("Tool evidence")) await applyConfigChoice(ctx, "toolEvidence", config.toolEvidence ? OFF : ON);
+      else if (choice.includes("Debug log")) await applyConfigChoice(ctx, "debug", config.debug ? OFF : ON);
+      else if (choice.includes("Animate")) await applyConfigChoice(ctx, "animateWidget", config.animateWidget ? OFF : ON);
+      else if (choice.includes("Compact")) await applyConfigChoice(ctx, "compactTaskLines", config.compactTaskLines ? OFF : ON);
+      else if (choice.includes("Highlight")) await applyConfigChoice(ctx, "highlightCompleted", config.highlightCompleted ? OFF : ON);
+      else if (choice.startsWith("💾")) await applyConfigChoice(ctx, "save", "run");
+      else if (choice.startsWith("📂")) await applyConfigChoice(ctx, "load", "run");
+      else if (choice.startsWith("🗑️")) await applyConfigChoice(ctx, "clear", "run");
+      else if (choice.startsWith("🧹")) await applyConfigChoice(ctx, "purge", "run");
+      updateUI(ctx);
+      persistState();
+      return;
     }
 
-    updateUI(ctx);
-    persistState();
+    await ctx.ui.custom((tui, theme, _kb, done) => {
+      const container = new Container();
+      container.addChild(new Text(theme.fg("accent", theme.bold("t-plan config (Enter/Space to change, Esc to close, type to search")), 1, 1));
+      // getSettingsListTheme() reads the global theme singleton, which is only
+      // initialized in interactive mode. Fall back to the theme handed to us by
+      // ctx.ui.custom so the dialog also works in rpc/print contexts.
+      let listTheme;
+      try {
+        listTheme = getSettingsListTheme();
+      } catch {
+        listTheme = {
+          label: (text, selected) => theme.fg(selected ? "accent" : "text", text),
+          value: (text, selected) => theme.fg(selected ? "accent" : "muted", text),
+          description: (text) => theme.fg("muted", text),
+          cursor: theme.fg("accent", "›"),
+          hint: (text) => theme.fg("dim", text),
+        };
+      }
+      const list = new SettingsList(
+        configItems(theme),
+        Math.min(configItems(theme).length + 2, 15),
+        listTheme,
+        (id, value) => {
+          applyConfigChoice(ctx, id, value)
+            .then(() => {
+              updateUI(ctx);
+              persistState();
+            })
+            .catch((err) => logError("applyConfigChoice", err));
+        },
+        () => done(undefined),
+        { enableSearch: true }
+      );
+      container.addChild(list);
+      return {
+        list,
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          list.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
+    });
   }
 
   async function showReorderUI(ctx: ExtensionContext): Promise<void> {
@@ -2106,5 +2379,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     onAgentSettled,
     onSessionShutdown,
     planManagerTool,
+    configItems,
+    // Read-only introspection for tests and diagnostics.
+    getConfig: () => config,
+    getState: () => state,
   };
 }

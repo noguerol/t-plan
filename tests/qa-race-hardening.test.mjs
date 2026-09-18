@@ -20,10 +20,12 @@ await ensurePeers();
 const u = await import("../src/utils.ts");
 
 const ORIG_HOME = process.env.HOME;
-const WARN = "plan file was updated by another session";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const warns = (h) => h.notes.filter((n) => String(n.msg).includes(WARN));
-const msgs = (h) => JSON.stringify(h.notes.map((n) => n.msg));
+
+// The foreign-write guard no longer emits a ui.notify warning (it is only
+// debug-logged in src/runtime.ts). Foreign writes are the norm in multi-agent
+// development and are merged automatically, so the only durable evidence that a
+// foreign session was seen is its id merged into the plan file's Sessions section.
 
 /** The one (or explicitly named) `plan_*.md` / `<prefix>_*.md` file in the harness cwd. */
 async function planName(h, expected) {
@@ -73,11 +75,12 @@ test("(1) 15 consecutive normal writes never emit a self-warning", async () => {
     }
     // Sanity: the writes really happened (seed + 8 adds), so "no warning" is not vacuous.
     assert.equal((await h.plan()).length, 9, "expected seed + 8 added tasks to be persisted");
-    assert.equal(
-      warns(h).length,
-      0,
-      `H1 FAIL: our own writes self-warned ${warns(h).length} time(s): ${msgs(h)}. ` +
-        `Minimal fix: compare with a tolerance / record mtime before the write too, in writePlanFile().`
+    // No self-warning is no longer observable; the durable evidence that our own
+    // consecutive writes were not mis-read as foreign is that our session survives.
+    assert.ok(
+      sessionIds(await h.planFile()).includes("selfRace001"),
+      `H1 FAIL: our own session was dropped across our own writes: [${sessionIds(await h.planFile()).join(", ")}]. ` +
+        `Minimal fix: our own consecutive writes must not be treated as foreign (record mtime before AND after the write in writePlanFile()).`
     );
 
     // Positive control: the same guard must still detect a real foreign write,
@@ -88,7 +91,11 @@ test("(1) 15 consecutive normal writes never emit a self-warning", async () => {
     h.notes.length = 0;
     await h.addTasks(["h1 pc trigger"]);
     await h.tool({ action: "complete", task_id: "1" });
-    assert.ok(warns(h).length >= 1, `H1 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
+    // The foreign session id is the only durable trace that the guard fired; it must be merged in.
+    assert.ok(
+      sessionIds(await readFile(join(h.cwd, name), "utf-8")).includes("h1Positive1"),
+      `H1 positive control: foreign session was not merged after a real foreign write: [${sessionIds(await readFile(join(h.cwd, name), "utf-8")).join(", ")}]`
+    );
   } finally {
     await h.cleanup();
   }
@@ -116,14 +123,12 @@ test("(2) after adopting a file via the load path, the next normal write does no
     h.notes.length = 0;
     await h.addTasks(["after load"]);
     await h.addTasks(["flush"]);
-    assert.equal(
-      warns(h).length,
-      0,
-      `H2 FAIL: load adopt did not record lastPlanMtime, next write warned: ${msgs(h)}. ` +
-        `Minimal fix: adoptPlanContent() must set lastPlanMtime from the adopted file (it does for readPlanFile).`
-    );
-    const final = await readFile(join(h.cwd, unified), "utf-8");
-    assert.ok(final.includes("after load"), "the post-load task must be written");
+    // No warning is emitted anymore; the evidence that load adoption established a
+    // baseline (so the next write is not mis-read as foreign) is that our session survives.
+    const afterLoad = await readFile(join(h.cwd, unified), "utf-8");
+    assert.ok(sessionIds(afterLoad).includes("loadAdopt01"), `H2 FAIL: our own session was lost after load adoption: [${sessionIds(afterLoad).join(", ")}]. ` +
+        `Minimal fix: adoptPlanContent() must set lastPlanMtime from the adopted file (it does for readPlanFile).`);
+    assert.ok(afterLoad.includes("after load"), "the post-load task must be written");
 
     // Positive control: load adoption did not disable the guard.
     await sleep(30);
@@ -135,7 +140,7 @@ test("(2) after adopting a file via the load path, the next normal write does no
     h.notes.length = 0;
     await h.addTasks(["h2 pc"]);
     await h.tool({ action: "complete", task_id: "1" });
-    assert.ok(warns(h).length >= 1, `H2 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
+    // The foreign session id is the only durable trace that the guard fired; it must be merged in.
     assert.ok(
       sessionIds(await readFile(join(h.cwd, unified), "utf-8")).includes("h2Positive1"),
       "H2 positive control: foreign session must be merged"
@@ -159,10 +164,11 @@ test("(3) purge resets tracking; a later real foreign write is still detected an
     await h.addTasks(["two"]);
     const afterReset = await planName(h);
     assert.equal(afterReset, name, "the auto title resolves to the same project file");
-    assert.equal(
-      warns(h).length,
-      0,
-      `H3 FAIL (a): the reset itself produced a spurious warning: ${msgs(h)}`
+    // No warning is emitted anymore; the evidence that re-establishing the baseline
+    // after purge is not mis-read as foreign is that our own session survives.
+    assert.ok(
+      sessionIds(await readFile(join(h.cwd, afterReset), "utf-8")).includes("resetRace01"),
+      `H3 FAIL (a): our own session was lost when the baseline was re-established after purge: [${sessionIds(await readFile(join(h.cwd, afterReset), "utf-8")).join(", ")}].`
     );
 
     // A genuine foreign write after the reset must be detected again.
@@ -175,13 +181,13 @@ test("(3) purge resets tracking; a later real foreign write is still detected an
     await h.addTasks(["three"]);
     await h.addTasks(["flush"]);
 
+    const final = await readFile(join(h.cwd, afterReset), "utf-8");
+    // The foreign session id is the only durable trace that the guard fired after purge; it must be merged in.
     assert.ok(
-      warns(h).length >= 1,
-      `H3 FAIL (b): foreign write after reset was not detected: ${msgs(h)}. ` +
+      sessionIds(final).includes("foreignReset1"),
+      `H3 FAIL (b): foreign write after reset was not merged: [${sessionIds(final).join(", ")}]. ` +
         `Minimal fix: purge must not permanently disable the guard — it must only clear lastPlanMtime.`
     );
-    const final = await readFile(join(h.cwd, afterReset), "utf-8");
-    assert.ok(sessionIds(final).includes("foreignReset1"), "foreign session must be merged");
     assert.ok(sessionIds(final).includes("resetRace01"), "own session must remain");
   } finally {
     await h.cleanup();
@@ -213,12 +219,12 @@ test("(4) title change then a foreign write on the new file is still detected", 
     await h.addTasks(["after retitle foreign"]);
     await h.addTasks(["flush"]);
 
-    assert.ok(
-      warns(h).length >= 1,
-      `H4 FAIL: foreign write on the retitled file was not detected: ${msgs(h)}`
-    );
     const final = await readFile(join(h.cwd, newName), "utf-8");
-    assert.ok(sessionIds(final).includes("foreignTitle1"), "foreign session must be merged on the new file");
+    // The foreign session id is the only durable trace that the guard fired on the new file; it must be merged in.
+    assert.ok(
+      sessionIds(final).includes("foreignTitle1"),
+      `H4 FAIL: foreign write on the retitled file was not merged: [${sessionIds(final).join(", ")}].`
+    );
     assert.ok(final.includes("after retitle foreign"), "our task must be written");
   } finally {
     await h.cleanup();
@@ -243,15 +249,13 @@ test("(5) prefix change then normal writes do not warn", async () => {
       if (i % 2 === 0) await h.addTasks([`prefix write ${i}`]);
       else await h.tool({ action: "complete", task_id: "1" });
     }
-    assert.equal(
-      warns(h).length,
-      0,
-      `H5 FAIL: prefix change produced a spurious warning: ${msgs(h)}. ` +
-        `Minimal fix: config prefix change already resets lastPlanMtime in showConfigMenu().`
-    );
+    // No warning is emitted anymore; the evidence that the prefix change established a
+    // clean baseline (normal writes not mis-read as foreign) is that our session survives.
+    const afterPrefix = await readFile(join(h.cwd, newName), "utf-8");
+    assert.ok(sessionIds(afterPrefix).includes("prefixRace01"), `H5 FAIL: our own session was lost after the prefix change: [${sessionIds(afterPrefix).join(", ")}]. ` +
+        `Minimal fix: config prefix change already resets lastPlanMtime in showConfigMenu().`);
     await planName(h, newName);
-    const final = await readFile(join(h.cwd, newName), "utf-8");
-    assert.ok(final.includes("prefix write"), "writes must land on the new-prefix file");
+    assert.ok(afterPrefix.includes("prefix write"), "writes must land on the new-prefix file");
 
     // Positive control: the guard is live on the new-prefix path.
     await sleep(30);
@@ -263,7 +267,11 @@ test("(5) prefix change then normal writes do not warn", async () => {
     h.notes.length = 0;
     await h.addTasks(["h5 pc"]);
     await h.tool({ action: "complete", task_id: "1" });
-    assert.ok(warns(h).length >= 1, `H5 positive control: guard did not detect a real foreign write: ${msgs(h)}`);
+    // The foreign session id is the only durable trace that the guard fired on the new-prefix path; it must be merged in.
+    assert.ok(
+      sessionIds(await readFile(join(h.cwd, newName), "utf-8")).includes("h5Positive1"),
+      `H5 positive control: foreign session was not merged after a real foreign write: [${sessionIds(await readFile(join(h.cwd, newName), "utf-8")).join(", ")}]`
+    );
   } finally {
     await h.cleanup();
   }
@@ -286,7 +294,12 @@ test("(6) trimegisto: 10 normal writes never warn and a foreign write merges in 
       if (i % 2 === 0) await h.addTasks([`tg write ${i}`]);
       else await h.tool({ action: "complete", task_id: "1" });
     }
-    assert.equal(warns(h).length, 0, `H6 FAIL (a): TG normal writes warned: ${msgs(h)}`);
+    // No warning is emitted anymore; the evidence that TG normal writes did not trip
+    // the foreign guard is that our own session survives the batch of writes.
+    assert.ok(
+      sessionIds(await h.planFile()).includes("ownTGrace01"),
+      `H6 FAIL (a): our own session was lost across TG normal writes: [${sessionIds(await h.planFile()).join(", ")}].`
+    );
 
     const name = await planName(h);
     await sleep(30);
@@ -307,7 +320,11 @@ test("(6) trimegisto: 10 normal writes never warn and a foreign write merges in 
     assert.ok(ids.includes("ownTGrace01"), `own session missing: [${ids.join(", ")}]`);
 
     await h.addTasks(["flush"]);
-    assert.ok(warns(h).length >= 1, `H6 FAIL (c): TG foreign write did not warn: ${msgs(h)}`);
+    // The foreign session id is the only durable trace that the guard fired in the second pass; it must be merged in.
+    assert.ok(
+      sessionIds(await readFile(join(h.cwd, name), "utf-8")).includes("foreignTGrace1"),
+      `H6 FAIL (c): the second-pass foreign write's session was not merged: [${sessionIds(await readFile(join(h.cwd, name), "utf-8")).join(", ")}]`
+    );
   } finally {
     await h.cleanup();
   }
@@ -328,12 +345,14 @@ test("(7) identical content with a newer mtime is flagged and does not corrupt s
     await h.addTasks(["after identical"]);
     await h.addTasks(["flush"]);
 
+    const final = await readFile(join(h.cwd, name), "utf-8");
+    // Identical bytes carry no new foreign session id, so the evidence that the newer-mtime
+    // write did not corrupt state is that our own session and tasks survive intact.
     assert.ok(
-      warns(h).length >= 1,
-      `H7 FAIL: a newer-mtime identical write was not flagged: ${msgs(h)}. ` +
+      sessionIds(final).includes("identRace01"),
+      `H7 FAIL: our own session was lost after a newer-mtime identical write (state corrupted): [${sessionIds(final).join(", ")}]. ` +
         `Minimal fix: writePlanFile() must trust the mtime (it does) — do not add content hashing.`
     );
-    const final = await readFile(join(h.cwd, name), "utf-8");
     assert.ok(final.includes("after identical"), "own task must be written, state intact");
     assert.ok(u.extractPlanTasks(final).length >= 2, "all tasks must still parse");
     assert.ok(sessionIds(final).includes("identRace01"), "own session must remain");
@@ -371,7 +390,11 @@ test("(8) an oversized foreign Sessions section (1000 entries) parses and is cap
       `H8 FAIL: the merge did not keep any foreign session: [${sessionIds(final).join(", ")}]`
     );
     assert.ok(u.extractPlanTasks(final).some((t) => t.text.includes("after big")), "file must stay parseable");
-    assert.ok(warns(h).length >= 1, "the foreign write must still be detected");
+    // The foreign session id is the only durable trace that the guard fired on the oversized write; it must be merged in.
+    assert.ok(
+      sessionIds(final).some((id) => id.startsWith("foreignBig")),
+      `H8 FAIL: no foreign session survived the oversized-write merge: [${sessionIds(final).join(", ")}]`
+    );
   } finally {
     await h.cleanup();
   }
@@ -403,6 +426,11 @@ test("(9) two runtimes with 20 alternating writes keep the file parseable with b
         `Minimal fix: the strict > guard must still detect sub-ms/short-interval foreign writes (it does).`
     );
     assert.ok(sessionBullets(final).length <= 20, "session cap must be respected");
+    // Both runtimes' sessions must be merged into the shared file (durable evidence of the guard).
+    assert.ok(
+      sessionIds(final).some((id) => id.startsWith("raceInter")),
+      `H9 FAIL: neither runtime's session survived the merge: [${sessionIds(final).join(", ")}]`
+    );
   } finally {
     await h2.cleanup();
     await h1.cleanup();
@@ -427,7 +455,8 @@ test("(10) writePlanFile no-ops with zero tasks (no file created, no warning)", 
       "H10 FAIL: writePlanFile created a file with zero tasks. " +
         "Minimal fix: keep the `state.tasks.length === 0` early return in writePlanFile()."
     );
-    assert.equal(warns(h).length, 0, `H10 FAIL: zero-task save warned: ${msgs(h)}`);
+    // No warning is emitted anymore and there is nothing to merge with zero tasks; the
+    // no-op is fully evidenced by the empty plan-files set above (no file, no session).
 
     // Positive control: the same runtime DOES write once a task exists, so the
     // no-op is the zero-task guard, not a dead runtime.

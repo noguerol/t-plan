@@ -16,6 +16,7 @@ export async function createHarness(options = {}) {
 
   const entries = [];
   const notes = [];
+  const inputCalls = [];
   const widgets = new Map();
   const reuseCwd = !!options.cwd;
   const cwd = options.cwd ?? (await mkdtemp(join(tmpdir(), "tplan-test-")));
@@ -42,7 +43,14 @@ export async function createHarness(options = {}) {
       },
       select: async () => undefined,
       confirm: async () => true,
-      input: async () => "",
+      input: async (prompt) => {
+        inputCalls.push(prompt);
+        // `uiInput` may be a string (always returned) or an array (queue: each
+        // call shifts the next value), so a single harness can answer several
+        // successive prompts differently (e.g. two prefix changes).
+        if (Array.isArray(options.uiInput)) return options.uiInput.shift() ?? "";
+        return options.uiInput ?? "";
+      },
     },
     sessionManager: {
       getSessionId: () => sessionId,
@@ -133,5 +141,5 @@ export async function createHarness(options = {}) {
     if (!reuseCwd) await rm(cwd, { recursive: true, force: true });
   }
 
-  return { rt, ctx, pi, entries, notes, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup };
+  return { rt, ctx, pi, entries, notes, inputCalls, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup };
 }

@@ -234,8 +234,8 @@ test("(6) purge resets tracking so a later write does not warn", async () => {
   }
 });
 
-// ── (7) one foreign write ⇒ exactly one warning ────────────────────────────────
-test("(7) the foreign-write warning is emitted exactly once", async () => {
+// ── (7) one foreign write ⇒ merged once, and never warned about ────────────────
+test("(7) a foreign write merges once and emits no user-facing warning", async () => {
   const h = await createHarness({ sessionId: "once000001" });
   try {
     await h.addTasks(["base"]);
@@ -247,7 +247,15 @@ test("(7) the foreign-write warning is emitted exactly once", async () => {
     h.notes.length = 0;
     for (let i = 0; i < 5; i++) await h.addTasks([`poll ${i}`]);
 
-    assert.equal(warns(h).length, 1, `expected exactly one warning, got ${warns(h).length}: ${msgs(h)}`);
+    // The foreign-write guard is now debug-only: no user-facing warning string.
+    assert.ok(
+      !h.notes.some((n) => String(n.msg).includes(WARN)),
+      `foreign writes must not emit the warning string, got ${msgs(h)}`
+    );
+    // Evidence the merge happened: the foreign session id is written into the file.
+    const final = await h.planFile();
+    assert.ok(sessionIds(final).includes("foreignOnce1"),
+      `foreign session not merged into the plan file: [${sessionIds(final).join(", ")}]`);
   } finally {
     await h.cleanup();
   }

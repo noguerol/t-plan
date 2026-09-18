@@ -1,6 +1,6 @@
 {
   "name": "pi-t-plan",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "pi plan tracker: TUI, plan_manager tool, tiers, timers, progress.",
   "keywords": [
     "pi-package",
@@ -41,6 +41,7 @@
     "src"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test tests/*.test.mjs"
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "verify": "node scripts/verify-package.mjs"
   }
 }
