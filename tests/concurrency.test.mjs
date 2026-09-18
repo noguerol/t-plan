@@ -51,8 +51,10 @@ function foreignPlan(title, task, ids) {
   ].join("\n");
 }
 
-// ── (a) foreign write ⇒ sessions merged + user warned ──────────────────────────
-test("(a) a foreign write merges session history and warns", async () => {
+// ── (a) foreign write ⇒ sessions merged (no warning) ───────────────────────────
+// The foreign-write guard still merges the foreign session history into the plan
+// file, but it no longer queues a ui.notify warning (see updateUI in src/runtime.ts).
+test("(a) a foreign write merges session history without warning", async () => {
   const h = await createHarness({ sessionId: "ownSession01" });
   try {
     await h.addTasks(["first task"]);
@@ -68,13 +70,11 @@ test("(a) a foreign write merges session history and warns", async () => {
 
     h.notes.length = 0;
     // The add action refreshes the UI *before* it writes, which is where the
-    // foreign mtime is detected and the warning queued; it therefore surfaces on
-    // the next UI refresh — the next add.
+    // foreign mtime is detected; the merge is automatic and no warning is queued.
     await h.addTasks(["second task"]);
     await h.addTasks(["third task"]);
 
-    assert.ok(warns(h), `expected the foreign-write warning, got ${msgs(h)}`);
-
+    // The foreign session id is merged into the plan file (history not lost).
     const final = await h.planFile();
     const sessions = final.slice(final.indexOf("## 🗂 Sessions"));
     assert.ok(sessions.includes("foreignSess42"), "foreign session id must be preserved");
@@ -96,6 +96,53 @@ test("(b) normal writes never warn (no regression)", async () => {
     await h.addTasks(["one", "two", "three"]);
     await h.tool({ action: "complete", task_id: "1" });
     assert.ok(!warns(h), `unexpected warning: ${msgs(h)}`);
+  } finally {
+    await h.cleanup();
+  }
+});
+
+// ── (b2) config survives the plan-state round-trip ─────────────────────────────
+// Regression guard: every config key must round-trip through the persisted
+// plan-state entry. A stray placeholder value on a non-value item (e.g. a
+// `currentValue: "run"` on an action) used to be merged back as `purge: "run"`.
+test("(b2) config round-trips without stray keys", async () => {
+  const h = await createHarness({ sessionId: "concurrency01" });
+  const theme = { fg: (_c, s) => s, bold: (s) => s };
+  try {
+    await h.addTasks(["one"]);
+    await h.addTasks(["two"]);
+
+    // A brand-new runtime restoring the same plan-state entry must reproduce the
+    // config exactly: only known keys, correct types.
+    const { createPlanRuntime } = await import("../src/runtime.ts");
+    const entries = h.entries ?? [];
+    const rt2 = createPlanRuntime({ appendEntry: () => {} });
+    const ctx2 = {
+      cwd: h.cwd,
+      hasUI: true,
+      mode: "tui",
+      isIdle: () => true,
+      ui: h.ctx.ui,
+      sessionManager: { getSessionId: () => "sess1234abcd", getEntries: () => entries },
+    };
+    await rt2.onSessionStart({}, ctx2);
+    // configItems() is the only public view of config: every item without `values`
+    // or `submenu` is an action, and its placeholder must never be a config value.
+    const items = rt2.configItems(theme);
+    const known = new Set([
+      "enabled", "autoDetect", "showWidget", "widgetPlacement", "planFilePrefix",
+      "trackAgents", "trimegisto", "showTimers", "toolEvidence", "debug",
+      "animateWidget", "compactTaskLines", "highlightCompleted",
+    ]);
+    for (const item of items) {
+      if (!known.has(item.id) && !item.values && !item.submenu) {
+        assert.ok(item.currentValue === "—", `action item '${item.id}' must display a neutral placeholder, got ${JSON.stringify(item.currentValue)}`);
+      }
+    }
+    const enabled = items.find((i) => i.id === "enabled");
+    assert.ok(["on", "off"].includes(enabled?.currentValue), `enabled must be on/off, got ${JSON.stringify(enabled?.currentValue)}`);
+    const debugItem = items.find((i) => i.id === "debug");
+    assert.ok(["on", "off"].includes(debugItem?.currentValue), `debug must be on/off, got ${JSON.stringify(debugItem?.currentValue)}`);
   } finally {
     await h.cleanup();
   }

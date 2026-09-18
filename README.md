@@ -105,7 +105,7 @@ One plan file per project, maintained across sessions — no session id in the n
 - **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten. Renaming the title writes the plan under the new name and leaves the previous file on disk.
 - **One file, every session** — a new pi session in the same directory adopts the tasks already on disk and keeps writing the same file; resuming a session brings its plan back too. Two pi processes in one directory share the same plan instead of producing `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`.
 - **One writer at a time** — the unified file is last-write-wins. Work on a project from a single pi session at a time; a second concurrent session in the same directory can overwrite the first one's latest state on disk (each session still keeps its own plan state in the session log, so resuming it recovers that session's view).
-- **Concurrent sessions keep their session history** — if the unified file was modified by another pi session between our writes, t-plan merges that session's history into the `## 🗂 Sessions` section so no session record is lost, and warns that task state remains last-write-wins.
+- **Concurrent sessions keep their session history** — if the unified file was modified by another pi session between our writes, t-plan merges that session's history into the `## 🗂 Sessions` section so no session record is lost. Task state remains last-write-wins and the merge is silent (it only shows up in the debug log).
 - **Sessions section** — the file includes a `## 🗂 Sessions` section (written before the footer) listing the pi sessions that worked on it (session id, first/last seen timestamps and an optional title), newest first, capped at the 20 most recent. The plan file therefore carries a short runtime history, not source.
 - **Private by design — never commit or publish plan files.** Plan files are runtime state, not source: t-plan keeps the pattern `<prefix>_*.md` (plus `plan.md` when the prefix is `plan`) in your `.gitignore` automatically — best-effort, and only inside a git working tree — and the model is explicitly instructed never to `git add`, commit, force-add or publish them. If you commit or share plan files, you leak session-internal state.
 - **Load a plan.** `/t-plan load` lists every plan file in the directory as `1. <title> · <n> tasks · <date>`, marking the current project file `← current` and old session-scoped files `(legacy)`. Picking one adopts its title, tasks and session history into the current session, and the extension then writes the unified file. Legacy candidates keep their session id as a hint — the extension still tells you how to jump back with `pi --session <id>`.
@@ -274,23 +274,27 @@ Edit the file by hand if you like — `/t-plan load` parses it back, including t
 
 ## Configuration
 
-Open with `/t-plan config`:
+Open with `/t-plan config` — a settings dialog in pi's native style (`SettingsList`): one row per option, its current value on the right, and an explanation rendered under the list when the row is selected. `↑↓` navigate, `Enter`/`Space` change a value, `Esc` closes, and typing filters the list. Toggles cycle `on`/`off`; `Plan file prefix` and the actions open a submenu (actions show `—` until you enter them).
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| Plan tracking | ON | Enable/disable the extension |
-| Auto-detect plans | ON | Detect plans in model output |
-| Show widget | ON | Display the task widget |
-| Widget placement | aboveEditor | Widget position (above/below editor) |
-| Plan file prefix | `plan` | Plan file: `<prefix>_<title-slug>.md` — one per project, never session-scoped. The prefix prompt is labelled `File prefix (<prefix>_<title>.md):` |
-| Track agents | ON | Monitor parallel agent tasks |
-| Trimegisto mode | OFF | Tier classification + agent assignment per task |
-| Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
-| Tool evidence | ON | Touch files/commands complete or advance tasks |
-| Debug log | OFF | Log swallowed errors to `~/.pi/agent/t-plan/debug.log` |
-| Animate widget | ON | Spinner on in-progress tasks + completion flash |
-| Compact task lines | ON | Truncate each task to a single line |
-| Highlight completed | ON | Briefly illuminate completed tasks before hiding them |
+| 📋 Plan tracking | ON | Enable/disable the extension |
+| 🔎 Auto-detect plans | ON | Detect plans in model output |
+| 🎛️ Task widget | ON | Display the task widget |
+| 📐 Widget placement | aboveEditor | Widget position (above/below editor) |
+| 📄 Plan file prefix | `plan` | Plan file: `<prefix>_<title-slug>.md` — one per project, never session-scoped. The prefix prompt is labelled `File prefix (<prefix>_<title>.md):` |
+| 🤝 Track agents | ON | Monitor parallel agent tasks |
+| ⚡ Trimegisto mode | OFF | Tier classification + agent assignment per task |
+| ⏱️ Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
+| 🧪 Tool evidence | ON | Touch files/commands complete or advance tasks |
+| 🐛 Debug log | OFF | Log swallowed errors to `~/.pi/agent/t-plan/debug.log` |
+| ✨ Animate widget | ON | Spinner on in-progress tasks + completion flash |
+| 📝 Compact task lines | ON | Truncate each task to a single line |
+| 💡 Highlight completed | ON | Briefly illuminate completed tasks before hiding them |
+
+Actions: 💾 Save plan file · 📂 Load plan file · 🗑️ Clear tasks · 🧹 Purge plan.
+
+When several sessions (or agents) share one plan file, each write is still merged with the others' session history — silently. The old "plan file was updated by another session" warning was removed because in multi-agent development it fires constantly and carries no actionable information; it only appears in the debug log when `🐛 Debug log` is ON.
 
 Global preferences persist across sessions in `~/.pi/agent/t-plan/config.json` (the newest session value always wins).
 
