@@ -17,6 +17,10 @@ export async function createHarness(options = {}) {
   const entries = [];
   const notes = [];
   const inputCalls = [];
+  const sendUserMessageCalls = [];
+  const abortCalls = [];
+  const editCommands = options.editCommands ?? [];
+  const harnessState = { uiInput: options.uiInput ?? "" };
   const widgets = new Map();
   const reuseCwd = !!options.cwd;
   const cwd = options.cwd ?? (await mkdtemp(join(tmpdir(), "tplan-test-")));
@@ -47,9 +51,20 @@ export async function createHarness(options = {}) {
         inputCalls.push(prompt);
         // `uiInput` may be a string (always returned) or an array (queue: each
         // call shifts the next value), so a single harness can answer several
-        // successive prompts differently (e.g. two prefix changes).
-        if (Array.isArray(options.uiInput)) return options.uiInput.shift() ?? "";
-        return options.uiInput ?? "";
+        // successive prompts differently (e.g. two prefix changes). It may also
+        // be reassigned after creation (e.g. `h.uiInput = "..."`) to answer the
+        // next prompt with a different value.
+        const value = (Array.isArray(harnessState.uiInput) ? harnessState.uiInput.shift() : harnessState.uiInput) ?? "";
+        return value;
+      },
+      width: options.width ?? 80,
+      abort: async () => { abortCalls.push(true); },
+      sendUserMessage: async (msg) => { sendUserMessageCalls.push(msg); },
+      // Edit-mode surface: interactive loop reads `editCommands` and tracks the
+      // currently selected index so /up, /down, /del, /note, /run work.
+      custom: {
+        editCommands,
+        editSelected: 0,
       },
     },
     sessionManager: {
@@ -141,5 +156,5 @@ export async function createHarness(options = {}) {
     if (!reuseCwd) await rm(cwd, { recursive: true, force: true });
   }
 
-  return { rt, ctx, pi, entries, notes, inputCalls, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup };
+  return { rt, ctx, pi, entries, notes, inputCalls, sendUserMessageCalls, abortCalls, editCommands, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup, get uiInput() { return harnessState.uiInput; }, set uiInput(v) { harnessState.uiInput = v; } };
 }

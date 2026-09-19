@@ -13,6 +13,7 @@ const tPlanCompletions = [
   { value: "save", label: "save", description: "Save" },
   { value: "clear", label: "clear", description: "Clear" },
   { value: "purge", label: "purge", description: "Purge" },
+  { value: "edit", label: "edit", description: "Edit (fullscreen)" },
 ];
 
 const taskCompletions = [

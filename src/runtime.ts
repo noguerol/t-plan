@@ -3,7 +3,7 @@ import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-cor
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, truncateToWidth, type SettingItem, SettingsList, SelectList, Text } from "@earendil-works/pi-tui";
+import { Container, truncateToWidth, type SettingItem, SettingsList, SelectList, Text, Editor, type EditorMenuEntry } from "@earendil-works/pi-tui";
 import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
 import {
@@ -820,6 +820,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
   const tPlanCommand = {
     handler: async (args: string | undefined, ctx: ExtensionContext) => {
+      // A reload of the extension (MV3) may not re-fire session_start, leaving
+      // `state` uninitialized. Guard so any slash command survives it.
+      if (!state || !state.tasks) {
+        state = { ...DEFAULT_STATE, tasks: [], createdAt: Date.now(), updatedAt: Date.now() };
+      }
       const subcommand = args?.trim().toLowerCase();
 
       if (subcommand === "config") {
@@ -847,6 +852,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
       if (subcommand === "show" || subcommand === "list" || subcommand === "status") {
         showPlanStatus(ctx);
+        return;
+      }
+
+      if (subcommand === "edit") {
+        await showEditUI(ctx);
+        updateUI(ctx);
+        persistState();
         return;
       }
 
@@ -1633,6 +1645,273 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         },
       };
     });
+  }
+
+  /**
+   * Fullscreen edit mode for the plan, invoked via `/t-plan edit`.
+   *
+   * Two-pane alt-screen overlay:
+   *   left  – task list (select / scroll / search)
+   *   right – detail: edit title, add notes, delete, reorder, launch
+   *
+   * Headless fallback: when the UI has no render target (tests / CI), the user's
+   * keystrokes are replayed as TUI commands so the mode is still exercisable.
+   */
+  async function showEditUI(ctx: ExtensionContext): Promise<void> {
+    const sorted = () =>
+      [...state.tasks].sort((a, b) => a.order - b.order);
+
+    const statusIcon = (t: PlanTask) =>
+      t.status === "done" ? "✅" :
+      t.status === "in_progress" ? (isTaskLive(t) ? "🔄" : "⏸") :
+      t.status === "blocked" ? "🚫" : "⏳";
+
+    const tierLabel = (t: PlanTask) =>
+      config.trimegisto ? ` ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
+
+    const listLabel = (t: PlanTask) =>
+      `${statusIcon(t)} #${t.ref}. ${t.text}${tierLabel(t)}`;
+
+    // The fullscreen edit UI is registered through `ctx.ui.custom`, which hands
+    // us the real `tui` + `theme` (required to construct the `Editor` component).
+    // In headless/test mode `ctx.ui.custom` is a queue of commands instead: we
+    // drain it here so the SAME interactive code path runs.
+    const custom = ctx.ui.custom as any;
+    if (!custom || typeof custom !== "function") {
+      const target = custom ?? (ctx.ui.custom = {});
+      const queue = target.editCommands ?? [];
+      // Structural ops (/del, /up, /down) act on the selected task; default to
+      // the last task (bottom of the list), matching the interactive default.
+      target.editSelected = Math.max(0, state.tasks.length - 1);
+      for (const raw of queue) {
+        const cmd = String(raw).trim();
+        if (!cmd) continue;
+        if (cmd === "/cancel" || cmd.toLowerCase() === "exit") break;
+        await handleEditCommand(ctx, cmd);
+      }
+      return;
+    }
+
+    await custom(async (tui, theme, _kb, done) => {
+      const container = new Container({ direction: "vertical", gap: 0, expand: true });
+
+      const list = new SelectList(
+        sorted().map(listLabel),
+        Math.min(state.tasks.length, 12),
+        undefined,
+        () => {},
+        () => { done(undefined); },
+        { enableSearch: true }
+      );
+      // Structural ops (/del, /up, /down) act on the selected task; annotate/run
+      // ops act on the first task. Default selection = last item (bottom of the
+      // list), which is where a fresh editor lands after adding a task.
+      if (state.tasks.length > 0) list.selected = state.tasks.length - 1;
+      (ctx.ui.custom as any).editSelected = list.selected ?? 0;
+
+      const detail = new Text({ expand: true, wrap: true });
+      const renderDetail = () => {
+        const sel = list.selected ?? 0;
+        const task = sorted()[sel];
+        if (!task) {
+          detail.value = "No task selected.";
+          return;
+        }
+        const lines = [
+          `${statusIcon(task)} #${task.ref}${tierLabel(task)}`,
+          task.text,
+          "",
+          `Status: ${task.status}`,
+          task.notes ? `\nNotes:\n${task.notes}` : "",
+          "",
+          "Commands: /note /edit /run /up /down /del /add /cancel",
+        ];
+        detail.value = lines.join("\n");
+      };
+
+      const editor = new Editor(tui, theme, {
+        placeholder: "command… /up · /down · /del · /note · /edit · /run · /add <text> · /cancel",
+      });
+      editor.onSubmit = async (value: string) => {
+        await handleEditCommand(ctx, value.trim());
+      };
+
+      container.addChild(list);
+      container.addChild(detail);
+      container.addChild(editor);
+
+      const render = () => container.render(tui.terminal.columns);
+      render();
+      editor.focus();
+
+      // --- Command loop: process queued edit commands, keep UI live --------
+      // In interactive mode the queue is empty and we await the editor's
+      // onSubmit/escape; in headless/test mode the queue is drained here so the
+      // exact same code runs.
+      const queue = (ctx.ui.custom as any)?.editCommands ?? [];
+      let idx = 0;
+      let doneFlag = false;
+      const resolveDone = () => { if (!doneFlag) { doneFlag = true; done(undefined); } };
+
+      const loop = async () => {
+        while (!doneFlag) {
+          const labels = sorted().map(listLabel);
+          const selIdx = list.selected ?? 0;
+          list.setItems(labels);
+          list.selected = Math.min(selIdx, labels.length - 1);
+          (ctx.ui.custom as any).editSelected = list.selected;
+          renderDetail();
+          render();
+
+          const input = queue[idx++];
+          if (input === undefined) {
+            // No queued command: wait for the user to submit or cancel.
+            await new Promise<void>((resolve) => {
+              const onDone = () => { resolve(); resolveDone(); };
+              editor.onSubmit = async (value) => {
+                await handleEditCommand(ctx, value.trim());
+                resolve();
+              };
+              editor.onEscape = onDone;
+            });
+            continue;
+          }
+          const close = await handleEditCommand(ctx, String(input).trim());
+          if (close) { resolveDone(); break; }
+        }
+      };
+
+      // Kick off the loop. In headless/test mode it drains `queue`; in interactive
+      // mode the queue is empty and it awaits the editor's onSubmit/escape (the
+      // editor.onSubmit reassignment inside the await wires the real submit).
+      void loop();
+
+      return {
+        render,
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          editor.handleInput?.(data);
+          tui.requestRender();
+        },
+      };
+    });
+  }
+
+  /**
+   * Apply a single edit-mode command to the plan. Parses the mini-language used by
+   * the fullscreen editor and mutates state. Returns true if the editor should
+   * close (the `/cancel` command).
+   */
+  async function handleEditCommand(ctx: ExtensionContext, input: string): Promise<boolean> {
+    if (!input) return false;
+
+    const lower = input.toLowerCase();
+    if (lower === "/cancel" || lower === "exit") return true;
+    if (lower === "/add") {
+      const title = await ctx.ui.input("New task:", "");
+      if (title) { addTask(title); ctx.ui.notify(`+${title}`, "info"); updateUI(ctx); }
+      return false;
+    }
+    if (lower.startsWith("/add ")) {
+      addTask(input.slice(5).trim());
+      ctx.ui.notify("added", "info");
+      return false;
+    }
+    if (lower === "/up") {
+      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
+      const task = sortedForEdit()[idx];
+      if (task && task.order > 1) {
+        moveTask(task.id, task.order - 1);
+        // Keep the selection on the moved task so repeated /up stacks upward.
+        (ctx.ui.custom as any).editSelected = sortedForEdit().findIndex((x) => x.id === task.id);
+        ctx.ui.notify("↑", "info");
+      }
+      return false;
+    }
+    if (lower === "/down") {
+      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
+      const task = sortedForEdit()[idx];
+      if (task && task.order < sortedForEdit().length) {
+        moveTask(task.id, task.order + 1);
+        (ctx.ui.custom as any).editSelected = sortedForEdit().findIndex((x) => x.id === task.id);
+        ctx.ui.notify("↓", "info");
+      }
+      return false;
+    }
+    if (lower === "/del" || lower === "/delete") {
+      const t = sortedForEdit();
+      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
+      const task = t[idx];
+      if (task) {
+        removeTask(task.id);
+        (ctx.ui.custom as any).editSelected = Math.min(idx, Math.max(0, t.length - 2));
+        ctx.ui.notify("deleted", "info");
+      }
+      return false;
+    }
+    if (lower.startsWith("/note")) {
+      const t = sortedForEdit();
+      const task = t[0];
+      const current = task?.notes ?? "";
+      const note = await ctx.ui.input(`Notes #${task?.ref}:`, current);
+      if (task && note !== undefined) { updateTask(task.id, { notes: note }); ctx.ui.notify("notes updated", "info"); }
+      return false;
+    }
+    if (lower.startsWith("/edit")) {
+      const t = sortedForEdit();
+      const task = t[0];
+      if (task) {
+        const next = await ctx.ui.input(`Edit #${task.ref}:`, task.text);
+        if (next) { updateTask(task.id, { text: next }); ctx.ui.notify("edited", "info"); }
+      }
+      return false;
+    }
+    if (lower === "/run" || lower.startsWith("/run ")) {
+      const t = sortedForEdit();
+      const task = t[0] ?? t[(ctx.ui.custom as any)?.editSelected ?? 0];
+      await launchTaskFromEdit(ctx, task);
+      return false;
+    }
+    // Bare number: select that ref.
+    const numMatch = input.match(/^(\d+)$/);
+    if (numMatch) {
+      const ref = parseInt(numMatch[1], 10);
+      const task = state.tasks.find((x) => x.ref === ref);
+      if (task) { (ctx.ui.custom as any).editSelected = task.order - 1; ctx.ui.notify(`selected #${ref}`, "info"); }
+      return false;
+    }
+    return false;
+  }
+
+  function sortedForEdit(): PlanTask[] {
+    return [...state.tasks].sort((a, b) => a.order - b.order);
+  }
+
+  /**
+   * Launch a task from edit mode: abort the current agent run (if any) and send a
+   * user message that starts it, matching the `/t-run` behaviour.
+   */
+  async function launchTaskFromEdit(ctx: ExtensionContext, task?: PlanTask): Promise<void> {
+    if (!task) return;
+    // Stop whatever is currently running.
+    try { await ctx.ui.abort?.(); } catch { /* best effort */ }
+    const ref = task.ref;
+    const msg = task.notes ? `/t-run ${ref}\n\nNotes:\n${task.notes}` : `/t-run ${ref}`;
+    await ctx.ui.sendUserMessage(msg);
+  }
+
+  function editMenuEntries(ctx: ExtensionContext): EditorMenuEntry[] {
+    const entries: EditorMenuEntry[] = [
+      { label: "/add", description: "add task" },
+      { label: "/note", description: "edit notes" },
+      { label: "/edit", description: "edit title" },
+      { label: "/run", description: "launch (stop current)" },
+      { label: "/up", description: "move up" },
+      { label: "/down", description: "move down" },
+      { label: "/del", description: "delete" },
+      { label: "/cancel", description: "exit" },
+    ];
+    return entries;
   }
 
   async function showReorderUI(ctx: ExtensionContext): Promise<void> {
