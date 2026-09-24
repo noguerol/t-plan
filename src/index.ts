@@ -29,8 +29,24 @@ const taskCompletions = [
 
 type Runtime = ReturnType<(typeof import("./runtime.ts"))["createPlanRuntime"]>;
 let runtimePromise: Promise<Runtime> | undefined;
+let boundPi: ExtensionAPI | undefined;
 function runtime(pi: ExtensionAPI): Promise<Runtime> {
-  return (runtimePromise ??= import("./runtime.ts").then((m) => m.createPlanRuntime(pi)));
+  // Tras newSession/fork/switchSession/reload, pi re-ejecuta la factory con un
+  // `pi` nuevo e invalida el viejo. El runtime está cacheado (module-level), así
+  // que hay que re-vincularlo al `pi` vivo o persistState() lanzaría "ctx stale"
+  // en cada llamada a plan_manager.
+  if (runtimePromise) {
+    if (boundPi !== pi) {
+      boundPi = pi;
+      return runtimePromise.then((r) => {
+        r.setPi(pi);
+        return r;
+      });
+    }
+    return runtimePromise;
+  }
+  boundPi = pi;
+  return (runtimePromise = import("./runtime.ts").then((m) => m.createPlanRuntime(pi)));
 }
 
 const completions = <T extends { value: string }>(items: T[], prefix: string) => {

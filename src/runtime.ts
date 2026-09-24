@@ -66,6 +66,10 @@ function getTextContent(message: AssistantMessage): string {
 }
 
 export function createPlanRuntime(pi: ExtensionAPI) {
+  // `pi` (la ExtensionAPI) queda STALE tras newSession/fork/switchSession/reload:
+  // pi re-ejecuta la factory con un `pi` nuevo e invalida el viejo (appendEntry lanza).
+  // `api` es el binding vivo: setPi() lo re-vincula al `pi` actual en cada carga.
+  let api: ExtensionAPI = pi;
   let config: PlanConfig = { ...DEFAULT_CONFIG };
   let state: PlanState = { ...DEFAULT_STATE, tasks: [] };
   let planFilePath: string = "";
@@ -177,10 +181,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
   function persistState(): void {
     touchSession(sessionId, Date.now());
-    pi.appendEntry("plan-state", {
-      config,
-      state,
-    });
+    // appendEntry lanza si el runtime sigue apuntando a un `pi` stale (session
+    // replacement/reload sin rebind). No debe tumbar la llamada a plan_manager:
+    // el plan file (writePlanFile) ya persiste el estado; aquí solo se degrada.
+    try {
+      api.appendEntry("plan-state", {
+        config,
+        state,
+      });
+    } catch (err) {
+      logError("persistState", err);
+    }
     saveGlobalConfig();
   }
 
@@ -2659,6 +2670,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     onSessionShutdown,
     planManagerTool,
     configItems,
+    // Re-vincula la ExtensionAPI tras session replacement/reload (ver `api`).
+    setPi: (next: ExtensionAPI) => {
+      api = next;
+    },
     // Read-only introspection for tests and diagnostics.
     getConfig: () => config,
     getState: () => state,
