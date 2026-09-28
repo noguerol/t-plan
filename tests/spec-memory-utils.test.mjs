@@ -17,7 +17,9 @@ const {
   looksLikeComplexSpec,
   extractRequirements,
   isSpecDocument,
+  isDeniedSpecPath,
   isNormativeBullet,
+  isNonNormativeLine,
   requirementTitle,
   requirementSignature,
   makeSpecSource,
@@ -65,6 +67,15 @@ test("isSpecDocument accepts declared specs and refuses project docs (F-2)", () 
   assert.equal(isSpecDocument("CONTRIBUTING.md", "- MUST run tests"), false);
   assert.equal(isSpecDocument("docs/adr/0001-db.md", "# ADR\n## Requirements\n- MUST use pg"), false);
   assert.equal(isSpecDocument("docs/testing/audit/findings.md", "- MUST check"), false);
+});
+
+test("isDeniedSpecPath marks protected project state (used by explicit source too)", () => {
+  for (const p of ["pi.md", "plan_app.md", "docs/plan_x.md", "node_modules/a/spec.md", ".pi/state.md", "docs/adr/0001.md", "docs/testing/x.md", "CHANGELOG.md", "README.md"]) {
+    assert.equal(isDeniedSpecPath(p), true, `${p} must be denied`);
+  }
+  for (const p of ["specs/app.md", "docs/requirements.md", "app-spec.md", "notes.md"]) {
+    assert.equal(isDeniedSpecPath(p), false, `${p} must not be denied`);
+  }
 });
 
 test("project-memory notes yield zero requirements (F-3 bad-source rejection)", () => {
@@ -145,6 +156,38 @@ test("requirementSignature is case/diacritic-insensitive", () => {
   assert.equal(requirementSignature("Autenticación de Usuarios"), requirementSignature("autenticacion de usuarios"));
   assert.equal(requirementSignature("Auth users!"), requirementSignature("auth   users"));
   assert.notEqual(requirementSignature("alpha"), requirementSignature("beta"));
+});
+
+test("requirementSignature keeps short distinguishing tokens (regression)", () => {
+  assert.notEqual(requirementSignature("Support HTTP/2."), requirementSignature("Support HTTP/3."));
+  assert.notEqual(requirementSignature("Implement step 1."), requirementSignature("Implement step 2."));
+  assert.notEqual(requirementSignature("Support iOS 9."), requirementSignature("Support iOS 8."));
+  assert.notEqual(requirementSignature("Add field A."), requirementSignature("Add field B."));
+  const reqs = extractRequirements("## Requirements\n- Support HTTP/2.\n- Support HTTP/3.\n", "S1");
+  assert.deepEqual(reqs.map((r) => r.text), ["Support HTTP/2.", "Support HTTP/3."]);
+});
+
+test("the new predicates tolerate hostile input", () => {
+  for (const v of [null, undefined, 123, {}, []]) {
+    assert.equal(isNormativeBullet(v), false);
+    assert.equal(isNonNormativeLine(v), true);
+    assert.equal(requirementTitle(v), "");
+  }
+});
+
+test("paths and identifiers are never requirements, even under a normative heading", () => {
+  const body = `## Requirements
+- packages/web/src/App.tsx
+- packages\\web\\App.tsx
+- deadbeef-1234-5678-9abc-def012345678
+- 01a0c64a-46c
+- id: 01a0c64a-46c
+- 281 tests, 14/14 build+typecheck
+- Why: we changed the parser
+- Implement the login form.
+`;
+  const reqs = extractRequirements(body, "S1");
+  assert.deepEqual(reqs.map((r) => r.text), ["Implement the login form."]);
 });
 
 test("nextSpecId / nextRequirementId skip non-matching ids", () => {

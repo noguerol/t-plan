@@ -44,6 +44,10 @@ async function seed(h) {
   return h.rt.onBeforeAgentStart({ prompt: SPEC, systemPrompt: "" }, h.ctx);
 }
 
+async function seedOne(h, prompt) {
+  return h.rt.onBeforeAgentStart({ prompt, systemPrompt: "" }, h.ctx);
+}
+
 test("structured prompt is detected, decomposed and seeded into lanes", async () => {
   const h = await createHarness({ sessionId: "specmem001" });
   try {
@@ -337,6 +341,21 @@ test("a referenced documentation file is not ingested by default (F-1/F-2)", asy
   }
 });
 
+test("source refuses protected paths even though it is explicit (F-2)", async () => {
+  const h = await createHarness({ sessionId: "specmem023" });
+  try {
+    await writeFile(join(h.cwd, "pi.md"), "# memory\n- The system MUST authenticate users.\n", "utf-8");
+    await writeFile(join(h.cwd, "plan_app.md"), "# plan\n- Must do the thing.\n", "utf-8");
+    for (const ref of ["pi.md", "plan_app.md"]) {
+      const res = await h.tool({ action: "source", task_text: ref });
+      assert.match(res.content[0].text, /Refusing to ingest protected path/, `${ref} must be refused`);
+    }
+    assert.equal(h.rt.getState().specs?.length ?? 0, 0, "no protected file may become a source");
+  } finally {
+    await h.cleanup();
+  }
+});
+
 test("plan_manager forget retracts a source, its requirements and tasks (F-5)", async () => {
   const h = await createHarness({ sessionId: "specmem018" });
   try {
@@ -355,6 +374,70 @@ test("plan_manager forget retracts a source, its requirements and tasks (F-5)", 
     // Re-ingesting the same prompt must not resurrect the forgotten source.
     await seed(h);
     assert.equal(h.rt.getState().specs.length, 0, "a forgotten source stays forgotten");
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("forget is durable across a reload (regression: stale plan file)", async () => {
+  const h = await createHarness({ sessionId: "specmem020" });
+  const cwd = h.cwd;
+  try {
+    await seed(h);
+    const sourceId = h.rt.getState().specs[0].id;
+    await h.tool({ action: "forget", task_text: sourceId });
+    assert.equal(h.rt.getState().specs.length, 0);
+
+    await h.stop();
+    // A new session over the same project must NOT re-adopt what was retracted.
+    const h2 = await createHarness({ sessionId: "specmem021", cwd });
+    try {
+      assert.equal(h2.rt.getState().specs?.length ?? 0, 0, "forget must survive a reload");
+      assert.equal(h2.rt.getState().requirements?.length ?? 0, 0, "retracted requirements must not resurrect");
+      assert.equal(h2.rt.getState().tasks.length, 0);
+    } finally {
+      await h2.cleanup();
+    }
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("the source budget prunes the oldest source without hanging", async () => {
+  const h = await createHarness({ sessionId: "specmem022" });
+  try {
+    // Regression: retractSource replaces state.specs, so the prune loop must
+    // re-read it or it spins forever on the already-retracted source.
+    for (let i = 1; i <= 9; i++) {
+      await seedOne(
+        h,
+        `# Spec ${i}\n\n## Requirements\n- The system MUST perform unique behaviour number ${i}.\n- Must handle case ${i} correctly.\n`
+      );
+    }
+    const state = h.rt.getState();
+    assert.equal(state.specs.length, 8, "at most MAX_SPEC_SOURCES documents stay active");
+    assert.ok(!state.specs.some((s) => s.id === "S1"), "the oldest source must be pruned");
+    assert.ok(!state.requirements.some((r) => r.sourceId === "S1"), "its requirements must be pruned too");
+    assert.equal(state.requirements.length, 16, "8 sources x 2 requirements");
+    for (const r of state.requirements) {
+      assert.ok(state.specs.some((s) => s.id === r.sourceId), `${r.id} must trace to a live source`);
+    }
+  } finally {
+    await h.cleanup();
+  }
+});
+
+test("source explains the project requirement cap instead of a generic message", async () => {
+  const h = await createHarness({ sessionId: "specmem024" });
+  try {
+    for (let i = 1; i <= 3; i++) {
+      const lines = Array.from({ length: 80 }, (_, j) => `- The system MUST operation ${i}-${j} now.`).join("\n");
+      await seedOne(h, `# Big ${i}\n\n## Requirements\n${lines}\n`);
+    }
+    assert.equal(h.rt.getState().requirements.length, 200, "the ledger is capped at MAX_PROJECT_REQUIREMENTS");
+    await writeFile(join(h.cwd, "brand-new-spec.md"), "# New\n\n## Requirements\n- Must add a fresh capability.\n", "utf-8");
+    const res = await h.tool({ action: "source", task_text: "brand-new-spec.md" });
+    assert.match(res.content[0].text, /cap reached/, `expected a cap message, got: ${res.content[0].text}`);
   } finally {
     await h.cleanup();
   }

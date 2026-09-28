@@ -12,6 +12,7 @@ import {
   extractRequirements,
   formatCoverageContext,
   hashText,
+  isDeniedSpecPath,
   isSpecDocument,
   looksLikeComplexSpec,
   makeSpecSource,
@@ -291,8 +292,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
   }
 
-  async function writePlanFile(cwd: string): Promise<void> {
-    if (!config.enabled || state.tasks.length === 0) return;
+  async function writePlanFile(cwd: string, force = false): Promise<void> {
+    // Persist whenever there is anything to remember. A spec-only state (ledger
+    // without tasks) must also reach disk. `force` covers the empty state left
+    // by `forget`: skipping the write would let a reload re-adopt the retracted
+    // sources from the stale file.
+    const hasSpecs = (state.specs?.length ?? 0) > 0 || (state.requirements?.length ?? 0) > 0;
+    if (!config.enabled || (!force && state.tasks.length === 0 && !hasSpecs)) return;
 
     const fileName = planFileNameFor(config.planFilePrefix, state.title);
     const filePath = join(cwd, fileName);
@@ -2183,12 +2189,16 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   /** Newest-K budget: retract the oldest sources until one slot is free. */
   function pruneOldestSources(keep: number): number {
     let dropped = 0;
-    const specs = state.specs ?? [];
-    while (specs.length > keep) {
+    // `retractSource` replaces `state.specs` with a new array, so re-read it on
+    // every iteration: a captured local reference would never shrink and the
+    // loop would spin forever on the same already-retracted source.
+    while ((state.specs?.length ?? 0) > keep) {
+      const specs = state.specs ?? [];
       const oldest = [...specs].sort((a, b) => a.addedAt - b.addedAt)[0];
       if (!oldest) break;
       retractSource(oldest);
       dropped++;
+      if (dropped > MAX_SPEC_SOURCES + 1) break; // defensive: never spin
     }
     return dropped;
   }
@@ -3175,11 +3185,23 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           if (rel.startsWith("/") || rel.includes("..")) {
             return { content: [{ type: "text", text: `Refusing path outside the project: ${rel}` }], details: {} };
           }
+          // Explicit source is a user opt-in, but protected project state (project
+          // memory, plan files, ADRs, node_modules…) is never a spec (F-2).
+          if (isDeniedSpecPath(rel)) {
+            return {
+              content: [{ type: "text", text: `Refusing to ingest protected path: ${rel} (project memory/plan files are never specs)` }],
+              details: { denied: rel },
+            };
+          }
           try {
             const content = await readFile(join(ctx.cwd, rel), "utf-8");
             const seeded = ingestSpec(content, "file", rel);
             if (seeded === 0) {
-              return { content: [{ type: "text", text: `No new requirements in ${rel} (empty, too small, or already ingested).` }], details: {} };
+              const atCap = (state.requirements?.length ?? 0) >= MAX_PROJECT_REQUIREMENTS;
+              const why = atCap
+                ? `project requirement cap reached (${MAX_PROJECT_REQUIREMENTS}); retract an old source with plan_manager forget first`
+                : "empty, too small, already ingested, or not a specification";
+              return { content: [{ type: "text", text: `No new requirements in ${rel} (${why}).` }], details: { seeded, atCap } };
             }
             promoteBacklog();
             persistState();
@@ -3215,7 +3237,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           }
           promoteBacklog();
           persistState();
-          await writePlanFile(ctx.cwd);
+          // force: forgetting the last source/task must overwrite the file (or a
+          // reload would resurrect what the user just retracted).
+          await writePlanFile(ctx.cwd, true);
           updateUI(ctx);
           return {
             content: [{ type: "text", text: `Forgot ${selector}: -${removed} requirements (and their tasks)` }],

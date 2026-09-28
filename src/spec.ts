@@ -43,11 +43,11 @@ const NORMATIVE_ANCHOR_WORDS = [
 /** Metadata labels that never describe an obligation (`key: value` notes). */
 const META_KEY_RE =
   /^\**\s*(?:id|uuid|guid|hash|sha\d*|ref|source|sourceid|status|estado|date|fecha|time|hora|version|ver|path|ruta|file|fichero|filename|why|por\s*qu[eé]|purpose|prop[oó]sito|method|m[eé]todo|approach|enfoque|summary|resumen|context|contexto|notes?|notas?|next|siguiente|blockers?|bloqueos?|goal|objetivo|what|how|fix(?:es|ed)?|solution|soluci[oó]n|change|cambio|result|resultado|impact|impacto|problem|problema|issue|risk|riesgo)\s*[:：]/i;
-/** A bullet that is nothing but a file path. */
+/** A bullet that is nothing but a file path (POSIX or Windows separators). */
 const BARE_PATH_RE =
-  /^~?[\w./@\-]+\.(?:md|markdown|txt|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|ini|cfg|lock|env|css|scss|less|html|py|rb|go|rs|java|kt|swift|php|sql|sh|bash|zsh|svg|png|jpe?g|gif)$/i;
-/** A bullet that is nothing but an identifier token (UUID/hash-like). */
-const BARE_ID_RE = /^[0-9a-f]{8}-[0-9a-f-]{4,}$/i;
+  /^~?[\w./@\\-]+\.(?:md|markdown|txt|ts|tsx|js|jsx|mjs|cjs|json|ya?ml|toml|ini|cfg|lock|env|css|scss|less|html|py|rb|go|rs|java|kt|swift|php|sql|sh|bash|zsh|svg|png|jpe?g|gif)$/i;
+/** A bullet that is nothing but an identifier token (UUID / truncated UUID / hash). */
+const BARE_ID_RE = /^[0-9a-f]{4,}(?:-[0-9a-f]{2,}){1,4}$/i;
 /** Bullets that START with an obligation verb are requirements, not notes. */
 const STARTS_OBLIGATION_RE =
   /^(?:implement|create|add|build|write|refactor|migrate|integrate|validate|support|expose|emit|persist|return|refund|lock|alert|authenticate|ensure|provide|allow|enable|handle|display|store|notify|use|include|define|configure|document|test|check|remove|update|fix|deploy|implementa|crea|a[ñn]ade|agrega|valida|permite|soporta|expone|emite|persiste|devuelve|notifica|asegura|proporciona|incluye|define|configura|documenta|prueba|verifica|elimina|actualiza|corrige|despliega)\b/i;
@@ -116,6 +116,24 @@ export function isNormativeBullet(text: string, anchor?: string): boolean {
 }
 
 /**
+ * Paths that are never a specification, however structured the content is:
+ * project memory, plan files, package/licence boilerplate, ADRs, testing notes
+ * and anything inside node_modules/.pi. Shared by `isSpecDocument` (referenced
+ * files) and the explicit `plan_manager source` action, which is a user opt-in
+ * but must still not ingest protected project state.
+ */
+export function isDeniedSpecPath(ref: string): boolean {
+  const path = String(ref ?? "").toLowerCase().replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!path) return false;
+  const base = path.split("/").pop() ?? "";
+  if (base === "pi.md" || (base.startsWith("plan_") && base.endsWith(".md"))) return true;
+  if (/^(?:readme|license|licence|changelog|changes|contributing|code_of_conduct|security|authors|notice)\b/.test(base)) return true;
+  if (path.includes("node_modules/") || path === ".pi" || path.startsWith(".pi/")) return true;
+  if (/(?:^|\/)(?:adr|testing)\//.test(path)) return true;
+  return false;
+}
+
+/**
  * A real specification file: declared by its path (spec/requirements/prd…),
  * by requirement identifiers, or by an explicit requirements heading. Project
  * memory, changelogs, ADRs and testing notes are refused even when structured.
@@ -126,10 +144,7 @@ export function isSpecDocument(ref: string, text: string): boolean {
   const base = path.split("/").pop() ?? "";
 
   // Path denylist: these are never specifications, however structured they are.
-  if (base === "pi.md" || base.startsWith("plan_") && base.endsWith(".md")) return false;
-  if (/^(?:readme|license|licence|changelog|changes|contributing|code_of_conduct|security|authors|notice)\b/.test(base)) return false;
-  if (path.includes("node_modules/") || path === ".pi" || path.startsWith(".pi/")) return false;
-  if (/(?:^|\/)(?:adr|testing)\//.test(path)) return false;
+  if (isDeniedSpecPath(path)) return false;
 
   // Path allowlist: the filename declares itself a spec.
   if (/(?:^|[-_.])(?:spec|specs|specification|especificacion|requirements|requisitos|prd|rfc)(?:[-_.]|$)/.test(base)) return true;
@@ -178,7 +193,7 @@ export function looksLikeComplexSpec(text: string): boolean {
 }
 
 const MODAL_VERB =
-  /\b(?:must|shall|should|will|needs?\s+to|has\s+to|have\s+to|debe(?:r[áa])?|deben|tiene\s+que|tienen\s+que|hay\s+que|soporta(?:r|rá)?|implement(?:a|ar|e|ed|ing)?|crea(?:r|rá)?|a[ñn]ad(?:e|ir|irá)?|agrega(?:r|rá)?|valida(?:r|rá)?|permit(?:e|ir|irá)|muestra|gestiona(?:r|rá)?|soporte|integrat?e?|support(?:s|ed|ing)?|allows?|enable?s?|creates?|adds?|provides?|handles?|validat(?:e|es|ing)|display?s?|store?s?|persist?s?|expose?s?|emit(?:s|ted|ting)?|notif(?:y|ies|ied)|return?s?|refund?s?|lock?s?|alert?s?|authenticat(?:e|es|ing))\b/i;
+  /\b(?:must|shall|should|will|needs?\s+to|has\s+to|have\s+to|debe(?:r[áa])?|deben|tiene\s+que|tienen\s+que|hay\s+que|soporta(?:r|rá)?|implement(?:a|ar|e|ed)?|crea(?:r|rá)?|a[ñn]ad(?:e|ir|irá)?|agrega(?:r|rá)?|valida(?:r|rá)?|permit(?:e|ir|irá)|muestra|gestiona(?:r|rá)?|soporte|integrat?e?|supports?|supported|allows?|enable?s?|creates?|adds?|provides?|handles?|validat(?:e|es|ed)|display?s?|store?s?|persist?s?|expose?s?|emit(?:s|ted)?|notif(?:y|ies|ied)|return?s?|refund?s?|lock?s?|alert?s?|authenticat(?:e|es|ed))\b/i;
 
 const ACTION_VERB =
   /\b(?:implement|create|add|build|write|refactor|migrate|integrate|validate|support|expose|emit|persist|return|refund|lock|alert|authenticate|endpoint|api|component|module|screen|page|database|auth|test|deploy|configur\w*)\b/i;
@@ -187,6 +202,9 @@ const OBLIGATION_VERB =
   /\b(?:must|shall|debe(?:r[áa])?|deben|tiene\s+que|tienen\s+que|hay\s+que|needs?\s+to|has\s+to|have\s+to)\b/i;
 
 function stripMarkdown(text: string): string {
+  // Tolerance is the contract: these helpers are called with hostile input by
+  // tests/diagnostics, and a non-string must yield "" rather than throw.
+  if (typeof text !== "string") return "";
   return text
     .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
@@ -214,7 +232,9 @@ export function requirementSignature(text: string): string {
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9\u3400-\u9fff]+/g, " ")
     .split(" ")
-    .filter((w) => w.length > 1 && !STOPWORDS.has(w))
+    // Keep single-character tokens (digits, letters): dropping them merged
+    // distinct requirements such as "Support HTTP/2." and "Support HTTP/3.".
+    .filter((w) => w.length > 0 && !STOPWORDS.has(w))
     .join(" ");
 }
 
