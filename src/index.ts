@@ -25,6 +25,8 @@ const taskCompletions = [
   { value: "start", label: "start", description: "Start" },
   { value: "block", label: "block", description: "Block" },
   { value: "tier", label: "tier", description: "Tier" },
+  { value: "verify", label: "verify", description: "Verify" },
+  { value: "coverage", label: "coverage", description: "Coverage" },
 ];
 
 type Runtime = ReturnType<(typeof import("./runtime.ts"))["createPlanRuntime"]>;
@@ -73,6 +75,9 @@ export default function planExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("session_start", async (event, ctx) => (await runtime(pi)).onSessionStart(event, ctx));
+  // `input` fires before `before_agent_start` and carries `source`:
+  // marks extension-injected prompts so spec memory skips them.
+  pi.on("input", async (event, ctx) => (await runtime(pi)).onInput(event, ctx));
   pi.on("before_agent_start", async (event, ctx) => (await runtime(pi)).onBeforeAgentStart(event, ctx));
   pi.on("tool_result", async (event, ctx) => (await runtime(pi)).onToolResult(event, ctx));
   pi.on("turn_end", async (event, ctx) => (await runtime(pi)).onTurnEnd(event, ctx));
@@ -83,19 +88,20 @@ export default function planExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "plan_manager",
     label: "Plan",
-    description: "Plan tasks; tiers t1/t2/t3, fallback t0.",
-    promptSnippet: "Plan tasks: add/remove/update/start/block/complete/list.",
+    description: "Plan tasks; tiers, lanes, coverage, verify.",
+    promptSnippet: "Plan: add/plan/complete/verify/update/start/block/remove/list/coverage/source/forget.",
     promptGuidelines: [
       "Multi-step work.",
       "Complete finished tasks; add new.",
       "Before ending turn, complete every finished task (task_id: \"3\", \"2,3\", \"2-4\" or text).",
       "Use stable #ref; display order varies.",
       "Discard/split/rename/reprioritize: update/remove.",
+      "Spec tasks need plan_manager verify (build/test evidence) before complete.",
       "Plan files: PRIVATE; never commit/publish/force-add; keep gitignored.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["add", "complete", "update", "list", "start", "block", "remove"] as const),
-      task_text: Type.Optional(Type.String({ description: "Text (add/update)" })),
+      action: StringEnum(["add", "plan", "complete", "verify", "update", "list", "coverage", "source", "forget", "start", "block", "remove"] as const),
+      task_text: Type.Optional(Type.String({ description: "Text (add/update); source/forget: relative path or source id" })),
       task_id: Type.Optional(
         Type.String({ description: "Ref/order/text; lists \"2,3\", ranges \"2-4\"" })
       ),
@@ -106,6 +112,13 @@ export default function planExtension(pi: ExtensionAPI): void {
           description: "Tier; t0/active fallback if omitted.",
         })
       ),
+      lane: Type.Optional(
+        StringEnum(["active", "backlog", "paused"] as const, {
+          description: "Execution lane (add/plan/update). Default active.",
+        })
+      ),
+      reqs: Type.Optional(Type.String({ description: "Requirement ids, e.g. \"R2,R5\" (add/plan/update)." })),
+      check: Type.Optional(Type.String({ description: "Acceptance steps, '|'-separated (add/plan/update)." })),
     }),
     execute: async (toolCallId, params, signal, onUpdate, ctx) =>
       (await runtime(pi)).planManagerTool.execute(toolCallId, params, signal, onUpdate, ctx),

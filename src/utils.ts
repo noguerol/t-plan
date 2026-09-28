@@ -1,5 +1,5 @@
 
-import type { PlanTask, PlanState, PlanSession, TaskStatus, Tier } from "./types.ts";
+import type { PlanTask, PlanState, PlanSession, PlanRequirement, SpecSource, TaskLane, TaskStatus, Tier } from "./types.ts";
 import { formatElapsed, tierBadge, tierColor } from "./tiers.ts";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -151,17 +151,43 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
   let inPlanSection = false;
   let planSectionFound = false;
   let inSessionsSection = false;
+  let inMetaSection = false;
   let currentStatus: TaskStatus = "pending";
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // La sección `## 🗂 Sessions` es metadato de sesiones, no tareas: sus bullets
-    // (aunque parezcan checkboxes numerados) nunca deben importarse como plan.
-    // Cualquier heading posterior vuelve a habilitar el parseo normal.
+    // `## 🗂 Sessions`, `## 📋 Specs` and `## 🎯 Requirements` are metadata, not
+    // tasks: their bullets (even checkbox-shaped ones) must never become plan tasks.
+    // Any later heading re-enables normal parsing.
     const lineHeading = headingText(line);
-    if (lineHeading !== undefined) inSessionsSection = lineHeading === "Sessions";
-    if (inSessionsSection) continue;
+    if (lineHeading !== undefined) {
+      inSessionsSection = lineHeading === "Sessions";
+      inMetaSection = lineHeading === "Specs" || lineHeading === "Requirements";
+    }
+    if (inSessionsSection || inMetaSection) continue;
+
+    // Indented continuation lines belong to the task above (spec excerpt, checks,
+    // verification evidence) and are never tasks themselves.
+    const metaMatch = line.match(/^\s{2,}[-*]\s+(spec|check|verified)\s*[:：]\s*(.+)$/i);
+    if (metaMatch && tasks.length > 0) {
+      const prev = tasks[tasks.length - 1];
+      const key = metaMatch[1].toLowerCase();
+      const value = metaMatch[2].trim();
+      if (key === "spec") prev.spec = value.slice(0, 400);
+      else if (key === "check") prev.check = value.split(/\s*\|\s*/).map((s) => s.trim()).filter(Boolean);
+      else if (key === "verified") {
+        const m = value.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*(?:—|-)\s*(.*)$/);
+        if (m) {
+          const ts = parseSessionStamp(m[1]);
+          if (!Number.isNaN(ts)) prev.verifiedAt = ts;
+          if (m[2]) prev.verifyNote = m[2].trim();
+        } else {
+          prev.verifyNote = value;
+        }
+      }
+      continue;
+    }
 
     const headingStatus = statusFromHeading(line);
     
@@ -191,6 +217,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
       const step = parseInt(numberedMatch[1]);
       const ref = refFromTaskText(numberedMatch[2]);
       const tier = tierFromTaskText(numberedMatch[2]);
+      const lane = laneFromTaskText(numberedMatch[2]);
+      const reqs = reqsFromTaskText(numberedMatch[2]);
       const text = cleanTaskText(numberedMatch[2]);
       if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
@@ -200,6 +228,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
           status: currentStatus,
           order: step,
           ...(tier ? { tier } : {}),
+          ...(lane ? { lane } : {}),
+          ...(reqs ? { reqs } : {}),
         });
       }
       continue;
@@ -210,6 +240,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
       const isDone = checkboxMatch[1].toLowerCase() === "x";
       const ref = refFromTaskText(checkboxMatch[2]);
       const tier = tierFromTaskText(checkboxMatch[2]);
+      const lane = laneFromTaskText(checkboxMatch[2]);
+      const reqs = reqsFromTaskText(checkboxMatch[2]);
       const text = cleanTaskText(checkboxMatch[2]);
       if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
@@ -219,6 +251,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
           status: isDone ? "done" : currentStatus,
           order: tasks.length + 1,
           ...(tier ? { tier } : {}),
+          ...(lane ? { lane } : {}),
+          ...(reqs ? { reqs } : {}),
         });
       }
       continue;
@@ -229,6 +263,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
       const step = parseInt(stepMatch[1] ?? stepMatch[2] ?? "0");
       const ref = refFromTaskText(stepMatch[3] ?? "");
       const tier = tierFromTaskText(stepMatch[3] ?? "");
+      const lane = laneFromTaskText(stepMatch[3] ?? "");
+      const reqs = reqsFromTaskText(stepMatch[3] ?? "");
       const text = cleanTaskText(stepMatch[3] ?? "");
       if (text.length >= minLength && !isSummaryLine(text)) {
         tasks.push({
@@ -238,6 +274,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
           status: currentStatus,
           order: step,
           ...(tier ? { tier } : {}),
+          ...(lane ? { lane } : {}),
+          ...(reqs ? { reqs } : {}),
         });
       }
       continue;
@@ -248,6 +286,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
       if (dashMatch) {
         const ref = refFromTaskText(dashMatch[1]);
         const tier = tierFromTaskText(dashMatch[1]);
+        const lane = laneFromTaskText(dashMatch[1]);
+        const reqs = reqsFromTaskText(dashMatch[1]);
         const text = cleanTaskText(dashMatch[1]);
         if (text.length >= minLength && !text.startsWith("#") && !isSummaryLine(text)) {
           tasks.push({
@@ -257,6 +297,8 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
             status: currentStatus,
             order: tasks.length + 1,
             ...(tier ? { tier } : {}),
+            ...(lane ? { lane } : {}),
+            ...(reqs ? { reqs } : {}),
           });
         }
       }
@@ -279,10 +321,28 @@ export function refFromTaskText(text: string): number | undefined {
   return m ? Number.parseInt(m[1], 10) : undefined;
 }
 
+/** Captures the `(lane:backlog)` horizon marker. */
+export function laneFromTaskText(text: string): TaskLane | undefined {
+  const m = text.match(/\(\s*lane\s*[:：]\s*(active|backlog|paused)\s*\)/i);
+  return m ? (m[1].toLowerCase() as TaskLane) : undefined;
+}
+
+/** Captures the `(reqs:R1,R2)` requirement trace marker. */
+export function reqsFromTaskText(text: string): string[] | undefined {
+  const m = text.match(/\(\s*reqs\s*[:：]\s*([^)]+)\)/i);
+  if (!m) return undefined;
+  const ids = m[1]
+    .split(/[,;\s]+/)
+    .map((s) => s.trim().replace(/^#/, "").toUpperCase())
+    .filter((s) => /^R\d+$/.test(s));
+  return ids.length ? [...new Set(ids)] : undefined;
+}
+
 function cleanTaskText(text: string): string {
   return text
     .replace(/^\s*#\d+\.\s+/, "")           // stable ref written by generatePlanMarkdown
     .replace(/\((?:→|->)\s*t[0-3]\)/gi, "")   // tier marker written by generatePlanMarkdown
+    .replace(/\((?:lane|reqs)\s*[:：][^)]*\)/gi, "") // lane/reqs markers
     .replace(/\(took\s+[\d:]+\)/gi, "")        // completion timer written by generatePlanMarkdown
     .replace(/⏱\s*[\d:]+/g, "")                 // running timer written by generatePlanMarkdown
     .replace(/\[t[0-3]\]/gi, "")                // tier badges
@@ -379,7 +439,11 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   
   lines.push(`# ${state.title}`);
   lines.push("");
-  
+  // F-7: the file is regenerated from internal state; say so instead of silently
+  // discarding a hand edit. Change tasks with plan_manager or /t-plan edit.
+  lines.push("<!-- AUTO-GENERATED by t-plan — regenerated on every update; manual edits are overwritten. -->");
+  lines.push("");
+
   if (state.description) {
     lines.push(state.description);
     lines.push("");
@@ -417,13 +481,31 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   const refPrefix = (task: PlanTask): string =>
     typeof task.ref === "number" && task.ref > 0 ? `#${task.ref}. ` : "";
 
+  const laneSuffix = (task: PlanTask): string =>
+    task.lane && task.lane !== "active" ? ` (lane:${task.lane})` : "";
+  const reqsSuffix = (task: PlanTask): string =>
+    task.reqs && task.reqs.length > 0 ? ` (reqs:${task.reqs.join(",")})` : "";
+  // Per-task memory that must survive context loss: the literal spec excerpt, the
+  // acceptance checks and the recorded verification evidence.
+  const metaLines = (task: PlanTask): string[] => {
+    const out: string[] = [];
+    if (task.spec) out.push(`  - spec: ${task.spec}`);
+    if (task.check && task.check.length > 0) out.push(`  - check: ${task.check.join(" | ")}`);
+    if (task.verifiedAt) {
+      const note = task.verifyNote ? ` — ${task.verifyNote}` : "";
+      out.push(`  - verified: ${formatSessionStamp(task.verifiedAt)}${note}`);
+    }
+    return out;
+  };
+
   if (inProgressTasks.length > 0) {
     lines.push("## 🔄 In Progress");
     lines.push("");
     for (const task of inProgressTasks.sort((a, b) => a.order - b.order)) {
       const agent = task.agentName ? ` (agent: ${task.agentName})` : "";
       const timer = showTimers && task.startedAt ? ` ⏱ ${formatElapsed(now - task.startedAt)}` : "";
-      lines.push(`- [ ] ${refPrefix(task)}${task.text}${timer}${tierSuffix(task)}${agent}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${timer}${tierSuffix(task)}${laneSuffix(task)}${reqsSuffix(task)}${agent}`);
+      lines.push(...metaLines(task));
     }
     lines.push("");
   }
@@ -432,7 +514,8 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("## ⏳ Pending");
     lines.push("");
     for (const task of pendingTasks.sort((a, b) => a.order - b.order)) {
-      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}${laneSuffix(task)}${reqsSuffix(task)}`);
+      lines.push(...metaLines(task));
     }
     lines.push("");
   }
@@ -442,7 +525,8 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
     lines.push("");
     for (const task of blockedTasks.sort((a, b) => a.order - b.order)) {
       const note = task.notes ? ` — ${task.notes}` : "";
-      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}${note}`);
+      lines.push(`- [ ] ${refPrefix(task)}${task.text}${tierSuffix(task)}${laneSuffix(task)}${reqsSuffix(task)}${note}`);
+      lines.push(...metaLines(task));
     }
     lines.push("");
   }
@@ -454,7 +538,34 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
       const took = showTimers && task.startedAt && task.completedAt
         ? ` (took ${formatElapsed(task.completedAt - task.startedAt)})`
         : "";
-      lines.push(`- [x] ${refPrefix(task)}${task.text}${took}${tierSuffix(task)}`);
+      lines.push(`- [x] ${refPrefix(task)}${task.text}${took}${tierSuffix(task)}${laneSuffix(task)}${reqsSuffix(task)}`);
+      lines.push(...metaLines(task));
+    }
+    lines.push("");
+  }
+
+  const specs = state.specs ?? [];
+  if (specs.length > 0) {
+    lines.push("## 📋 Specs");
+    lines.push("");
+    for (const s of specs) {
+      const title = s.title ? ` — "${s.title}"` : "";
+      const hashPart = s.hash ? ` — hash:${s.hash}` : "";
+      lines.push(`- \`${s.id}\` [${s.kind}] \`${s.ref}\`${title} — ${s.requirementCount} requirements${hashPart}`);
+    }
+    lines.push("");
+  }
+
+  const requirements = state.requirements ?? [];
+  if (requirements.length > 0) {
+    lines.push("## 🎯 Requirements");
+    lines.push("");
+    for (const r of requirements) {
+      const covering = state.tasks.filter((t) => (t.reqs ?? []).includes(r.id));
+      const satisfied = covering.some((t) => t.status === "done");
+      const origin = `(${r.sourceId}${r.anchor ? ` · ${r.anchor}` : ""})`;
+      const taskPart = covering.length > 0 ? ` (tasks: ${covering.map((t) => `#${t.ref}`).join(", ")})` : "";
+      lines.push(`- [${satisfied ? "x" : " "}] ${r.id}. ${r.text} ${origin}${taskPart}`);
     }
     lines.push("");
   }
@@ -477,6 +588,62 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   lines.push("<!-- PRIVATE RUNTIME STATE — generated by the t-plan extension. Never commit or publish this file; keep it in your .gitignore. -->");
 
   return lines.join("\n");
+}
+
+export interface ParsedSpecs {
+  specs: SpecSource[];
+  requirements: PlanRequirement[];
+}
+
+/**
+ * Reads the `## 📋 Specs` and `## 🎯 Requirements` sections written by
+ * `generatePlanMarkdown`. Malformed/absent sections yield empty lists.
+ */
+export function parsePlanSpecs(content: string): ParsedSpecs {
+  const specs: SpecSource[] = [];
+  const requirements: PlanRequirement[] = [];
+  let section: "specs" | "requirements" | undefined;
+
+  for (const line of content.split(/\r?\n/)) {
+    const heading = headingText(line);
+    if (heading !== undefined) {
+      section = heading === "Specs" ? "specs" : heading === "Requirements" ? "requirements" : undefined;
+      continue;
+    }
+    if (!section) continue;
+
+    if (section === "specs") {
+      const m = line.match(
+        /^\s*-\s+`([^`]+)`\s+\[(file|prompt)\]\s+`([^`]+)`(?:\s+—\s+"(.*?)")?\s+—\s+(\d+)\s+requirements?(?:\s+—\s+hash:([^\s]*))?\s*$/
+      );
+      if (!m) continue;
+      specs.push({
+        id: m[1],
+        kind: m[2] as "file" | "prompt",
+        ref: m[3],
+        ...(m[4] !== undefined ? { title: m[4] } : {}),
+        hash: m[6] ?? "",
+        addedAt: Date.now(),
+        requirementCount: Number.parseInt(m[5], 10),
+      });
+      continue;
+    }
+
+    const m = line.match(/^\s*-\s+\[[ xX]\]\s+(R\d+)\.\s+(.+)$/);
+    if (!m) continue;
+    let text = m[2].trim().replace(/\s+\(tasks:\s*[^)]*\)\s*$/, "").trim();
+    const origin = text.match(/\s+\((S\d+)(?:\s+·\s+([^)]*))?\)\s*$/);
+    let sourceId = "";
+    let anchor: string | undefined;
+    if (origin && typeof origin.index === "number") {
+      sourceId = origin[1];
+      anchor = origin[2];
+      text = text.slice(0, origin.index).trim();
+    }
+    requirements.push({ id: m[1], sourceId, ...(anchor ? { anchor } : {}), text });
+  }
+
+  return { specs, requirements };
 }
 
 /**

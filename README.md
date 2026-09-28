@@ -16,6 +16,8 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 ## What's new
 
+- **v1.7.1 — the spec memory no longer eats your notes** — `extractRequirements` now requires **normative** content: a bullet must contain a modal/obligation verb (`MUST`, `must`, `debe`…), start with an action/imperative verb, carry a requirement id (`RF-1`, `REQ-3`…) or live under an explicit requirements/acceptance/scope heading. Bare paths, UUIDs, `key: value` notes, metric lines (`281 tests, 14/14 build`) and blockquotes are skipped, so project memory (`pi.md`), continuation briefs, ADRs, changelogs and findings logs decompose to **0 requirements** instead of 80. Referenced `.md`/`.txt` files are no longer read by default (new opt-in `📥 Ingest referenced specs`), and even then only when `isSpecDocument()` declares them a spec — the file that was polluted last time now passes through untouched. Requirements are the ledger; tasks are only seeded for the active window (5) and promoted as work completes, and a task's title is a derived short clause (the full text stays in `spec`). New `plan_manager forget` retracts a source, its requirements and the tasks that only covered them; sources/requirements are capped (newest 8 sources, 200 requirements) and the plan file now carries an `AUTO-GENERATED` header instead of silently discarding manual edits. 217 tests + `npm run verify` green.
+- **v1.7.0 — Spec-Driven Project Memory (memoria global de planificación)** — a long project that starts from a spec doc or a structured prompt no longer loses requirements to context decay. With `🧠 Spec memory` ON, t-plan detects the spec (keywords like `MUST`/`requirements`/`RF-1`, size/structure, or an explicitly-declared spec file when `📥 Ingest referenced specs` is ON), decomposes it **deterministically** into atomic requirements (`R1, R2…`, anchor, content hash, deduped and capped) and keeps them as a coverage ledger, auto-seeding tasks only for the active window. Each task carries its requirement trace (`reqs`), the literal spec excerpt (`spec`) and its acceptance checks (`check`), and lives in a **lane**: `active` (window of 5), `backlog` or `paused`, with rolling promotion as work completes. Every turn injects a `[SPEC]` coverage block (satisfied/mapped, gaps, gate). With `🛡️ Spec review gate` ON a spec task can never reach `done` unverified — `plan_manager verify` records the evidence (build/tests), and if the model tries to conclude while coverage < 100% t-plan blocks the drop and forces a bounded continuation. Specs/requirements and per-task memory round-trip through the plan file (`## 📋 Specs`, `## 🎯 Requirements`, `spec:`/`check:`/`verified:`), so the memory survives sessions, model switches and interruptions. New `plan_manager` actions `plan`/`coverage`/`source`/`forget`/`verify` and params `lane`/`reqs`/`check`. Contract: `docs/spec-plan-memory.md`.
 - **v1.4.0 — in-progress ≠ girando (liveness del widget)** — el widget sólo anima (spinner + ⏱ timer + color acento) una tarea `in_progress` cuando hay un run de agente activo o una tarea de agente viva; en caso contrario se muestra parada (`⏸`, muted, sin spinner ni timer) y cuenta como pendiente en la cabecera. Al arrancar/restaurar sesión, cualquier `in_progress` heredado del `plan_*.md` se aparca a `pending`. `plan_manager list` sigue mostrando el estado almacenado (`in_progress`) para el modelo; `/t-plan show` refleja la liveness (`⏸` si nadie la ejecuta).
 - **v1.3.3 — smaller startup and text footprint** — trimmed the entrypoint's exposed metadata/descriptions and compressed the injected plan context, labels, notifications and menu text. Startup bundle 4,458 → 4,184 bytes (−6.1%); no change to command names/args, tool name/params/schema, config keys, persisted state or behavior.
 - **v1.3.2 — short task names survive across sessions** — task text shorter than 4 characters (`CI`, `v2`) was written to the plan file but silently dropped when a new session adopted it, because the file parser reused the model-prose noise filter (`text.length > 3`). That filter now defaults to 4 for prose detection and is relaxed to 1 when reading a plan file, so cross-session adoption is lossless for short tasks.
@@ -128,6 +130,38 @@ One plan file per project, maintained across sessions — no session id in the n
 - **Availability-aware** — the extension reads `~/.pi/agent/trimegisto/config.json` and knows which tiers are actually spawnable (enabled + model configured, respecting `spawnOnlyOnActive`). Tasks assigned to an unavailable tier fall back to `t0` (`active`), so plans stay executable.
 - **LLM guidance** — the injected plan context lists each task's effective tier and instructs the model to launch tasks on their tier with the `trimegisto` tool, batching independent tasks in one call.
 - **Everywhere** — the widget shows colored `[tN]` badges plus a header distribution (`t1×1 t2×3 t3×2`), the plan file shows `(→ tN)` per task, and `/t-plan show` + `plan_manager list` show `→ tN`.
+
+## Spec-Driven Project Memory
+
+Long projects usually start from a spec document or a long structured prompt, but as the conversation grows the original requirements decay: the model forgets items, silently re-scopes and eventually declares the project finished with a fraction of the spec implemented. t-plan closes that gap by turning the spec into first-class, persisted tasks, so the plan file becomes the project's global memory and survives context decay, model switches and interruptions.
+
+- **Automatic detection** — with `🧠 Spec memory` ON, t-plan inspects the prompt each turn. A spec or long structured request is recognised by keywords (`spec`, `requirements`, `acceptance criteria`, `MUST`/`SHALL`/`DEBE`, `RF-1`…), by size (≥ 8 non-empty lines, ≥ 6 structural items and ≥ 3 normative bullets, or ≥ 1200 chars with ≥ 3 headings) and — only when `📥 Ingest referenced specs` is ON — by a referenced `.md`/`.txt` file that `isSpecDocument()` accepts as a spec. Short chatter is left alone. Only normative lines become requirements: prose must carry an obligation modal or start with an action verb, and paths/UUIDs/`key: value` notes/metrics are skipped, so a notes file decomposes to zero.
+- **Exhaustive decomposition** — the source is split into atomic requirements with stable ids (`R1`, `R2`…) and an anchor (`§2 Auth`, `L42`). Each becomes a backlog/active task carrying its requirement trace (`reqs`), the **literal spec excerpt** (`spec`) and its **acceptance checks** (`check`) — e.g. `compiles/typechecks | tests pass | behavior matches the spec excerpt`. Requirements are deduped and capped per source, and the same source is never ingested twice (content hash).
+- **Lanes** — every seeded task lands in a lane: `active` (current timeframe, default), `backlog` (long-term queue extracted from the spec) or `paused` (deliberately parked). The first few go `active`, the rest `backlog`; as active work completes, the next backlog tasks are **promoted automatically** (rolling promotion), so a long spec stays visible without flooding the working set.
+
+```
+- [ ] #7. Implement OAuth login (→ t2) (lane:backlog) (reqs:R2,R5)
+  - spec: The system MUST authenticate users via OAuth2 (from S1 §2 Auth)
+  - check: compiles/typechecks | tests pass | behavior matches the spec excerpt
+  - verified: 2026-09-24 17:02:11 — npm test → 32 passed
+```
+
+- **`[SPEC]` context every turn** — the injected plan block gains a coverage summary, the gap list and the backlog/paused lanes, so the model always knows what is still missing:
+
+```
+[SPEC]
+coverage: 3/12 satisfied · 12/12 mapped (25%)
+gaps: R5 §2 Auth; R7 §3 API
+Backlog (7):
+- 🗂 #20. …
+Paused: #24
+Gate: do NOT conclude while coverage < 100%; the plan is the project memory.
+```
+
+- **Review gate** — with `🛡️ Spec review gate` ON, a spec-derived task (one with `spec` or `check`) can never reach `done` until it is **verified**: `plan_manager verify` records `verifiedAt` plus the evidence note, or the run must contain a real build/test command. `plan_manager complete` on an unverified spec task is refused with its pending checks, and if the model tries to conclude while coverage is < 100% (or unverified spec tasks remain) t-plan forces it to continue instead of dropping them — so the model cannot declare the project finished early. Only work that compiles, passes its tests and matches the spec excerpt counts as done.
+- **Global project memory** — specs and requirements are serialized into the plan file (`## 📋 Specs`, `## 🎯 Requirements`, lane/`reqs` markers) and re-adopted on load, so traceability survives sessions, model switches and interruptions.
+
+New `plan_manager` actions support the flow: `plan` (bulk decomposition — one task per line, optional leading `[R1,R2]`/`R1:` and a `lane`), `coverage` (the coverage report plus unsatisfied requirements and their covering refs), `source` (ingest a file you name explicitly), `forget` (retract a source by id/path — removes it with its requirements and the tasks that only covered them) and `verify` (`task_id` + `notes` evidence). `add`/`update` accept the `lane`, `reqs` and `check` params. Toggle the feature with `🧠 Spec memory` and `🛡️ Spec review gate` in `/t-plan config`; turning `Spec memory` off only stops ingest/injection — existing specs, requirements and lanes are never deleted.
 
 ## Task Timers
 
@@ -287,6 +321,9 @@ Open with `/t-plan config` — a settings dialog in pi's native style (`Settings
 | ⚡ Trimegisto mode | OFF | Tier classification + agent assignment per task |
 | ⏱️ Task timers | ON | Live `HH:MM:SS` counter on in-progress tasks |
 | 🧪 Tool evidence | ON | Touch files/commands complete or advance tasks |
+| 🧠 Spec memory | ON | Detect spec docs / long prompts, decompose them into requirements and auto-seed the backlog |
+| 📥 Ingest referenced specs | OFF | Opt-in: read & decompose a spec file merely mentioned in a prompt (declared specs only; notes/ADRs/changelogs are refused) |
+| 🛡️ Spec review gate | ON | Refuse to complete unverified spec tasks and to conclude while coverage < 100% |
 | 🐛 Debug log | OFF | Log swallowed errors to `~/.pi/agent/t-plan/debug.log` |
 | ✨ Animate widget | ON | Spinner on in-progress tasks + completion flash |
 | 📝 Compact task lines | ON | Truncate each task to a single line |

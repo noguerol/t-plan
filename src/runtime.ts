@@ -4,8 +4,29 @@ import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, truncateToWidth, type SettingItem, SettingsList, SelectList, Text, Editor, type EditorMenuEntry } from "@earendil-works/pi-tui";
-import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession } from "./types.ts";
+import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession, SpecSource, PlanRequirement, TaskLane } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
+import {
+  computeCoverage,
+  defaultChecksFor,
+  extractRequirements,
+  formatCoverageContext,
+  hashText,
+  isSpecDocument,
+  looksLikeComplexSpec,
+  makeSpecSource,
+  nextRequirementId,
+  nextSpecId,
+  parseChecks,
+  parseReqs,
+  requirementTitle,
+  taskVerificationRequired,
+  taskVerified,
+  MAX_PROJECT_REQUIREMENTS,
+  MAX_SPEC_SOURCES,
+  SPEC_ACTIVE_WINDOW,
+  type CoverageReport,
+} from "./spec.ts";
 import {
   classifyTask,
   completedTimerText,
@@ -49,6 +70,7 @@ import {
   hasRealPlanStructure,
   splitSegments,
   taskTextScore,
+  parsePlanSpecs,
 } from "./utils.ts";
 import { readFile, writeFile, appendFile, access, unlink, mkdir, readdir, stat, rename } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
@@ -102,6 +124,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   // (trimegisto) se consideran vivas mientras su agentId siga tracked.
   let runActive = false;
   const liveAgentTaskIds = new Set<string>();
+  // Anti-loop guard for the spec review gate: at most two forced continuations
+  // per run, reset in before_agent_start.
+  let gateForced = 0;
+
+  // Source of the next prompt: pi's `input` event exposes `source`
+  // ('interactive' | 'rpc' | 'extension') but `before_agent_start` does not.
+  // Extension-injected prompts (e.g. the critique autocritique directive)
+  // must not seed spec memory: the input handler marks them here and
+  // before_agent_start consumes the flag (so a stale mark can never leak
+  // into a later user turn, even if an input event is missed).
+  let extensionPromptPending = false;
 
   function isTaskLive(task: PlanTask): boolean {
     return task.status === "in_progress" && (runActive || liveAgentTaskIds.has(task.id));
@@ -333,6 +366,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       state.tasks = tasks;
     }
     mergeSessionsIntoState(fileSessions);
+    // Spec-driven memory: requirements and their sources travel in the plan file
+    // so a new session (or a different model) re-adopts the whole project scope.
+    const parsedSpecs = parsePlanSpecs(content);
+    if (parsedSpecs.specs.length > 0) state.specs = parsedSpecs.specs;
+    if (parsedSpecs.requirements.length > 0) state.requirements = parsedSpecs.requirements;
     // Best-effort: recuerda el mtime del fichero adoptado para poder distinguir
     // después un write ajeno (otra sesión) de nuestro propio write.
     try {
@@ -341,7 +379,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } catch {
       lastPlanMtime = undefined;
     }
-    const adopted = tasks.length > 0 || fileSessions.length > 0;
+    const adopted = tasks.length > 0 || fileSessions.length > 0 || parsedSpecs.specs.length > 0 || parsedSpecs.requirements.length > 0;
     if (adopted) {
       state.updatedAt = Date.now();
       planFilePath = filePath;
@@ -614,7 +652,13 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
   }
 
-  function addTask(text: string, status: TaskStatus = "pending", order?: number, tier?: Tier): PlanTask {
+  function addTask(
+    text: string,
+    status: TaskStatus = "pending",
+    order?: number,
+    tier?: Tier,
+    extra?: { lane?: TaskLane; reqs?: string[]; spec?: string; check?: string[] }
+  ): PlanTask {
     const maxRef = state.tasks.reduce((max, t) => Math.max(max, t.ref ?? 0), 0);
     const task: PlanTask = {
       id: generateId(),
@@ -628,6 +672,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } else if (config.trimegisto) {
       task.tier = classifyTask(text);
     }
+    if (extra?.lane) task.lane = extra.lane;
+    if (extra?.reqs?.length) task.reqs = extra.reqs;
+    if (extra?.spec) task.spec = extra.spec.slice(0, 400);
+    if (extra?.check?.length) task.check = extra.check;
     state.tasks.push(task);
     state.updatedAt = Date.now();
     return task;
@@ -907,6 +955,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         const ok = await ctx.ui.confirm("Clear plan?", "Remove all tasks?");
         if (ok) {
           state.tasks = [];
+          state.specs = [];
+          state.requirements = [];
           state.updatedAt = Date.now();
           ctx.ui.notify("Cleared", "info");
           updateUI(ctx);
@@ -1290,6 +1340,21 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         config.toolEvidence = on;
         ctx.ui.notify(on ? "Tool evidence ON: files/commands complete tasks" : "Tool evidence OFF: text/markers only", "info");
         break;
+      case "specMemory":
+        config.specMemory = on;
+        ctx.ui.notify(on ? "Spec memory ON: specs → requirements → backlog" : "Spec memory OFF: no auto-decomposition", "info");
+        break;
+      case "specIngestFiles":
+        config.specIngestFiles = on;
+        ctx.ui.notify(
+          on ? "Spec file ingestion ON: referenced spec docs are decomposed" : "Spec file ingestion OFF: only explicit source/plan",
+          "info"
+        );
+        break;
+      case "specReviewGate":
+        config.specReviewGate = on;
+        ctx.ui.notify(on ? "Review gate ON: spec tasks must be verified before done" : "Review gate OFF", "info");
+        break;
       case "debug":
         config.debug = on;
         ctx.ui.notify(on ? `Debug log ON: ${DEBUG_LOG_PATH}` : "Debug log OFF", "info");
@@ -1409,6 +1474,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       {
         id: "toolEvidence", label: "🧪 Tool evidence", currentValue: onOff(config.toolEvidence), values: [ON, OFF],
         description: "Let real work count as proof: writing a file or running a command that matches a task advances or completes it, instead of relying only on what the model says.",
+      },
+      {
+        id: "specMemory", label: "🧠 Spec memory", currentValue: onOff(config.specMemory), values: [ON, OFF],
+        description: "Detect spec docs / long structured prompts, decompose them once into requirements (R1, R2…) and auto-seed a backlog task per requirement with its excerpt and checks.",
+      },
+      {
+        id: "specIngestFiles", label: "📥 Ingest referenced specs", currentValue: onOff(config.specIngestFiles), values: [ON, OFF],
+        description: "Off by default. When ON, a spec file merely *mentioned* in a prompt is read and decomposed — but only if it declares itself a spec (filename/requirements heading/ids). Notes, ADRs, changelogs and project memory are always refused.",
+      },
+      {
+        id: "specReviewGate", label: "🛡️ Spec review gate", currentValue: onOff(config.specReviewGate), values: [ON, OFF],
+        description: "A spec-derived task cannot be marked done until verified (build/tests) via plan_manager verify; and the project cannot be declared finished while coverage < 100%.",
       },
       {
         id: "debug", label: "🐛 Debug log", currentValue: onOff(config.debug), values: [ON, OFF],
@@ -1533,6 +1610,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       const ok = await ctx.ui.confirm("Clear?", "Remove all tasks?");
       if (ok) {
         state.tasks = [];
+        state.specs = [];
+        state.requirements = [];
         state.updatedAt = Date.now();
       }
       return;
@@ -1578,6 +1657,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         `${config.trimegisto ? "✅" : "❌"} TG: ${config.trimegisto ? "ON" : "OFF"}`,
         `${config.showTimers ? "✅" : "❌"} Timers: ${config.showTimers ? "ON" : "OFF"}`,
         `${config.toolEvidence ? "✅" : "❌"} Tool evidence: ${config.toolEvidence ? "ON" : "OFF"}`,
+        `${config.specMemory ? "✅" : "❌"} Spec memory: ${config.specMemory ? "ON" : "OFF"}`,
+        `${config.specIngestFiles ? "✅" : "❌"} Ingest referenced specs: ${config.specIngestFiles ? "ON" : "OFF"}`,
+        `${config.specReviewGate ? "✅" : "❌"} Spec review gate: ${config.specReviewGate ? "ON" : "OFF"}`,
         `${config.debug ? "✅" : "❌"} Debug log: ${config.debug ? "ON" : "OFF"}`,
         `${config.animateWidget ? "✅" : "❌"} Animate: ${config.animateWidget ? "ON" : "OFF"}`,
         `${config.compactTaskLines ? "✅" : "❌"} Compact: ${config.compactTaskLines ? "ON" : "OFF"}`,
@@ -1599,6 +1681,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       else if (choice.includes("TG")) await applyConfigChoice(ctx, "trimegisto", config.trimegisto ? OFF : ON);
       else if (choice.includes("Timers")) await applyConfigChoice(ctx, "showTimers", config.showTimers ? OFF : ON);
       else if (choice.includes("Tool evidence")) await applyConfigChoice(ctx, "toolEvidence", config.toolEvidence ? OFF : ON);
+      else if (choice.includes("Spec memory")) await applyConfigChoice(ctx, "specMemory", config.specMemory ? OFF : ON);
+      else if (choice.includes("Ingest referenced specs")) await applyConfigChoice(ctx, "specIngestFiles", config.specIngestFiles ? OFF : ON);
+      else if (choice.includes("Spec review gate")) await applyConfigChoice(ctx, "specReviewGate", config.specReviewGate ? OFF : ON);
       else if (choice.includes("Debug log")) await applyConfigChoice(ctx, "debug", config.debug ? OFF : ON);
       else if (choice.includes("Animate")) await applyConfigChoice(ctx, "animateWidget", config.animateWidget ? OFF : ON);
       else if (choice.includes("Compact")) await applyConfigChoice(ctx, "compactTaskLines", config.compactTaskLines ? OFF : ON);
@@ -2003,6 +2088,242 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     },
   };
 
+  // ── Spec-driven project memory ────────────────────────────────────────
+  // A spec doc / long prompt is decomposed once into stable requirements, and
+  // each requirement becomes a persisted task carrying its literal excerpt
+  // (`spec`), acceptance checks (`check`) and a coverage link (`reqs`). That is
+  // the project memory that survives context decay, model switches and reloads.
+
+  function requirementTextFor(id: string | undefined): string | undefined {
+    if (!id) return undefined;
+    return state.requirements?.find((r) => r.id === id)?.text;
+  }
+
+  function activeLaneCount(): number {
+    return state.tasks.filter((t) => (t.lane ?? "active") === "active" && t.status !== "done").length;
+  }
+
+  /**
+   * Seed a task for the next requirement (ledger order) that has none yet.
+   * Requirements are the ledger; tasks only ever cover the active window, so a
+   * document can never flood the task list with one task per bullet (RC-4).
+   */
+  function seedNextRequirementTask(): PlanTask | undefined {
+    const reqs = state.requirements;
+    if (!reqs?.length) return undefined;
+    const mapped = new Set<string>();
+    for (const t of state.tasks) for (const id of t.reqs ?? []) mapped.add(id);
+    const next = reqs.find((r) => !mapped.has(r.id));
+    if (!next) return undefined;
+    const title = requirementTitle(next.text) || next.text.slice(0, 80);
+    return addTask(title, "pending", undefined, undefined, {
+      lane: "active",
+      reqs: [next.id],
+      spec: next.text,
+      check: defaultChecksFor(next.text),
+    });
+  }
+
+  /** Keep the execution lane fed: backlog tasks first, then the requirement ledger. */
+  function promoteBacklog(): number {
+    if (!config.specMemory) return 0;
+    let promoted = 0;
+    while (activeLaneCount() < SPEC_ACTIVE_WINDOW) {
+      const next = state.tasks
+        .filter((t) => t.lane === "backlog" && t.status === "pending")
+        .sort((a, b) => a.order - b.order)[0];
+      if (next) {
+        next.lane = "active";
+        promoted++;
+        continue;
+      }
+      if (!seedNextRequirementTask()) break;
+      promoted++;
+    }
+    if (promoted > 0) state.updatedAt = Date.now();
+    return promoted;
+  }
+
+  // Retracted source hashes: re-ingesting a forgotten document must not
+  // resurrect its requirements (F-5). Session-local: an explicit new ingest is
+  // the only way back.
+  const forgottenHashes = new Set<string>();
+
+  /**
+   * Drop a source, its requirements and the tasks that only existed for them.
+   * Tasks covering requirements from other sources survive (their `reqs` is
+   * trimmed). Returns how many requirements were retracted.
+   */
+  function retractSource(source: SpecSource): number {
+    if (connectedSpecs().includes(source)) {
+      state.specs = (state.specs ?? []).filter((s) => s !== source);
+    }
+    if (source.hash) forgottenHashes.add(source.hash);
+    const removedReqIds = new Set<string>(
+      (state.requirements ?? []).filter((r) => r.sourceId === source.id).map((r) => r.id)
+    );
+    if (removedReqIds.size === 0) return 0;
+    state.requirements = (state.requirements ?? []).filter((r) => r.sourceId !== source.id);
+    for (const task of [...state.tasks]) {
+      const own = task.reqs;
+      if (!own || own.length === 0) continue;
+      const remaining = own.filter((id) => !removedReqIds.has(id));
+      if (remaining.length === own.length) continue;
+      if (remaining.length === 0) removeTask(task.id);
+      else task.reqs = remaining;
+    }
+    state.updatedAt = Date.now();
+    return removedReqIds.size;
+  }
+
+  function connectedSpecs(): SpecSource[] {
+    return state.specs ?? [];
+  }
+
+  /** Newest-K budget: retract the oldest sources until one slot is free. */
+  function pruneOldestSources(keep: number): number {
+    let dropped = 0;
+    const specs = state.specs ?? [];
+    while (specs.length > keep) {
+      const oldest = [...specs].sort((a, b) => a.addedAt - b.addedAt)[0];
+      if (!oldest) break;
+      retractSource(oldest);
+      dropped++;
+    }
+    return dropped;
+  }
+
+  /**
+   * Decompose one spec/prompt into requirements (the coverage ledger). Tasks are
+   * NOT created here: `promoteBacklog()` lifts requirements into the active lane
+   * only while it has room. Idempotent: the content hash prevents re-ingesting
+   * the same source every turn, and a forgotten source stays forgotten.
+   */
+  function ingestSpec(text: string, kind: "file" | "prompt", ref: string): number {
+    if (!config.specMemory || !text || text.trim().length < 40) return 0;
+    const hash = hashText(text);
+    if (forgottenHashes.has(hash)) return 0;
+    if ((state.specs ?? []).some((s) => s.hash === hash)) return 0;
+
+    const sourceId = nextSpecId(state.specs);
+    const raws = extractRequirements(text, sourceId);
+    if (raws.length === 0) return 0;
+
+    // Source budget: only the newest MAX_SPEC_SOURCES documents stay active.
+    pruneOldestSources(MAX_SPEC_SOURCES - 1);
+
+    const reqs = state.requirements ?? (state.requirements = []);
+    const capacity = Math.max(0, MAX_PROJECT_REQUIREMENTS - reqs.length);
+    const kept = raws.slice(0, capacity);
+    if (kept.length === 0) return 0;
+
+    const specs = state.specs ?? (state.specs = []);
+    specs.push(makeSpecSource(sourceId, kind, ref, text, kept.length));
+    for (const raw of kept) {
+      const id = nextRequirementId(reqs);
+      reqs.push({ id, sourceId: raw.sourceId, ...(raw.anchor ? { anchor: raw.anchor } : {}), text: raw.text });
+    }
+    state.updatedAt = Date.now();
+    return kept.length;
+  }
+
+  /**
+   * Ingest the markdown/txt files a prompt references. Opt-in (specIngestFiles,
+   * default off) AND gated by `isSpecDocument`: a passing mention of a notes file
+   * must never turn project memory into requirements (RC-1/F-1).
+   */
+  async function ingestReferencedFiles(prompt: string, ctx: ExtensionContext): Promise<number> {
+    if (!config.specMemory || !config.specIngestFiles || !prompt) return 0;
+    const matches = prompt.match(/[\w./-]+\.(?:md|markdown|txt)\b/gi) ?? [];
+    const seen = new Set<string>();
+    let added = 0;
+    for (const raw of matches.slice(0, 5)) {
+      const rel = raw.replace(/^\.\//, "");
+      if (!/^[\w./-]+$/.test(rel) || rel.startsWith("/") || rel.includes("..")) continue;
+      if (seen.has(rel)) continue;
+      seen.add(rel);
+      const abs = join(ctx.cwd, rel);
+      if (abs !== ctx.cwd && !abs.startsWith(ctx.cwd + "/")) continue;
+      try {
+        const st = await stat(abs);
+        if (!st.isFile() || st.size > 200_000) continue;
+        const content = await readFile(abs, "utf-8");
+        if (!looksLikeComplexSpec(content)) continue;
+        if (!isSpecDocument(rel, content)) continue;
+        added += ingestSpec(content, "file", rel);
+      } catch {
+        // A missing/renamed file in the prompt is normal; ignore it.
+      }
+    }
+    return added;
+  }
+
+  function gapTaskRefs(cov: CoverageReport): PlanTask[] {
+    const gaps = new Set(cov.unsatisfied.map((r) => r.id));
+    return state.tasks
+      .filter((t) => t.status !== "done" && (t.reqs ?? []).some((r) => gaps.has(r)))
+      .sort((a, b) => a.order - b.order);
+  }
+
+  /** True when the review gate is on and a spec task has not been verified yet. */
+  function verificationPending(task: PlanTask): boolean {
+    return config.specReviewGate && taskVerificationRequired(task) && !taskVerified(task, evidence.testRuns);
+  }
+
+  function unverifiedSpecTasks(): PlanTask[] {
+    if (!config.specReviewGate) return [];
+    return state.tasks.filter((t) => t.status !== "done" && verificationPending(t));
+  }
+
+  /**
+   * Self-heal: a reconciliation or a removal can leave a requirement without any
+   * task (the memory would silently lose it). Re-seed tasks from the ledger, but
+   * only up to the active-window budget so coverage stays actionable without
+   * turning the whole ledger into tasks (F-4). `promoteBacklog()` fills the rest
+   * as slots free up.
+   */
+  function ensureRequirementCoverage(): number {
+    if (!config.specMemory) return 0;
+    let added = 0;
+    while (activeLaneCount() < SPEC_ACTIVE_WINDOW && seedNextRequirementTask()) added++;
+    return added;
+  }
+
+  interface SpecGate { message: string; gaps: number; }
+
+  /**
+   * The review gate: the model must not conclude the project while requirements
+   * are unsatisfied or spec tasks are unverified. Returns null when it may close.
+   */
+  function specGate(): SpecGate | null {
+    if (!config.specMemory || !config.specReviewGate) return null;
+    const reqs = state.requirements;
+    if (!reqs || reqs.length === 0) return null;
+
+    const cov = computeCoverage(reqs, state.tasks);
+    const pendingGap = gapTaskRefs(cov);
+    const unverified = unverifiedSpecTasks();
+    if (cov.satisfied >= cov.total && unverified.length === 0) return null;
+
+    const lines = [
+      `[PLAN GATE] No cierres el proyecto: ${cov.satisfied}/${cov.total} requisitos satisfechos.`,
+    ];
+    if (cov.unsatisfied.length > 0) {
+      const labels = cov.unsatisfied
+        .slice(0, 10)
+        .map((r) => `${r.id}${r.anchor ? ` ${r.anchor}` : ""}`)
+        .join("; ");
+      lines.push(`Gaps: ${labels}${cov.unsatisfied.length > 10 ? " …" : ""}`);
+    }
+    const show = (pendingGap.length > 0 ? pendingGap : unverified).slice(0, 12);
+    lines.push("Pendiente:");
+    for (const t of show) {
+      lines.push(`- #${t.ref}. ${t.text}${taskVerificationRequired(t) ? " [verify required]" : ""}`);
+    }
+    lines.push("Continúa con estas tareas; marca done solo tras plan_manager verify con evidencia (build/tests).");
+    return { message: lines.join("\n"), gaps: cov.total - cov.satisfied };
+  }
+
   const onSessionStart = async (_event: unknown, ctx: ExtensionContext) => {
     try {
     globalConfigPartial = await loadGlobalConfig();
@@ -2039,6 +2360,16 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     } catch (err) { logError("session_start", err); /* stale ctx/reload */ }
   };
 
+  const onInput = async (event: any, _ctx?: ExtensionContext) => {
+    try {
+      const source = event?.source;
+      if (source === "extension") extensionPromptPending = true;
+      else if (source === "interactive" || source === "rpc") extensionPromptPending = false;
+      // Unknown/absent source: leave the flag as-is; before_agent_start
+      // consumes it, so it can never outlive the next run boundary.
+    } catch (err) { logError("input", err); }
+  };
+
   const onBeforeAgentStart = async (event: any, ctx: ExtensionContext) => {
     try {
     // Nueva petición del usuario => nueva evidencia; también se limpia el stopReason
@@ -2046,6 +2377,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     evidence = createEvidence();
     lastStopReason = undefined;
     lastAssistantText = "";
+    // Consume the input-event mark before anything may return early.
+    const injectedPrompt = extensionPromptPending;
+    extensionPromptPending = false;
 
     if (!config.enabled) return;
 
@@ -2056,8 +2390,35 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     // retomamos, debe volver a girar desde el primer momento del run.
     updateUI(ctx);
 
+    // Spec-driven memory: ingest a structured prompt / (opt-in) referenced spec
+    // docs once (hash-deduped) into the requirements ledger, then lift as many
+    // requirements as the active window allows into tasks.
+    gateForced = 0;
+    // Extension-injected prompts (autocritique directive & co.) are not user
+    // specs: never decompose them into requirements/tasks.
+    if (config.specMemory && !injectedPrompt) {
+      try {
+        const prompt = typeof event?.prompt === "string" ? event.prompt : "";
+        let seeded = 0;
+        if (looksLikeComplexSpec(prompt)) seeded += ingestSpec(prompt, "prompt", "prompt");
+        seeded += await ingestReferencedFiles(prompt, ctx);
+        if (seeded > 0) {
+          promoteBacklog();
+          await writePlanFile(ctx.cwd);
+          persistState();
+          updateUI(ctx);
+          ctx.ui.notify(`🧠 spec: +${seeded} requisitos → ledger`, "info");
+        }
+      } catch (err) {
+        logError("before_agent_start:spec", err);
+      }
+    }
+
+    const isOffLane = (t: PlanTask) =>
+      config.specMemory && (t.lane === "backlog" || t.lane === "paused");
+
     if (state.tasks.length > 0) {
-      const pending = state.tasks.filter((t) => t.status === "pending");
+      const pending = state.tasks.filter((t) => t.status === "pending" && !isOffLane(t));
       const inProgress = state.tasks.filter((t) => t.status === "in_progress");
       const blocked = state.tasks.filter((t) => t.status === "blocked");
       const done = state.tasks.filter((t) => t.status === "done");
@@ -2106,6 +2467,35 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       if (done.length > 0) {
         const refs = done.slice(-12).map((t) => `#${t.ref}`).join(", ");
         planContext += `Done (${done.length}): ${refs}${done.length > 12 ? ", ..." : ""}\n\n`;
+      }
+
+      if (config.specMemory) {
+        const backlog = state.tasks
+          .filter((t) => t.lane === "backlog" && t.status !== "done")
+          .sort((a, b) => a.order - b.order);
+        if (backlog.length > 0) {
+          planContext += `Backlog (${backlog.length}):\n`;
+          for (const t of backlog.slice(0, PENDING_CAP)) {
+            planContext += `- 🗂 #${t.ref}. ${t.text}${tierTag(t)}\n`;
+          }
+          if (backlog.length > PENDING_CAP) planContext += `- … +${backlog.length - PENDING_CAP} more\n`;
+          planContext += "\n";
+        }
+        const paused = state.tasks.filter((t) => t.lane === "paused" && t.status !== "done");
+        if (paused.length > 0) {
+          planContext += `Paused: ${paused.slice(0, 20).map((t) => `#${t.ref}`).join(", ")}${paused.length > 20 ? ", …" : ""}\n\n`;
+        }
+        const coverage = formatCoverageContext(state.requirements, state.tasks);
+        if (coverage) {
+          planContext += coverage + "\n";
+          const cov = computeCoverage(state.requirements, state.tasks);
+          const unverified = unverifiedSpecTasks().length;
+          if (cov.satisfied < cov.total || unverified > 0) {
+            planContext +=
+              "Gate: do NOT conclude while coverage < 100%; verify each spec task (build/tests) with plan_manager verify before complete. The plan is the project memory.\n";
+          }
+          planContext += "\n";
+        }
       }
 
       planContext += "Rules: before ending the turn, plan_manager complete task_id=<ref> for EVERY finished task (accepts \"2,3\" or text). Plan changed => add/remove/update; starting => plan_manager start or name it. Auto-tracking uses touched files/commands.\n";
@@ -2184,6 +2574,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
     let changed = false;
     const autoNotes: string[] = [];
+    let gate: SpecGate | null = null;
+    // Self-heal coverage even if a reconcile emptied the task list.
+    if (config.specMemory && ensureRequirementCoverage() > 0) changed = true;
 
     if (state.tasks.length > 0) {
       // Snapshot con los refs vigentes AL INICIO del turno: el modelo trabaja con la
@@ -2255,14 +2648,20 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         ]),
       ];
       if (allDone.length > 0) {
+        let completed = 0;
         for (const id of allDone) {
           const task = state.tasks.find((t) => t.id === id);
-          if (task && task.status !== "done") {
-            markTaskStatus(id, "done", ctx);
-            changed = true;
+          if (!task || task.status === "done") continue;
+          // Spec work is never done on the model's word alone: it must be verified.
+          if (verificationPending(task)) {
+            autoNotes.push(`#${task.ref} needs verify`);
+            continue;
           }
+          markTaskStatus(id, "done", ctx);
+          completed++;
+          changed = true;
         }
-        autoNotes.push(`+${allDone.length} done`);
+        if (completed > 0) autoNotes.push(`+${completed} done`);
       }
 
       const allStarted = [...new Set([...auto.startedIds, ...byEvidence.startedIds])];
@@ -2283,7 +2682,14 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       // ("Listo, commit y push hechos. Queda pendiente el despliegue.") y el veto global
       // anterior anulaba toda la detección.
       const clauses = detectWorkConclusionClauses(text);
-      if (clauses.conclusion) {
+      const genericDone = !clauses.conclusion && detectGenericCompletion(text);
+      const concluding = clauses.conclusion || genericDone;
+      gate = concluding ? specGate() : null;
+      if (gate) {
+        // The project is not finished: keep every task, and let the boundary
+        // continuation below send the model back to the unsatisfied requirements.
+        autoNotes.push(`⛔ ${gate.gaps} gaps`);
+      } else if (clauses.conclusion) {
         const active = state.tasks.filter((t) => t.status === "in_progress");
         const leftover = state.tasks.filter((t) => t.status === "pending" || t.status === "blocked");
         const withEvidence = new Set(
@@ -2305,13 +2711,24 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           (t) => !t.everTouched && !withEvidence.has(t.id) && !mentionedPending.includes(t.id)
         );
 
-        for (const task of active) markTaskStatus(task.id, "done", ctx);
+        for (const task of active) {
+          if (verificationPending(task)) continue;
+          markTaskStatus(task.id, "done", ctx);
+        }
         for (const task of keep) {
           touchTask(task.id);
+          if (verificationPending(task)) continue;
           markTaskStatus(task.id, "done", ctx);
         }
         for (const task of hold) touchTask(task.id);
-        for (const task of drop) removeTask(task.id);
+        for (const task of drop) {
+          // Never silently discard spec-derived work: it is the project memory.
+          if (taskVerificationRequired(task)) {
+            touchTask(task.id);
+            continue;
+          }
+          removeTask(task.id);
+        }
 
         if (active.length > 0 || keep.length > 0 || drop.length > 0) {
           changed = true;
@@ -2321,16 +2738,22 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           if (drop.length > 0) parts.push(`${drop.length} dropped`);
           autoNotes.push(`done: ${parts.join(",")}`);
         }
-      } else if (detectGenericCompletion(text)) {
+      } else if (genericDone) {
         const active = state.tasks.filter((t) => t.status === "in_progress");
-        if (active.length > 0) {
-          for (const task of active) {
-            markTaskStatus(task.id, "done", ctx);
-          }
+        let completed = 0;
+        for (const task of active) {
+          if (verificationPending(task)) continue;
+          markTaskStatus(task.id, "done", ctx);
+          completed++;
+        }
+        if (completed > 0) {
           changed = true;
-          autoNotes.push(`${active.length} done`);
+          autoNotes.push(`${completed} done`);
         }
       }
+
+      // Roll the execution lane forward as tasks complete.
+      if (promoteBacklog() > 0) changed = true;
 
       if (changed) {
         // Persistir ANTES de pintar: si updateUI lanza (ctx stale tras reload) el estado
@@ -2354,6 +2777,17 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         await writePlanFile(ctx.cwd);
         updateUI(ctx);
       }
+    }
+
+    // Spec review gate: force one continuation so the model keeps working on the
+    // unsatisfied requirements instead of accepting an incomplete result.
+    if (gate && !event?.continue && gateForced < 2) {
+      gateForced++;
+      ctx.ui.notify(`⛔ ${gate.gaps} requisitos sin cubrir`, "warning");
+      return {
+        entries: [{ type: "custom_message", customType: "plan-gap", content: gate.message, display: true }],
+        continue: true,
+      };
     }
     } catch (err) { logError("turn_end", err); /* stale ctx/reload */ }
   };
@@ -2410,6 +2844,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       for (const id of byEvidence.completedIds) {
         const task = state.tasks.find((t) => t.id === id);
         if (!task || task.status === "done") continue;
+        // Tool evidence completes a spec task only when the run also verified it.
+        if (verificationPending(task)) continue;
         touchTask(id);
         markTaskStatus(id, "done", ctx);
         completed++;
@@ -2418,6 +2854,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         changed = true;
         notes.push(`✓ ${completed} by tool evidence`);
       }
+      if (promoteBacklog() > 0) changed = true;
     }
 
     // Sólo una interrupción real justifica pausar lo que estaba en curso.
@@ -2497,14 +2934,22 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             return { content: [{ type: "text", text: "task_text is required for add action" }], details: {} };
           }
           const tier = params.tier ? toolValueToTier(params.tier) : undefined;
+          const lane = params.lane ? (params.lane as TaskLane) : undefined;
+          const reqs = parseReqs(params.reqs);
+          const checks = parseChecks(params.check);
           ensureTitle(params.task_text, ctx);
-          const task = addTask(params.task_text, "pending", undefined, tier);
+          const task = addTask(params.task_text, "pending", undefined, tier, {
+            ...(lane ? { lane } : {}),
+            ...(reqs.length ? { reqs, spec: requirementTextFor(reqs[0]) } : {}),
+            ...(checks.length ? { check: checks } : {}),
+          });
           updateUI(ctx);
           persistState();
           await writePlanFile(ctx.cwd);
           const tierNote = config.trimegisto && task.tier ? ` [${task.tier}]` : "";
+          const laneNote = task.lane && task.lane !== "active" ? ` (${task.lane})` : "";
           return {
-            content: [{ type: "text", text: `Added task #${task.ref}: ${task.text}${tierNote}` }],
+            content: [{ type: "text", text: `Added task #${task.ref}: ${task.text}${tierNote}${laneNote}` }],
             details: { task },
           };
         }
@@ -2523,13 +2968,52 @@ export function createPlanRuntime(pi: ExtensionAPI) {
               details: { notFound: String(params.task_id) },
             };
           }
+          // A spec task is never done on the model's word: it needs verification
+          // (plan_manager verify or a build/test command in the current run).
+          const unverified = targets.filter(
+            (t) => t.status !== "done" && verificationPending(t)
+          );
+          if (unverified.length > 0) {
+            const list = unverified
+              .map((t) => `#${t.ref} (${(t.check ?? ["verify"]).join(", ")})`)
+              .join("; ");
+            return {
+              content: [{
+                type: "text",
+                text: `Not verified: ${list}. Run the acceptance checks (build/tests) and record evidence with plan_manager verify task_id=<ref> notes="<evidence>" before completing.`,
+              }],
+              details: { unverified: unverified.map((t) => t.ref) },
+            };
+          }
           for (const target of targets) markTaskStatus(target.id, "done", ctx);
+          promoteBacklog();
           persistState();
           await writePlanFile(ctx.cwd);
           updateUI(ctx);
           return {
             content: [{ type: "text", text: targets.map((t) => `✓ #${t.ref} ${t.text}`).join("\n") }],
             details: { task: targets[0], tasks: targets },
+          };
+        }
+
+        case "verify": {
+          if (params.task_id === undefined || params.task_id === null || String(params.task_id).trim() === "") {
+            return { content: [{ type: "text", text: `task_id required for verify. Refs:\n${taskRefList()}` }], details: {} };
+          }
+          const task = resolveTaskIds(params.task_id)[0];
+          if (!task) {
+            return { content: [{ type: "text", text: `Task not found: ${String(params.task_id)}\nRefs:\n${taskRefList()}` }], details: { notFound: String(params.task_id) } };
+          }
+          task.verifiedAt = Date.now();
+          task.verifyNote = params.notes ? String(params.notes).slice(0, 300) : "verified";
+          task.everTouched = true;
+          promoteBacklog();
+          persistState();
+          await writePlanFile(ctx.cwd);
+          updateUI(ctx);
+          return {
+            content: [{ type: "text", text: `✎ verified #${task.ref} ${task.text} — ${task.verifyNote}` }],
+            details: { task },
           };
         }
 
@@ -2586,6 +3070,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
             const tier = toolValueToTier(params.tier);
             if (tier) updates.tier = tier;
           }
+          if (params.lane) updates.lane = params.lane as TaskLane;
+          if (params.reqs !== undefined) updates.reqs = parseReqs(params.reqs);
+          if (params.check !== undefined) updates.check = parseChecks(params.check);
           updateTask(task.id, updates);
           task.everTouched = true;
           persistState();
@@ -2615,6 +3102,127 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           };
         }
 
+        case "plan": {
+          const raw = typeof params.task_text === "string" ? params.task_text : "";
+          if (!raw.trim()) {
+            return { content: [{ type: "text", text: "task_text is required for plan (one task per line)" }], details: {} };
+          }
+          const lane = (params.lane as TaskLane) ?? "active";
+          const baseChecks = parseChecks(params.check);
+          // Hard cap so a pathological payload cannot explode the plan state.
+          const MAX_PLAN_LINES = 200;
+          const rawLines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+          const lines = rawLines.slice(0, MAX_PLAN_LINES);
+          const truncated = rawLines.length - lines.length;
+          const added: PlanTask[] = [];
+          for (const line of lines) {
+            const tagged = line.match(/^\[([^\]]+)\]\s*(.*)$/) ?? line.match(/^((?:R\d+[\s,;]*)+)[:：]\s*(.*)$/i);
+            let reqs = parseReqs(params.reqs);
+            let body = line;
+            if (tagged) {
+              reqs = [...new Set([...reqs, ...parseReqs(tagged[1])])];
+              body = (tagged[2] ?? "").trim() || line;
+            }
+            body = body.replace(/^\d+[.)]\s*/, "").replace(/^[-*+]\s*/, "").trim();
+            if (!body) continue;
+            const task = addTask(body, "pending", undefined, undefined, {
+              lane,
+              ...(reqs.length ? { reqs, spec: requirementTextFor(reqs[0]) } : {}),
+              ...(baseChecks.length ? { check: baseChecks } : {}),
+            });
+            added.push(task);
+          }
+          if (added.length === 0) {
+            return { content: [{ type: "text", text: "No tasks parsed from task_text." }], details: {} };
+          }
+          // Respect an explicit backlog/paused placement; only fill the active lane.
+          if (lane === "active") promoteBacklog();
+          persistState();
+          await writePlanFile(ctx.cwd);
+          updateUI(ctx);
+          return {
+            content: [{ type: "text", text: `+${added.length} tasks (${lane}): ${added.map((t) => `#${t.ref}`).join(", ")}${truncated > 0 ? ` (… ${truncated} lines ignored, cap ${MAX_PLAN_LINES})` : ""}` }],
+            details: { tasks: added, truncated },
+          };
+        }
+
+        case "coverage": {
+          const cov = computeCoverage(state.requirements, state.tasks);
+          const lines = [
+            `${cov.satisfied}/${cov.total} satisfied · ${cov.mapped}/${cov.total} mapped (${cov.percent}%)`,
+          ];
+          if (state.specs?.length) {
+            lines.push(`Specs: ${state.specs.map((s) => `${s.id} ${s.ref} (${s.requirementCount})`).join(", ")}`);
+          }
+          if (cov.unsatisfied.length > 0) {
+            lines.push("Unsatisfied:");
+            for (const r of cov.unsatisfied) {
+              const refs = state.tasks
+                .filter((t) => (t.reqs ?? []).includes(r.id))
+                .map((t) => `#${t.ref}`)
+                .join(", ");
+              lines.push(`- ${r.id}${r.anchor ? ` ${r.anchor}` : ""}. ${r.text}${refs ? ` (${refs})` : ""}`);
+            }
+          }
+          return { content: [{ type: "text", text: lines.join("\n") }], details: { coverage: cov } };
+        }
+
+        case "source": {
+          const rel = typeof params.task_text === "string" ? params.task_text.trim().replace(/^\.\//, "") : "";
+          if (!rel) {
+            return { content: [{ type: "text", text: "task_text is required for source (relative path)" }], details: {} };
+          }
+          if (rel.startsWith("/") || rel.includes("..")) {
+            return { content: [{ type: "text", text: `Refusing path outside the project: ${rel}` }], details: {} };
+          }
+          try {
+            const content = await readFile(join(ctx.cwd, rel), "utf-8");
+            const seeded = ingestSpec(content, "file", rel);
+            if (seeded === 0) {
+              return { content: [{ type: "text", text: `No new requirements in ${rel} (empty, too small, or already ingested).` }], details: {} };
+            }
+            promoteBacklog();
+            persistState();
+            await writePlanFile(ctx.cwd);
+            updateUI(ctx);
+            return { content: [{ type: "text", text: `+${seeded} requirements from ${rel}` }], details: { seeded } };
+          } catch (err) {
+            return { content: [{ type: "text", text: `Cannot read ${rel}: ${err instanceof Error ? err.message : String(err)}` }], details: {} };
+          }
+        }
+
+        case "forget": {
+          const selector =
+            (typeof params.task_text === "string" && params.task_text.trim()) ||
+            (params.task_id !== undefined && params.task_id !== null ? String(params.task_id).trim() : "");
+          if (!selector) {
+            const known = (state.specs ?? []).map((s) => `${s.id} ${s.ref}`).join(", ") || "none";
+            return { content: [{ type: "text", text: `task_text required for forget (source id or path). Sources: ${known}` }], details: {} };
+          }
+          const specs = state.specs ?? [];
+          const key = selector.replace(/^\.\//, "");
+          let removed = 0;
+          if (key.toLowerCase() === "all") {
+            for (const source of [...specs]) removed += retractSource(source);
+          } else {
+            const source = specs.find(
+              (s) => s.id.toLowerCase() === key.toLowerCase() || s.ref === key || s.ref === key.replace(/\\/g, "/")
+            );
+            if (!source) {
+              return { content: [{ type: "text", text: `Source not found: ${selector}` }], details: { notFound: selector } };
+            }
+            removed = retractSource(source);
+          }
+          promoteBacklog();
+          persistState();
+          await writePlanFile(ctx.cwd);
+          updateUI(ctx);
+          return {
+            content: [{ type: "text", text: `Forgot ${selector}: -${removed} requirements (and their tasks)` }],
+            details: { removed },
+          };
+        }
+
         case "list": {
           const total = state.tasks.length;
           const done = state.tasks.filter((t) => t.status === "done").length;
@@ -2638,7 +3246,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
                     if (took) timer = ` (${took})`;
                   }
                 }
-                return `${icon} #${t.ref}. ${t.text}${timer}${tier}`;
+                const lane = t.lane === "backlog" ? " [backlog]" : t.lane === "paused" ? " [paused]" : "";
+                return `${icon} #${t.ref}. ${t.text}${timer}${tier}${lane}`;
               }),
           ];
 
@@ -2650,7 +3259,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
         default:
           return {
-            content: [{ type: "text", text: `Unknown action: ${String(params?.action)}. Use add|complete|update|list|start|block|remove. Refs:\n${taskRefList()}` }],
+            content: [{ type: "text", text: `Unknown action: ${String(params?.action)}. Use add|plan|complete|verify|update|list|coverage|source|forget|start|block|remove. Refs:\n${taskRefList()}` }],
             details: {},
           };
       }
@@ -2662,6 +3271,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     taskCommand,
     shortcut,
     onSessionStart,
+    onInput,
     onBeforeAgentStart,
     onToolResult,
     onTurnEnd,

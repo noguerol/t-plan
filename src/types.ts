@@ -5,6 +5,28 @@ export type { Tier } from "./tiers.ts";
 
 export type TaskStatus = "pending" | "in_progress" | "done" | "blocked";
 
+/** Execution horizon of a task; `undefined` is treated as "active". */
+export type TaskLane = "active" | "backlog" | "paused";
+
+/** One origin of requirements: a referenced file or the user's structured prompt. */
+export interface SpecSource {
+  id: string;                        // "S1", "S2"… stable
+  kind: "file" | "prompt";
+  ref: string;                       // relative path, or "prompt"
+  title?: string;                    // first heading / first line
+  hash: string;                      // hashText(content)
+  addedAt: number;
+  requirementCount: number;
+}
+
+/** One atomic requirement extracted from a spec source. */
+export interface PlanRequirement {
+  id: string;                        // "R1", "R2"… stable
+  sourceId: string;                  // SpecSource.id
+  anchor?: string;                   // "§2 Auth" | "L42"
+  text: string;                      // atomic requirement text
+}
+
 export interface PlanTask {
   id: string;
   ref: number;             // Stable handle shown to the model (never renumbered).
@@ -20,6 +42,12 @@ export interface PlanTask {
   notes?: string;          // Optional notes
   parentId?: string;       // For subtasks
   tier?: Tier;             // Trimegisto tier assignment (t0/t1/t2/t3)
+  lane?: TaskLane;         // Execution horizon; undefined === "active"
+  reqs?: string[];         // Requirement ids this task covers, e.g. ["R2","R5"]
+  spec?: string;           // Literal spec/prompt excerpt this task implements
+  check?: string[];        // Acceptance/verification steps ("tests pass", …)
+  verifiedAt?: number;     // ms epoch, set by plan_manager verify
+  verifyNote?: string;     // Verification evidence recorded by the model
   everTouched?: boolean;   // True once a *per-task* detection path referenced it
                            // (explicit marker, tool evidence, fuzzy completion, manual
                            // edit). Never set in bulk: at plan-conclusion, untouched
@@ -67,6 +95,8 @@ export interface PlanState {
   showWidget: boolean;     // Show the TUI widget
   widgetPlacement: "aboveEditor" | "belowEditor";
   sessions?: PlanSession[];  // history of sessions that worked on the plan, persisted in the plan file
+  specs?: SpecSource[];         // spec/prompt sources ingested into this plan
+  requirements?: PlanRequirement[]; // atomic requirements extracted from those sources
 }
 
 export interface PlanConfig {
@@ -82,6 +112,9 @@ export interface PlanConfig {
   trimegisto: boolean;     // Trimegisto mode: classify tasks into t1/t2/t3 tiers
   showTimers: boolean;     // Show HH:MM:SS elapsed timers on in-progress tasks
   toolEvidence: boolean;   // Complete/advance tasks from real tool activity (paths touched)
+  specMemory: boolean;     // Detect/ingest specs + auto-seed backlog + [SPEC] context
+  specIngestFiles: boolean; // Ingest spec files merely referenced in a prompt (opt-in, default off)
+  specReviewGate: boolean; // Block premature "done" and unverified completion
   debug: boolean;          // Log swallowed errors to ~/.pi/agent/t-plan/debug.log
 }
 
@@ -98,6 +131,9 @@ export const DEFAULT_CONFIG: PlanConfig = {
   trimegisto: false,
   showTimers: true,
   toolEvidence: true,
+  specMemory: true,
+  specIngestFiles: false,
+  specReviewGate: true,
   debug: false,
 };
 
