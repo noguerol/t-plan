@@ -16,9 +16,10 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 
 ## What's new
 
+- **v1.8.0 — `/tplan` is one word, and it takes the task** — the command was renamed from `/t-plan` to `/tplan`, and the common case no longer needs a subcommand or an input dialog: `/tplan write the docs` appends the task to the pending list, persists the plan file and shows the pending list right away. `/tplan` with no text still toggles tracking, and every existing subcommand (`config`, `show`, `new`, `load`, `save`, `clear`, `purge`, `edit`, `on`/`off`) keeps working; `/tplan add <text>` disambiguates text that would collide with a subcommand name.
 - **v1.7.1 — the spec memory no longer eats your notes** — `extractRequirements` now requires **normative** content: a bullet must contain a modal/obligation verb (`MUST`, `must`, `debe`…), start with an action/imperative verb, carry a requirement id (`RF-1`, `REQ-3`…) or live under an explicit requirements/acceptance/scope heading. Bare paths, UUIDs, `key: value` notes, metric lines (`281 tests, 14/14 build`) and blockquotes are skipped, so project memory (`pi.md`), continuation briefs, ADRs, changelogs and findings logs decompose to **0 requirements** instead of 80. Referenced `.md`/`.txt` files are no longer read by default (new opt-in `📥 Ingest referenced specs`), and even then only when `isSpecDocument()` declares them a spec — the file that was polluted last time now passes through untouched. Requirements are the ledger; tasks are only seeded for the active window (5) and promoted as work completes, and a task's title is a derived short clause (the full text stays in `spec`). New `plan_manager forget` retracts a source, its requirements and the tasks that only covered them; sources/requirements are capped (newest 8 sources, 200 requirements) and the plan file now carries an `AUTO-GENERATED` header instead of silently discarding manual edits. 217 tests + `npm run verify` green.
 - **v1.7.0 — Spec-Driven Project Memory (memoria global de planificación)** — a long project that starts from a spec doc or a structured prompt no longer loses requirements to context decay. With `🧠 Spec memory` ON, t-plan detects the spec (keywords like `MUST`/`requirements`/`RF-1`, size/structure, or an explicitly-declared spec file when `📥 Ingest referenced specs` is ON), decomposes it **deterministically** into atomic requirements (`R1, R2…`, anchor, content hash, deduped and capped) and keeps them as a coverage ledger, auto-seeding tasks only for the active window. Each task carries its requirement trace (`reqs`), the literal spec excerpt (`spec`) and its acceptance checks (`check`), and lives in a **lane**: `active` (window of 5), `backlog` or `paused`, with rolling promotion as work completes. Every turn injects a `[SPEC]` coverage block (satisfied/mapped, gaps, gate). With `🛡️ Spec review gate` ON a spec task can never reach `done` unverified — `plan_manager verify` records the evidence (build/tests), and if the model tries to conclude while coverage < 100% t-plan blocks the drop and forces a bounded continuation. Specs/requirements and per-task memory round-trip through the plan file (`## 📋 Specs`, `## 🎯 Requirements`, `spec:`/`check:`/`verified:`), so the memory survives sessions, model switches and interruptions. New `plan_manager` actions `plan`/`coverage`/`source`/`forget`/`verify` and params `lane`/`reqs`/`check`. Contract: `docs/spec-plan-memory.md`.
-- **v1.4.0 — in-progress ≠ girando (liveness del widget)** — el widget sólo anima (spinner + ⏱ timer + color acento) una tarea `in_progress` cuando hay un run de agente activo o una tarea de agente viva; en caso contrario se muestra parada (`⏸`, muted, sin spinner ni timer) y cuenta como pendiente en la cabecera. Al arrancar/restaurar sesión, cualquier `in_progress` heredado del `plan_*.md` se aparca a `pending`. `plan_manager list` sigue mostrando el estado almacenado (`in_progress`) para el modelo; `/t-plan show` refleja la liveness (`⏸` si nadie la ejecuta).
+- **v1.4.0 — in-progress ≠ girando (liveness del widget)** — el widget sólo anima (spinner + ⏱ timer + color acento) una tarea `in_progress` cuando hay un run de agente activo o una tarea de agente viva; en caso contrario se muestra parada (`⏸`, muted, sin spinner ni timer) y cuenta como pendiente en la cabecera. Al arrancar/restaurar sesión, cualquier `in_progress` heredado del `plan_*.md` se aparca a `pending`. `plan_manager list` sigue mostrando el estado almacenado (`in_progress`) para el modelo; `/tplan show` refleja la liveness (`⏸` si nadie la ejecuta).
 - **v1.3.3 — smaller startup and text footprint** — trimmed the entrypoint's exposed metadata/descriptions and compressed the injected plan context, labels, notifications and menu text. Startup bundle 4,458 → 4,184 bytes (−6.1%); no change to command names/args, tool name/params/schema, config keys, persisted state or behavior.
 - **v1.3.2 — short task names survive across sessions** — task text shorter than 4 characters (`CI`, `v2`) was written to the plan file but silently dropped when a new session adopted it, because the file parser reused the model-prose noise filter (`text.length > 3`). That filter now defaults to 4 for prose detection and is relaxed to 1 when reading a plan file, so cross-session adoption is lossless for short tasks.
 - **v1.3.1 — concurrency guard hardened** — two edge cases in the shared-file guard: with Trimegisto mode enabled, the merged history of another session was computed but not written, because `displayState` was snapshotted before the merge; and a foreign write landing within ~1 ms of ours was missed by the `mtime + 1` tolerance. The merged history is now serialized in the same write, and any strictly newer `mtime` counts as a foreign write (our own write leaves it exactly equal, so no self-warnings). Both are covered by regression tests.
@@ -50,6 +51,7 @@ The model gets a `plan_manager` tool plus automatic plan-context injection, so i
 - **Parallel agent tracking** — tasks spawned for sub-agents are tracked and labeled per agent
 - **Trimegisto mode** — complexity-based tier assignment (t1/t2/t3) with availability-aware fallback to `active` (t0)
 - **Task timers** — live `HH:MM:SS` elapsed counter on in-progress tasks (configurable)
+- **Quick add** — `/tplan <task text>` adds a task and shows the pending list
 - **Manual task management** — `/task` command family for full control
 - **Session persistence** — state survives restarts and session switches; global preferences persist in `~/.pi/agent/t-plan/config.json`
 
@@ -94,7 +96,7 @@ pi remove git:github.com/noguerol/t-plan
 /task done 2
 ```
 
-The extension is enabled by default. Toggle it anytime with `/t-plan` or `Ctrl+Alt+P`.
+The extension is enabled by default. Add a task with `/tplan <task text>` and toggle tracking anytime with `/tplan` (no text) or `Ctrl+Alt+P`.
 
 ## The unified plan file
 
@@ -104,19 +106,19 @@ One plan file per project, maintained across sessions — no session id in the n
 <prefix>_<title-slug>.md      e.g. plan_myapp.md
 ```
 
-- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/t-plan new` (which also resets the task list) — custom titles stop being auto-overwritten. Renaming the title writes the plan under the new name and leaves the previous file on disk.
+- **Title** — auto-derived from the working directory name in the conversation's language (English: `myapp Plan`, Spanish: `Plan de myapp`, Mandarin: `myapp 计划`). Change it anytime with `/tplan new` (which also resets the task list) — custom titles stop being auto-overwritten. Renaming the title writes the plan under the new name and leaves the previous file on disk.
 - **One file, every session** — a new pi session in the same directory adopts the tasks already on disk and keeps writing the same file; resuming a session brings its plan back too. Two pi processes in one directory share the same plan instead of producing `plan_myapp_01a048c3.md` and `plan_myapp_01a0493a.md`.
 - **One writer at a time** — the unified file is last-write-wins. Work on a project from a single pi session at a time; a second concurrent session in the same directory can overwrite the first one's latest state on disk (each session still keeps its own plan state in the session log, so resuming it recovers that session's view).
 - **Concurrent sessions keep their session history** — if the unified file was modified by another pi session between our writes, t-plan merges that session's history into the `## 🗂 Sessions` section so no session record is lost. Task state remains last-write-wins and the merge is silent (it only shows up in the debug log).
 - **Sessions section** — the file includes a `## 🗂 Sessions` section (written before the footer) listing the pi sessions that worked on it (session id, first/last seen timestamps and an optional title), newest first, capped at the 20 most recent. The plan file therefore carries a short runtime history, not source.
 - **Private by design — never commit or publish plan files.** Plan files are runtime state, not source: t-plan keeps the pattern `<prefix>_*.md` (plus `plan.md` when the prefix is `plan`) in your `.gitignore` automatically — best-effort, and only inside a git working tree — and the model is explicitly instructed never to `git add`, commit, force-add or publish them. If you commit or share plan files, you leak session-internal state.
-- **Load a plan.** `/t-plan load` lists every plan file in the directory as `1. <title> · <n> tasks · <date>`, marking the current project file `← current` and old session-scoped files `(legacy)`. Picking one adopts its title, tasks and session history into the current session, and the extension then writes the unified file. Legacy candidates keep their session id as a hint — the extension still tells you how to jump back with `pi --session <id>`.
+- **Load a plan.** `/tplan load` lists every plan file in the directory as `1. <title> · <n> tasks · <date>`, marking the current project file `← current` and old session-scoped files `(legacy)`. Picking one adopts its title, tasks and session history into the current session, and the extension then writes the unified file. Legacy candidates keep their session id as a hint — the extension still tells you how to jump back with `pi --session <id>`.
 - **Legacy files are migrated, not duplicated.** A session-scoped `plan_<slug>_<session-id>.md` (or `plan_<slug>_noid.md`) is still detected and read; when it matches the current project title (or you load it), it is **renamed** to `plan_<slug>.md` and becomes *the* unified file (the most recently modified matching legacy file is adopted first).
-- **Purge** (`/t-plan purge`) deletes all tasks, resets the plan state and removes the project's plan file.
+- **Purge** (`/tplan purge`) deletes all tasks, resets the plan state and removes the project's plan file.
 
 ## Trimegisto Mode
 
-[Trimegisto](https://github.com/noguerol/trimegisto) turns pi into a multi-agent runtime with four tiers. With Trimegisto mode ON (`/t-plan config` → `Trimegisto mode`), t-plan applies trimegisto's own role separation — *"T1 plans, T2 solves, T3 executes"* — to every task:
+[Trimegisto](https://github.com/noguerol/trimegisto) turns pi into a multi-agent runtime with four tiers. With Trimegisto mode ON (`/tplan config` → `Trimegisto mode`), t-plan applies trimegisto's own role separation — *"T1 plans, T2 solves, T3 executes"* — to every task:
 
 | Tier | Badge | Complexity | Typical work |
 |------|-------|------------|--------------|
@@ -129,7 +131,7 @@ One plan file per project, maintained across sessions — no session id in the n
 - **Manual override** — `/task tier 3 t1` or the `tier` parameter of `plan_manager` (`"t0" | "t1" | "t2" | "t3" | "active"`).
 - **Availability-aware** — the extension reads `~/.pi/agent/trimegisto/config.json` and knows which tiers are actually spawnable (enabled + model configured, respecting `spawnOnlyOnActive`). Tasks assigned to an unavailable tier fall back to `t0` (`active`), so plans stay executable.
 - **LLM guidance** — the injected plan context lists each task's effective tier and instructs the model to launch tasks on their tier with the `trimegisto` tool, batching independent tasks in one call.
-- **Everywhere** — the widget shows colored `[tN]` badges plus a header distribution (`t1×1 t2×3 t3×2`), the plan file shows `(→ tN)` per task, and `/t-plan show` + `plan_manager list` show `→ tN`.
+- **Everywhere** — the widget shows colored `[tN]` badges plus a header distribution (`t1×1 t2×3 t3×2`), the plan file shows `(→ tN)` per task, and `/tplan show` + `plan_manager list` show `→ tN`.
 
 ## Spec-Driven Project Memory
 
@@ -161,27 +163,29 @@ Gate: do NOT conclude while coverage < 100%; the plan is the project memory.
 - **Review gate** — with `🛡️ Spec review gate` ON, a spec-derived task (one with `spec` or `check`) can never reach `done` until it is **verified**: `plan_manager verify` records `verifiedAt` plus the evidence note, or the run must contain a real build/test command. `plan_manager complete` on an unverified spec task is refused with its pending checks, and if the model tries to conclude while coverage is < 100% (or unverified spec tasks remain) t-plan forces it to continue instead of dropping them — so the model cannot declare the project finished early. Only work that compiles, passes its tests and matches the spec excerpt counts as done.
 - **Global project memory** — specs and requirements are serialized into the plan file (`## 📋 Specs`, `## 🎯 Requirements`, lane/`reqs` markers) and re-adopted on load, so traceability survives sessions, model switches and interruptions.
 
-New `plan_manager` actions support the flow: `plan` (bulk decomposition — one task per line, optional leading `[R1,R2]`/`R1:` and a `lane`), `coverage` (the coverage report plus unsatisfied requirements and their covering refs), `source` (ingest a file you name explicitly), `forget` (retract a source by id/path — removes it with its requirements and the tasks that only covered them) and `verify` (`task_id` + `notes` evidence). `add`/`update` accept the `lane`, `reqs` and `check` params. Toggle the feature with `🧠 Spec memory` and `🛡️ Spec review gate` in `/t-plan config`; turning `Spec memory` off only stops ingest/injection — existing specs, requirements and lanes are never deleted.
+New `plan_manager` actions support the flow: `plan` (bulk decomposition — one task per line, optional leading `[R1,R2]`/`R1:` and a `lane`), `coverage` (the coverage report plus unsatisfied requirements and their covering refs), `source` (ingest a file you name explicitly), `forget` (retract a source by id/path — removes it with its requirements and the tasks that only covered them) and `verify` (`task_id` + `notes` evidence). `add`/`update` accept the `lane`, `reqs` and `check` params. Toggle the feature with `🧠 Spec memory` and `🛡️ Spec review gate` in `/tplan config`; turning `Spec memory` off only stops ingest/injection — existing specs, requirements and lanes are never deleted.
 
 ## Task Timers
 
-Every in-progress task can show a live `HH:MM:SS` counter since it started (spinner, badge and timer all update in real time). Completed tasks record their total time in the plan file as `(took HH:MM:SS)`. Toggle with `/t-plan config` → `Task timers`.
+Every in-progress task can show a live `HH:MM:SS` counter since it started (spinner, badge and timer all update in real time). Completed tasks record their total time in the plan file as `(took HH:MM:SS)`. Toggle with `/tplan config` → `Task timers`.
 
 ## Commands
 
-### `/t-plan` — plan management
+### `/tplan` — plan management
 
 | Command | Description |
 |---------|-------------|
-| `/t-plan` | Toggle plan tracking on/off |
-| `/t-plan config` | Open the configuration menu |
-| `/t-plan on` / `/t-plan off` | Enable/disable tracking |
-| `/t-plan show` | Display current plan status |
-| `/t-plan new` | Create a new (empty) plan |
-| `/t-plan load` | List the project's plan files (legacy ones highlighted) and load one into the current session |
-| `/t-plan save` | Save tasks to the project's plan file |
-| `/t-plan clear` | Remove all tasks from the live plan (the plan file is left as-is) |
-| `/t-plan purge` | Delete all tasks, reset state and remove the project's plan file |
+| `/tplan <task text>` | Add a task to the pending list and show the pending list right away |
+| `/tplan add <task text>` | Same, for text that collides with a subcommand name |
+| `/tplan` | Toggle plan tracking on/off (no text) |
+| `/tplan config` | Open the configuration menu |
+| `/tplan on` / `/tplan off` | Enable/disable tracking |
+| `/tplan show` | Display current plan status |
+| `/tplan new` | Create a new (empty) plan |
+| `/tplan load` | List the project's plan files (legacy ones highlighted) and load one into the current session |
+| `/tplan save` | Save tasks to the project's plan file |
+| `/tplan clear` | Remove all tasks from the live plan (the plan file is left as-is) |
+| `/tplan purge` | Delete all tasks, reset state and remove the project's plan file |
 
 ### `/task` — manual task management
 
@@ -246,7 +250,7 @@ The widget is designed to stay compact and readable during long projects:
 
 ### Tareas en curso vs paradas (liveness)
 
-El widget sólo **anima** (spinner + ⏱ timer + color acento) una tarea en estado `in_progress` cuando hay un **run de agente activo** o una **tarea de agente viva**; si no, se muestra con `⏸` (muted, sin spinner ni timer) y **cuenta como pendiente** en la cabecera. Al arrancar una sesión, cualquier `in_progress` heredado del `plan_*.md` se **aparca a `pending`** (nadie está ejecutándolo), así que no quedan timers girando por trabajo de días anteriores. El estado almacenado no cambia (`plan_manager list` sigue mostrando `in_progress` para el modelo), pero `/t-plan show` refleja la liveness: `⏸` cuando nadie la ejecuta.
+El widget sólo **anima** (spinner + ⏱ timer + color acento) una tarea en estado `in_progress` cuando hay un **run de agente activo** o una **tarea de agente viva**; si no, se muestra con `⏸` (muted, sin spinner ni timer) y **cuenta como pendiente** en la cabecera. Al arrancar una sesión, cualquier `in_progress` heredado del `plan_*.md` se **aparca a `pending`** (nadie está ejecutándolo), así que no quedan timers girando por trabajo de días anteriores. El estado almacenado no cambia (`plan_manager list` sigue mostrando `in_progress` para el modelo), pero `/tplan show` refleja la liveness: `⏸` cuando nadie la ejecuta.
 
 ## The `plan_manager` Tool
 
@@ -304,11 +308,11 @@ The `## 🗂 Sessions` section is written after the last task group and before t
 
 Each task line carries its stable `#ref` (`#5. Initialize project structure`) so refs, statuses and the task history survive a reload and continue in the next session.
 
-Edit the file by hand if you like — `/t-plan load` parses it back, including the status-group sections, summary counters, stable refs, tier markers, timers and the session history.
+Edit the file by hand if you like — `/tplan load` parses it back, including the status-group sections, summary counters, stable refs, tier markers, timers and the session history.
 
 ## Configuration
 
-Open with `/t-plan config` — a settings dialog in pi's native style (`SettingsList`): one row per option, its current value on the right, and an explanation rendered under the list when the row is selected. `↑↓` navigate, `Enter`/`Space` change a value, `Esc` closes, and typing filters the list. Toggles cycle `on`/`off`; `Plan file prefix` and the actions open a submenu (actions show `—` until you enter them).
+Open with `/tplan config` — a settings dialog in pi's native style (`SettingsList`): one row per option, its current value on the right, and an explanation rendered under the list when the row is selected. `↑↓` navigate, `Enter`/`Space` change a value, `Esc` closes, and typing filters the list. Toggles cycle `on`/`off`; `Plan file prefix` and the actions open a submenu (actions show `—` until you enter them).
 
 | Option | Default | Description |
 |--------|---------|-------------|

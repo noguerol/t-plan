@@ -101,7 +101,7 @@ test("(1) 15 consecutive normal writes never emit a self-warning", async () => {
   }
 });
 
-// ── (2) the /t-plan load adopt path records the adopted file's mtime ────────────
+// ── (2) the /tplan load adopt path records the adopted file's mtime ────────────
 // After adopting a file, the next normal write must not consider it foreign.
 test("(2) after adopting a file via the load path, the next normal write does not warn", async () => {
   const h = await createHarness({ sessionId: "loadAdopt01" });

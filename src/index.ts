@@ -4,6 +4,7 @@ import { Key } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 
 const tPlanCompletions = [
+  { value: "add", label: "add", description: "Add task" },
   { value: "on", label: "on", description: "On" },
   { value: "off", label: "off", description: "Off" },
   { value: "config", label: "config", description: "Cfg" },
@@ -57,8 +58,8 @@ const completions = <T extends { value: string }>(items: T[], prefix: string) =>
 };
 
 export default function planExtension(pi: ExtensionAPI): void {
-  pi.registerCommand("t-plan", {
-    description: "Toggle",
+  pi.registerCommand("tplan", {
+    description: "Add task / toggle",
     handler: async (args: string | undefined, ctx: ExtensionContext) => (await runtime(pi)).tPlanCommand.handler(args, ctx),
     getArgumentCompletions: (prefix: string) => completions(tPlanCompletions, prefix),
   });

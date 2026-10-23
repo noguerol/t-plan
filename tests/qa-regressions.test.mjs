@@ -75,7 +75,7 @@ test("purge removes the unified project file and tolerates a missing one", async
   }
 });
 
-test("/t-plan load adopts a legacy file and migrates it to the unified name", async () => {
+test("/tplan load adopts a legacy file and migrates it to the unified name", async () => {
   const cwd = await projectDir("loadproj");
   await mkdir(cwd, { recursive: true });
   await writeFile(

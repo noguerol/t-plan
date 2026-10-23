@@ -16,7 +16,7 @@ const STUB = [
   'export const truncateToWidth = (s, w, e = "…") => (s.length > w ? s.slice(0, Math.max(1, w - 1)) + e : s);',
   'export const visibleWidth = (s) => [...String(s)].length;',
   'export const Key = { ctrlAlt: (k) => `ctrl+alt+${k}` };',
-  '// Minimal stand-ins for the settings dialog used by /t-plan config.',
+  '// Minimal stand-ins for the settings dialog used by /tplan config.',
   'class Container {',
   '  children = [];',
   '  addChild(c) { this.children.push(c); }',

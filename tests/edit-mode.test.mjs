@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHarness } from "./helpers/harness.mjs";
 
 /**
- * `/t-plan edit` fullscreen edit mode.
+ * `/tplan edit` fullscreen edit mode.
  *
  * The interactive loop drains `ctx.ui.custom.editCommands` and applies each
  * command through the same code path the editor's onSubmit would. We drive it

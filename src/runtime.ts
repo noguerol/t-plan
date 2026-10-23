@@ -1001,6 +1001,33 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         return;
       }
 
+      // `/tplan <texto>` añade la tarea y muestra la lista en ese momento. Se
+      // comprueba al final para no sombrear ningún subcomando; el prefijo
+      // explícito `add` existe para textos que colisionan con uno de ellos.
+      let taskText = args?.trim() ?? "";
+      if (taskText.split(/\s+/)[0]?.toLowerCase() === "add") {
+        taskText = taskText.slice(3).trim();
+        if (!taskText) {
+          ctx.ui.notify("usage: /tplan <task text>", "warning");
+          return;
+        }
+      }
+      if (taskText) {
+        if (!config.enabled) {
+          ctx.ui.notify("plan off — /tplan to enable", "warning");
+          return;
+        }
+        ensureTitle(taskText, ctx);
+        const task = addTask(taskText);
+        updateUI(ctx);
+        persistState();
+        await writePlanFile(ctx.cwd);
+        const tierNote = config.trimegisto && task.tier ? ` [${task.tier}]` : "";
+        ctx.ui.notify(`➕ #${task.ref}: ${task.text}${tierNote}`, "info");
+        showPendingStatus(ctx);
+        return;
+      }
+
       config.enabled = !config.enabled;
       state.enabled = config.enabled;
       ctx.ui.notify(`Plan ${config.enabled ? "ON" : "OFF"}`, "info");
@@ -1415,7 +1442,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         label: "📋 Plan tracking",
         currentValue: onOff(config.enabled),
         values: [ON, OFF],
-        description: "Enable or disable the whole extension: the widget, the plan_manager tool and plan detection. /t-plan alone flips the same flag.",
+        description: "Enable or disable the whole extension: the widget, the plan_manager tool and plan detection. /tplan alone flips the same flag.",
       },
       {
         id: "autoDetect",
@@ -1750,7 +1777,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   }
 
   /**
-   * Fullscreen edit mode for the plan, invoked via `/t-plan edit`.
+   * Fullscreen edit mode for the plan, invoked via `/tplan edit`.
    *
    * Two-pane alt-screen overlay:
    *   left  – task list (select / scroll / search)
@@ -2046,6 +2073,22 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
   }
 
+  function taskStatusLine(t: PlanTask): string {
+    const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? (isTaskLive(t) ? "🔄" : "⏸") : t.status === "blocked" ? "🚫" : "⏳";
+    const agent = t.agentName ? ` [${t.agentName}]` : "";
+    const tier = config.trimegisto ? ` → ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
+    let timer = "";
+    if (config.showTimers) {
+      if (isTaskLive(t) && t.startedAt) {
+        timer = ` ⏱ ${formatElapsed(Date.now() - t.startedAt)}`;
+      } else if (t.status === "done") {
+        const took = completedTimerText(t.startedAt, t.completedAt);
+        if (took) timer = ` (${took})`;
+      }
+    }
+    return `${icon} #${t.ref}. ${t.text}${timer}${tier}${agent}`;
+  }
+
   function showPlanStatus(ctx: ExtensionContext): void {
     if (state.tasks.length === 0) {
       ctx.ui.notify("Empty plan", "info");
@@ -2054,9 +2097,6 @@ export function createPlanRuntime(pi: ExtensionAPI) {
 
     const total = state.tasks.length;
     const done = state.tasks.filter((t) => t.status === "done").length;
-    const inProgress = state.tasks.filter((t) => t.status === "in_progress").length;
-    const pending = state.tasks.filter((t) => t.status === "pending").length;
-    const blocked = state.tasks.filter((t) => t.status === "blocked").length;
 
     const lines = [
       `${state.title}`,
@@ -2064,23 +2104,25 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       "",
       ...state.tasks
         .sort((a, b) => a.order - b.order)
-        .map((t) => {
-          const icon = t.status === "done" ? "✅" : t.status === "in_progress" ? (isTaskLive(t) ? "🔄" : "⏸") : t.status === "blocked" ? "🚫" : "⏳";
-          const agent = t.agentName ? ` [${t.agentName}]` : "";
-          const tier = config.trimegisto ? ` → ${resolveEffectiveTier(t.tier, tgConfig)}` : "";
-          let timer = "";
-          if (config.showTimers) {
-            if (isTaskLive(t) && t.startedAt) {
-              timer = ` ⏱ ${formatElapsed(Date.now() - t.startedAt)}`;
-            } else if (t.status === "done") {
-              const took = completedTimerText(t.startedAt, t.completedAt);
-              if (took) timer = ` (${took})`;
-            }
-          }
-          return `${icon} #${t.ref}. ${t.text}${timer}${tier}${agent}`;
-        }),
+        .map(taskStatusLine),
     ];
 
+    ctx.ui.notify(lines.join("\n"), "info");
+  }
+
+  // `/tplan <texto>` must leave the pending list in view, not a 40-task wall.
+  function showPendingStatus(ctx: ExtensionContext): void {
+    const pending = state.tasks.filter((t) => t.status !== "done").sort((a, b) => a.order - b.order);
+    if (pending.length === 0) {
+      ctx.ui.notify(`${state.title}\nNothing pending`, "info");
+      return;
+    }
+    const lines = [
+      state.title,
+      `${pending.length} ${pending.length === 1 ? "task" : "tasks"} pending`,
+      "",
+      ...pending.map(taskStatusLine),
+    ];
     ctx.ui.notify(lines.join("\n"), "info");
   }
 

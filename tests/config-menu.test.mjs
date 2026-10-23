@@ -1,5 +1,5 @@
 /**
- * The /t-plan config menu is now a SettingsList (pi's native settings pattern):
+ * The /tplan config menu is now a SettingsList (pi's native settings pattern):
  * one item per setting, with a `description` rendered under the list when the
  * item is selected, and a submenu for free-text options. These tests exercise
  * the real factory (real SettingsList from @earendil-works/pi-tui) headlessly.

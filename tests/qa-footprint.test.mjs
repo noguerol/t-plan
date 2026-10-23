@@ -225,7 +225,7 @@ test("(6) src/index.ts still registers 2 commands, 7 events, plan_manager + para
   const src = await readFile(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf-8");
 
   const required = {
-    "command t-plan": 'pi.registerCommand("t-plan"',
+    "command tplan": 'pi.registerCommand("tplan"',
     "command task": 'pi.registerCommand("task"',
     "event session_start": 'pi.on("session_start"',
     "event before_agent_start": 'pi.on("before_agent_start"',
