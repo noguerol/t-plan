@@ -3,7 +3,7 @@ import type { AgentMessage, AgentToolResult } from "@earendil-works/pi-agent-cor
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { getSettingsListTheme, getSelectListTheme } from "@earendil-works/pi-coding-agent";
-import { Container, truncateToWidth, type SettingItem, SettingsList, SelectList, Text, Editor, type EditorMenuEntry } from "@earendil-works/pi-tui";
+import { Container, truncateToWidth, matchesKey, type SettingItem, SettingsList, SelectList, Text, Editor } from "@earendil-works/pi-tui";
 import type { PlanTask, PlanState, PlanConfig, TaskStatus, Tier, PlanSession, SpecSource, PlanRequirement, TaskLane } from "./types.ts";
 import { DEFAULT_CONFIG, DEFAULT_STATE, SPINNER_FRAMES } from "./types.ts";
 import {
@@ -128,6 +128,26 @@ export function createPlanRuntime(pi: ExtensionAPI) {
   // Anti-loop guard for the spec review gate: at most two forced continuations
   // per run, reset in before_agent_start.
   let gateForced = 0;
+  // Auto-continue: while pending tasks remain the agent must keep working. The
+  // "idle" counter is the emergency brake: it only grows when a forced
+  // continuation produced NO tool activity and no change in the unfinished set
+  // (a model that just chats instead of working). Any real work resets it, so a
+  // long task is never cut short. A new user prompt resets everything.
+  const AUTO_CONTINUE_MAX_IDLE = 5;
+  let autoContinueIdle = 0;
+  let autoContinueSignature = "";
+  let autoContinueStalled = false;
+  let autoContinueSawWork = false;
+  // Set right before the settle fallback starts a run, so its before_agent_start
+  // does not wipe the brake (it is the same continuation, not a new request).
+  let autoContinueRestart = false;
+
+  function resetAutoContinueBrake(): void {
+    autoContinueIdle = 0;
+    autoContinueSignature = "";
+    autoContinueStalled = false;
+    autoContinueSawWork = false;
+  }
 
   // Source of the next prompt: pi's `input` event exposes `source`
   // ('interactive' | 'rpc' | 'extension') but `before_agent_start` does not.
@@ -1019,6 +1039,8 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         }
         ensureTitle(taskText, ctx);
         const task = addTask(taskText);
+        // User-authored: a model conclusion must never drop or auto-finalize it.
+        task.userAdded = true;
         updateUI(ctx);
         persistState();
         await writePlanFile(ctx.cwd);
@@ -1052,10 +1074,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           const input = await ctx.ui.input("Task description:", "");
           if (!input) return;
           ensureTitle(input, ctx);
-          addTask(input);
+          addTask(input).userAdded = true;
         } else {
           ensureTitle(text, ctx);
-          addTask(text);
+          addTask(text).userAdded = true;
         }
         ctx.ui.notify("Added", "info");
         updateUI(ctx);
@@ -1388,6 +1410,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         config.specReviewGate = on;
         ctx.ui.notify(on ? "Review gate ON: spec tasks must be verified before done" : "Review gate OFF", "info");
         break;
+      case "autoContinue":
+        config.autoContinue = on;
+        resetAutoContinueBrake();
+        ctx.ui.notify(on ? "Auto-continue ON: the agent takes the next pending task in plan order" : "Auto-continue OFF", "info");
+        break;
       case "debug":
         config.debug = on;
         ctx.ui.notify(on ? `Debug log ON: ${DEBUG_LOG_PATH}` : "Debug log OFF", "info");
@@ -1519,6 +1546,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       {
         id: "specReviewGate", label: "🛡️ Spec review gate", currentValue: onOff(config.specReviewGate), values: [ON, OFF],
         description: "A spec-derived task cannot be marked done until verified (build/tests) via plan_manager verify; and the project cannot be declared finished while coverage < 100%.",
+      },
+      {
+        id: "autoContinue", label: "▶️ Auto-continue pending tasks", currentValue: onOff(config.autoContinue), values: [ON, OFF],
+        description: "While tasks are pending the agent must keep working: at every turn/settle boundary it is sent to the next one in plan order — including tasks added while it was working. Esc stops it; it only pauses when the model does nothing at all for several continuations.",
       },
       {
         id: "debug", label: "🐛 Debug log", currentValue: onOff(config.debug), values: [ON, OFF],
@@ -1693,6 +1724,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         `${config.specMemory ? "✅" : "❌"} Spec memory: ${config.specMemory ? "ON" : "OFF"}`,
         `${config.specIngestFiles ? "✅" : "❌"} Ingest referenced specs: ${config.specIngestFiles ? "ON" : "OFF"}`,
         `${config.specReviewGate ? "✅" : "❌"} Spec review gate: ${config.specReviewGate ? "ON" : "OFF"}`,
+        `${config.autoContinue ? "✅" : "❌"} Auto-continue: ${config.autoContinue ? "ON" : "OFF"}`,
         `${config.debug ? "✅" : "❌"} Debug log: ${config.debug ? "ON" : "OFF"}`,
         `${config.animateWidget ? "✅" : "❌"} Animate: ${config.animateWidget ? "ON" : "OFF"}`,
         `${config.compactTaskLines ? "✅" : "❌"} Compact: ${config.compactTaskLines ? "ON" : "OFF"}`,
@@ -1717,6 +1749,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       else if (choice.includes("Spec memory")) await applyConfigChoice(ctx, "specMemory", config.specMemory ? OFF : ON);
       else if (choice.includes("Ingest referenced specs")) await applyConfigChoice(ctx, "specIngestFiles", config.specIngestFiles ? OFF : ON);
       else if (choice.includes("Spec review gate")) await applyConfigChoice(ctx, "specReviewGate", config.specReviewGate ? OFF : ON);
+      else if (choice.includes("Auto-continue")) await applyConfigChoice(ctx, "autoContinue", config.autoContinue ? OFF : ON);
       else if (choice.includes("Debug log")) await applyConfigChoice(ctx, "debug", config.debug ? OFF : ON);
       else if (choice.includes("Animate")) await applyConfigChoice(ctx, "animateWidget", config.animateWidget ? OFF : ON);
       else if (choice.includes("Compact")) await applyConfigChoice(ctx, "compactTaskLines", config.compactTaskLines ? OFF : ON);
@@ -1776,12 +1809,18 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     });
   }
 
+  // Selected row in the fullscreen editor: shared by the interactive component
+  // and the headless command replay, and the anchor for /edit /note /run /up
+  // /down /del.
+  let editSelectedIndex = 0;
+
   /**
    * Fullscreen edit mode for the plan, invoked via `/tplan edit`.
    *
-   * Two-pane alt-screen overlay:
-   *   left  – task list (select / scroll / search)
-   *   right – detail: edit title, add notes, delete, reorder, launch
+   * Renders the task list with the real pi-tui components (SelectList + Text +
+   * Editor): ↑↓ move the selection while the command line is empty, and the
+   * editor accepts the mini-language /edit /note /del /add /up /down /run.
+   * Esc closes.
    *
    * Headless fallback: when the UI has no render target (tests / CI), the user's
    * keystrokes are replayed as TUI commands so the mode is still exercisable.
@@ -1809,119 +1848,228 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     if (!custom || typeof custom !== "function") {
       const target = custom ?? (ctx.ui.custom = {});
       const queue = target.editCommands ?? [];
-      // Structural ops (/del, /up, /down) act on the selected task; default to
-      // the last task (bottom of the list), matching the interactive default.
-      target.editSelected = Math.max(0, state.tasks.length - 1);
+      // Every command acts on the selected task; default to the last one (the
+      // interactive default), matching where a fresh edit session lands.
+      editSelectedIndex = Math.max(0, state.tasks.length - 1);
+      target.editSelected = editSelectedIndex;
       for (const raw of queue) {
         const cmd = String(raw).trim();
         if (!cmd) continue;
-        if (cmd === "/cancel" || cmd.toLowerCase() === "exit") break;
-        await handleEditCommand(ctx, cmd);
+        target.editSelected = editSelectedIndex;
+        if (await handleEditCommand(ctx, cmd)) break;
       }
+      target.editSelected = editSelectedIndex;
+      persistState();
+      await writePlanFile(ctx.cwd);
+      updateUI(ctx);
       return;
     }
 
-    await custom(async (tui, theme, _kb, done) => {
-      const container = new Container({ direction: "vertical", gap: 0, expand: true });
+    await custom(async (tui: any, theme: any, _kb: any, done: (result?: unknown) => void) => {
+      // Theme conversion: `theme` is pi's Theme (fg/bg), while pi-tui's components
+      // want a SelectListTheme + EditorTheme. Building them here keeps the editor
+      // independent of the global theme singleton (rpc/print has none).
+      const fg = (token: string, text: string): string => {
+        try { return typeof theme?.fg === "function" ? theme.fg(token, text) : text; } catch { return text; }
+      };
+      const selectTheme = {
+        selectedPrefix: (text: string) => fg("accent", text),
+        selectedText: (text: string) => fg("accent", text),
+        description: (text: string) => fg("muted", text),
+        scrollInfo: (text: string) => fg("muted", text),
+        noMatch: (text: string) => fg("muted", text),
+      };
+      const editorTheme = {
+        borderColor: (text: string) => fg("borderMuted", text),
+        selectList: selectTheme,
+      };
 
-      const list = new SelectList(
-        sorted().map(listLabel),
-        Math.min(state.tasks.length, 12),
-        undefined,
-        () => {},
-        () => { done(undefined); },
-        { enableSearch: true }
-      );
-      // Structural ops (/del, /up, /down) act on the selected task; annotate/run
-      // ops act on the first task. Default selection = last item (bottom of the
-      // list), which is where a fresh editor lands after adding a task.
-      if (state.tasks.length > 0) list.selected = state.tasks.length - 1;
-      (ctx.ui.custom as any).editSelected = list.selected ?? 0;
+      // Fresh edit session: start on the last task (where new tasks land).
+      editSelectedIndex = Math.max(0, sorted().length - 1);
 
-      const detail = new Text({ expand: true, wrap: true });
-      const renderDetail = () => {
-        const sel = list.selected ?? 0;
-        const task = sorted()[sel];
+      let closed = false;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        done(undefined);
+      };
+
+      const container = new Container();
+      const header = new Text("");
+      const detail = new Text("");
+      const hint = new Text("", 1, 0);
+      // Inline sub-mode: /edit, /note and /add (without arguments) reuse the
+      // command line instead of opening ctx.ui.input, which would replace this
+      // fullscreen component with the main editor.
+      let pending: "edit" | "note" | "add" | null = null;
+      // Real Editor API: (tui, EditorTheme, { paddingX }). No `placeholder`,
+      // no `focus()`; the cursor is drawn when the TUI focuses this component.
+      const editor = new Editor(tui, editorTheme, { paddingX: 1 });
+
+      function items() {
+        return sorted().map((t) => ({ value: t.id, label: listLabel(t) }));
+      }
+
+      function selectedIndex(): number {
+        const id = list?.getSelectedItem()?.value;
+        const idx = id ? sorted().findIndex((t) => t.id === id) : -1;
+        return idx >= 0 ? idx : Math.max(0, Math.min(editSelectedIndex, sorted().length - 1));
+      }
+
+      function buildList(): SelectList {
+        const tasks = sorted();
+        const next = new SelectList(items(), Math.max(1, Math.min(tasks.length, 12)), selectTheme);
+        next.setSelectedIndex(Math.max(0, Math.min(editSelectedIndex, Math.max(0, tasks.length - 1))));
+        next.onSelectionChange = () => {
+          editSelectedIndex = selectedIndex();
+          renderDetail();
+          tui.requestRender();
+        };
+        next.onCancel = () => close();
+        return next;
+      }
+
+      let list = buildList();
+
+      function renderHeader(): void {
+        const count = state.tasks.length;
+        header.setText(fg("accent", `${state.title} — ${count} task${count === 1 ? "" : "s"} · edit mode`));
+      }
+
+      function renderHint(): void {
+        const task = selectedEditTask();
+        if (pending === "edit") {
+          hint.setText(fg("accent", `Editing text of #${task?.ref ?? "?"} — Enter saves · Esc cancels`));
+        } else if (pending === "note") {
+          hint.setText(fg("accent", `Editing notes of #${task?.ref ?? "?"} — Enter saves · Esc cancels`));
+        } else if (pending === "add") {
+          hint.setText(fg("accent", "New task — Enter adds · Esc cancels"));
+        } else {
+          hint.setText(fg("dim", "↑↓ select · Enter edits · /note /del /add <text> /up /down /run · Esc closes"));
+        }
+      }
+
+      function renderDetail(): void {
+        const task = sorted()[selectedIndex()];
         if (!task) {
-          detail.value = "No task selected.";
+          detail.setText(fg("muted", "No tasks yet. Type /add <text> to create one."));
           return;
         }
         const lines = [
-          `${statusIcon(task)} #${task.ref}${tierLabel(task)}`,
-          task.text,
-          "",
-          `Status: ${task.status}`,
-          task.notes ? `\nNotes:\n${task.notes}` : "",
-          "",
-          "Commands: /note /edit /run /up /down /del /add /cancel",
+          `${statusIcon(task)} #${task.ref}. ${task.text}${tierLabel(task)}`,
+          fg("muted", `Status: ${task.status}${task.lane && task.lane !== "active" ? ` · lane: ${task.lane}` : ""}`),
         ];
-        detail.value = lines.join("\n");
-      };
+        if (task.notes) lines.push("", fg("muted", "Notes:"), task.notes);
+        if (task.check?.length) lines.push("", fg("muted", `Checks: ${task.check.join(" | ")}`));
+        if (task.reqs?.length) lines.push(fg("muted", `Reqs: ${task.reqs.join(", ")}`));
+        detail.setText(lines.join("\n"));
+      }
 
-      const editor = new Editor(tui, theme, {
-        placeholder: "command… /up · /down · /del · /note · /edit · /run · /add <text> · /cancel",
-      });
+      function mount(): void {
+        container.clear();
+        container.addChild(header);
+        container.addChild(list);
+        container.addChild(detail);
+        container.addChild(hint);
+        container.addChild(editor);
+      }
+
+      function refresh(): void {
+        editSelectedIndex = Math.max(0, Math.min(editSelectedIndex, sorted().length - 1));
+        list = buildList();
+        mount();
+        renderHeader();
+        renderDetail();
+        renderHint();
+        tui.requestRender();
+      }
+
+      async function sync(): Promise<void> {
+        persistState();
+        await writePlanFile(ctx.cwd);
+        updateUI(ctx);
+        refresh();
+      }
+
       editor.onSubmit = async (value: string) => {
-        await handleEditCommand(ctx, value.trim());
-      };
+        const text = value.trim();
 
-      container.addChild(list);
-      container.addChild(detail);
-      container.addChild(editor);
-
-      const render = () => container.render(tui.terminal.columns);
-      render();
-      editor.focus();
-
-      // --- Command loop: process queued edit commands, keep UI live --------
-      // In interactive mode the queue is empty and we await the editor's
-      // onSubmit/escape; in headless/test mode the queue is drained here so the
-      // exact same code runs.
-      const queue = (ctx.ui.custom as any)?.editCommands ?? [];
-      let idx = 0;
-      let doneFlag = false;
-      const resolveDone = () => { if (!doneFlag) { doneFlag = true; done(undefined); } };
-
-      const loop = async () => {
-        while (!doneFlag) {
-          const labels = sorted().map(listLabel);
-          const selIdx = list.selected ?? 0;
-          list.setItems(labels);
-          list.selected = Math.min(selIdx, labels.length - 1);
-          (ctx.ui.custom as any).editSelected = list.selected;
-          renderDetail();
-          render();
-
-          const input = queue[idx++];
-          if (input === undefined) {
-            // No queued command: wait for the user to submit or cancel.
-            await new Promise<void>((resolve) => {
-              const onDone = () => { resolve(); resolveDone(); };
-              editor.onSubmit = async (value) => {
-                await handleEditCommand(ctx, value.trim());
-                resolve();
-              };
-              editor.onEscape = onDone;
-            });
-            continue;
+        if (pending) {
+          if (text === "/cancel" || text === "/exit") {
+            pending = null;
+            renderHint();
+            tui.requestRender();
+            return;
           }
-          const close = await handleEditCommand(ctx, String(input).trim());
-          if (close) { resolveDone(); break; }
+          const kind = pending;
+          pending = null;
+          const task = selectedEditTask();
+          if (kind === "add") addEditTask(ctx, text);
+          else if (kind === "edit" && task && text) updateTask(task.id, { text });
+          else if (kind === "note" && task) updateTask(task.id, { notes: text });
+          await sync();
+          return;
         }
+
+        // No-argument forms switch the command line into inline edit mode.
+        if (text === "/add" || text === "/edit" || text === "/note") {
+          pending = text.slice(1) as "edit" | "note" | "add";
+          const task = selectedEditTask();
+          if (pending === "edit") editor.setText(task?.text ?? "");
+          else if (pending === "note") editor.setText(task?.notes ?? "");
+          renderHint();
+          tui.requestRender();
+          return;
+        }
+
+        const closeRequested = await handleEditCommand(ctx, text);
+        if (closeRequested) { close(); return; }
+        await sync();
       };
 
-      // Kick off the loop. In headless/test mode it drains `queue`; in interactive
-      // mode the queue is empty and it awaits the editor's onSubmit/escape (the
-      // editor.onSubmit reassignment inside the await wires the real submit).
-      void loop();
+      mount();
+      renderHeader();
+      renderDetail();
+      renderHint();
 
       return {
-        render,
+        render: (width: number) => container.render(width),
         invalidate: () => container.invalidate(),
         handleInput: (data: string) => {
-          editor.handleInput?.(data);
+          // Esc cancels an inline edit, or closes the editor when idle.
+          if (data === "\x1b" || matchesKey(data, "escape")) {
+            if (pending) {
+              pending = null;
+              editor.setText("");
+              renderHint();
+              tui.requestRender();
+              return;
+            }
+            close();
+            return;
+          }
+          const empty = editor.getText().trim() === "";
+          if (empty && (matchesKey(data, "up") || matchesKey(data, "down"))) {
+            list.handleInput(data);
+            tui.requestRender();
+            return;
+          }
+          // Enter on the list opens the selected task text for editing.
+          if (empty && matchesKey(data, "enter")) {
+            const task = selectedEditTask();
+            if (task) {
+              pending = "edit";
+              editor.setText(task.text);
+              renderHint();
+              tui.requestRender();
+            }
+            return;
+          }
+          editor.handleInput(data);
           tui.requestRender();
         },
+        get focused() { return editor.focused; },
+        set focused(value: boolean) { editor.focused = value; },
       };
     });
   }
@@ -1938,57 +2086,63 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     if (lower === "/cancel" || lower === "exit") return true;
     if (lower === "/add") {
       const title = await ctx.ui.input("New task:", "");
-      if (title) { addTask(title); ctx.ui.notify(`+${title}`, "info"); updateUI(ctx); }
+      if (title) addEditTask(ctx, title);
       return false;
     }
     if (lower.startsWith("/add ")) {
-      addTask(input.slice(5).trim());
-      ctx.ui.notify("added", "info");
+      addEditTask(ctx, input.slice(5).trim());
       return false;
     }
     if (lower === "/up") {
-      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
-      const task = sortedForEdit()[idx];
+      const task = selectedEditTask();
       if (task && task.order > 1) {
         moveTask(task.id, task.order - 1);
         // Keep the selection on the moved task so repeated /up stacks upward.
-        (ctx.ui.custom as any).editSelected = sortedForEdit().findIndex((x) => x.id === task.id);
+        editSelectedIndex = sortedForEdit().findIndex((x) => x.id === task.id);
         ctx.ui.notify("↑", "info");
       }
       return false;
     }
     if (lower === "/down") {
-      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
-      const task = sortedForEdit()[idx];
+      const task = selectedEditTask();
       if (task && task.order < sortedForEdit().length) {
         moveTask(task.id, task.order + 1);
-        (ctx.ui.custom as any).editSelected = sortedForEdit().findIndex((x) => x.id === task.id);
+        editSelectedIndex = sortedForEdit().findIndex((x) => x.id === task.id);
         ctx.ui.notify("↓", "info");
       }
       return false;
     }
     if (lower === "/del" || lower === "/delete") {
-      const t = sortedForEdit();
-      const idx = (ctx.ui.custom as any)?.editSelected ?? 0;
-      const task = t[idx];
+      const tasks = sortedForEdit();
+      const idx = Math.max(0, Math.min(editSelectedIndex, tasks.length - 1));
+      const task = tasks[idx];
       if (task) {
         removeTask(task.id);
-        (ctx.ui.custom as any).editSelected = Math.min(idx, Math.max(0, t.length - 2));
+        editSelectedIndex = Math.min(idx, Math.max(0, tasks.length - 2));
         ctx.ui.notify("deleted", "info");
       }
       return false;
     }
+    if (lower.startsWith("/note ")) {
+      const task = selectedEditTask();
+      if (task) { updateTask(task.id, { notes: input.slice(6).trim() }); ctx.ui.notify("notes updated", "info"); }
+      return false;
+    }
     if (lower.startsWith("/note")) {
-      const t = sortedForEdit();
-      const task = t[0];
+      const task = selectedEditTask();
       const current = task?.notes ?? "";
       const note = await ctx.ui.input(`Notes #${task?.ref}:`, current);
       if (task && note !== undefined) { updateTask(task.id, { notes: note }); ctx.ui.notify("notes updated", "info"); }
       return false;
     }
+    if (lower.startsWith("/edit ")) {
+      const task = selectedEditTask();
+      const next = input.slice(6).trim();
+      if (task && next) { updateTask(task.id, { text: next }); ctx.ui.notify("edited", "info"); }
+      return false;
+    }
     if (lower.startsWith("/edit")) {
-      const t = sortedForEdit();
-      const task = t[0];
+      const task = selectedEditTask();
       if (task) {
         const next = await ctx.ui.input(`Edit #${task.ref}:`, task.text);
         if (next) { updateTask(task.id, { text: next }); ctx.ui.notify("edited", "info"); }
@@ -1996,20 +2150,37 @@ export function createPlanRuntime(pi: ExtensionAPI) {
       return false;
     }
     if (lower === "/run" || lower.startsWith("/run ")) {
-      const t = sortedForEdit();
-      const task = t[0] ?? t[(ctx.ui.custom as any)?.editSelected ?? 0];
+      const task = selectedEditTask();
       await launchTaskFromEdit(ctx, task);
-      return false;
+      return true; // the agent takes over: close the editor
     }
     // Bare number: select that ref.
     const numMatch = input.match(/^(\d+)$/);
     if (numMatch) {
       const ref = parseInt(numMatch[1], 10);
       const task = state.tasks.find((x) => x.ref === ref);
-      if (task) { (ctx.ui.custom as any).editSelected = task.order - 1; ctx.ui.notify(`selected #${ref}`, "info"); }
+      if (task) { editSelectedIndex = sortedForEdit().findIndex((x) => x.id === task.id); ctx.ui.notify(`selected #${ref}`, "info"); }
       return false;
     }
     return false;
+  }
+
+  /** The task under the edit cursor (/edit, /note, /run, /up, /down, /del). */
+  function selectedEditTask(): PlanTask | undefined {
+    const tasks = sortedForEdit();
+    if (tasks.length === 0) return undefined;
+    return tasks[Math.max(0, Math.min(editSelectedIndex, tasks.length - 1))];
+  }
+
+  /** /add: manual tasks are user intent (never auto-dropped) and get selected. */
+  function addEditTask(ctx: ExtensionContext, text: string): void {
+    const clean = text.trim();
+    if (!clean) return;
+    ensureTitle(clean, ctx);
+    const task = addTask(clean);
+    task.userAdded = true;
+    editSelectedIndex = sortedForEdit().findIndex((t) => t.id === task.id);
+    ctx.ui.notify(`+${clean}`, "info");
   }
 
   function sortedForEdit(): PlanTask[] {
@@ -2027,20 +2198,6 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     const ref = task.ref;
     const msg = task.notes ? `/t-run ${ref}\n\nNotes:\n${task.notes}` : `/t-run ${ref}`;
     await ctx.ui.sendUserMessage(msg);
-  }
-
-  function editMenuEntries(ctx: ExtensionContext): EditorMenuEntry[] {
-    const entries: EditorMenuEntry[] = [
-      { label: "/add", description: "add task" },
-      { label: "/note", description: "edit notes" },
-      { label: "/edit", description: "edit title" },
-      { label: "/run", description: "launch (stop current)" },
-      { label: "/up", description: "move up" },
-      { label: "/down", description: "move down" },
-      { label: "/del", description: "delete" },
-      { label: "/cancel", description: "exit" },
-    ];
-    return entries;
   }
 
   async function showReorderUI(ctx: ExtensionContext): Promise<void> {
@@ -2430,8 +2587,11 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     lastStopReason = undefined;
     lastAssistantText = "";
     // Consume the input-event mark before anything may return early.
-    const injectedPrompt = extensionPromptPending;
+    // A queued queue-restart is a synthetic prompt too: it must not seed spec
+    // memory and it must not reset the auto-continue brake (same continuation).
+    const injectedPrompt = extensionPromptPending || autoContinueRestart;
     extensionPromptPending = false;
+    autoContinueRestart = false;
 
     if (!config.enabled) return;
 
@@ -2446,6 +2606,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     // docs once (hash-deduped) into the requirements ledger, then lift as many
     // requirements as the active window allows into tasks.
     gateForced = 0;
+    // A fresh user request owns the run again: the auto-continue brake resets.
+    // The one exception is the settle fallback restarting the queue (handled
+    // above): that is the same continuation, so the brake must survive.
+    if (!injectedPrompt) resetAutoContinueBrake();
     // Extension-injected prompts (autocritique directive & co.) are not user
     // specs: never decompose them into requirements/tasks.
     if (config.specMemory && !injectedPrompt) {
@@ -2550,6 +2714,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         }
       }
 
+      if (config.autoContinue && pending.length > 0) {
+        planContext += "Queue: pending tasks are executed IN ORDER. After finishing one, start the next pending task without waiting for the user.\n";
+      }
       planContext += "Rules: before ending the turn, plan_manager complete task_id=<ref> for EVERY finished task (accepts \"2,3\" or text). Plan changed => add/remove/update; starting => plan_manager start or name it. Auto-tracking uses touched files/commands.\n";
 
       return {
@@ -2569,6 +2736,9 @@ export function createPlanRuntime(pi: ExtensionAPI) {
    */
   const onToolResult = async (event: any, _ctx: ExtensionContext) => {
     try {
+      // Any tool call (plan_manager included) proves the agent is working, so the
+      // auto-continue brake must not count that round as idle.
+      if (config.enabled && config.autoContinue && event?.toolName) autoContinueSawWork = true;
       if (!config.enabled || !config.toolEvidence) return;
       if (!event?.toolName || event.toolName === "plan_manager") return;
       recordToolEvidence(evidence, event.toolName, event.input, event.isError === true);
@@ -2755,16 +2925,29 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         // "Tocada" = referenced by a marker, by tool evidence, by fuzzy completion or
         // edited by hand. Las que nadie tocó se descartan (intención original); las que
         // siguen declaradas pendientes se conservan como pendientes.
-        const keep = leftover.filter(
+        // Tasks the USER added with /tplan or /task are the execution queue, not
+        // the model's own proposal: a conclusion never drops them and never marks
+        // them done on prose alone. Only explicit completion or real tool evidence
+        // closes them; otherwise they stay pending for the auto-continue step.
+        const userLeftover = leftover.filter((t) => t.userAdded);
+        const modelLeftover = leftover.filter((t) => !t.userAdded);
+        const keep = modelLeftover.filter(
           (t) => (t.everTouched || withEvidence.has(t.id)) && !mentionedPending.includes(t.id)
         );
-        const hold = leftover.filter((t) => mentionedPending.includes(t.id));
-        const drop = leftover.filter(
+        const hold = modelLeftover.filter((t) => mentionedPending.includes(t.id));
+        const drop = modelLeftover.filter(
           (t) => !t.everTouched && !withEvidence.has(t.id) && !mentionedPending.includes(t.id)
         );
+        const userCompleted = userLeftover.filter(
+          (t) => withEvidence.has(t.id) && !verificationPending(t)
+        );
 
-        for (const task of active) {
-          if (verificationPending(task)) continue;
+        const completedActive = active.filter(
+          (t) => !verificationPending(t) && !(t.userAdded && !withEvidence.has(t.id))
+        );
+        for (const task of completedActive) markTaskStatus(task.id, "done", ctx);
+        for (const task of userCompleted) {
+          touchTask(task.id);
           markTaskStatus(task.id, "done", ctx);
         }
         for (const task of keep) {
@@ -2782,10 +2965,15 @@ export function createPlanRuntime(pi: ExtensionAPI) {
           removeTask(task.id);
         }
 
-        if (active.length > 0 || keep.length > 0 || drop.length > 0) {
+        if (userCompleted.length > 0 || completedActive.length > 0 || keep.length > 0 || drop.length > 0) {
           changed = true;
+        }
+        if (userLeftover.length - userCompleted.length > 0) {
+          autoNotes.push(`⏳ ${userLeftover.length - userCompleted.length} user pending`);
+        }
+        if (completedActive.length > 0 || keep.length > 0 || drop.length > 0) {
           const parts: string[] = [];
-          if (active.length > 0) parts.push(`${active.length} completed`);
+          if (completedActive.length > 0) parts.push(`${completedActive.length} completed`);
           if (keep.length > 0) parts.push(`${keep.length} finalized`);
           if (drop.length > 0) parts.push(`${drop.length} dropped`);
           autoNotes.push(`done: ${parts.join(",")}`);
@@ -2841,7 +3029,113 @@ export function createPlanRuntime(pi: ExtensionAPI) {
         continue: true,
       };
     }
+
+    // Queue enforcement at the turn boundary: the model ended a text-only turn
+    // while work remains. Continue right here instead of relying on the settle
+    // path, which some runs skip (refused boundary, tool-agnostic stops, errors).
+    if (!event?.continue) {
+      const hadToolCalls =
+        (event?.toolResults?.length ?? 0) > 0 ||
+        (Array.isArray(message.content) && message.content.some((block: any) => block?.type === "toolCall"));
+      const stop = message.stopReason;
+      if (!hadToolCalls && stop !== "aborted" && stop !== "error") {
+        const payload = autoContinuePayload(ctx);
+        if (payload) return payload;
+      }
+    }
     } catch (err) { logError("turn_end", err); /* stale ctx/reload */ }
+  };
+
+  /**
+   * The tasks the agent should be executing next, in plan order: pending or
+   * in_progress, active lane only (backlog/paused wait for promotion), and never
+   * a sub-agent task (trimegisto has its own lifecycle for those).
+   */
+  function executableQueue(): PlanTask[] {
+    return state.tasks
+      .filter((t) => t.status === "pending" || t.status === "in_progress")
+      .filter((t) => !t.agentId)
+      .filter((t) => !(config.specMemory && (t.lane === "backlog" || t.lane === "paused")))
+      .sort((a, b) => a.order - b.order);
+  }
+
+  /** The directive that sends the agent to the next executable task. */
+  function autoContinueMessage(queue: PlanTask[]): string {
+    const next = queue[0];
+    const list = queue.slice(0, 12).map((t) => `#${t.ref}. ${t.text}`).join("\n");
+    return [
+      "[PLAN] Pending tasks remain — do not stop.",
+      `Next in plan order: #${next.ref}. ${next.text}`,
+      `Start it now (plan_manager start task_id=${next.ref}), do the work, run its checks, and call plan_manager complete task_id=${next.ref} when it is really finished.`,
+      "Then continue immediately with the next pending task, in plan order, until none remain. Do not ask for confirmation.",
+      'Do not mark a task blocked just to stop: blocked is only for work that truly needs the user, with the reason in notes. Never leave a task in_progress.',
+      "",
+      "Queue:",
+      list,
+    ].join("\n");
+  }
+
+  /**
+   * Decides whether the agent must be sent back to the queue. Shared by the
+   * turn boundary (early enforcement) and `agent_before_settle` (final guard).
+   * Returns a boundary payload, or undefined when there is nothing to continue.
+   */
+  function autoContinuePayload(ctx: ExtensionContext): { entries: any[]; continue: true } | undefined {
+    if (!config.enabled || !config.autoContinue || disposed) return;
+
+    const queue = executableQueue();
+    if (queue.length === 0) {
+      resetAutoContinueBrake();
+      return;
+    }
+
+    const signature = queue.map((t) => t.ref).join(",");
+    const progressed = autoContinueSawWork || signature !== autoContinueSignature;
+    if (progressed) {
+      autoContinueIdle = 0;
+      autoContinueStalled = false;
+    } else {
+      autoContinueIdle++;
+    }
+    autoContinueSignature = signature;
+    autoContinueSawWork = false;
+
+    if (autoContinueIdle >= AUTO_CONTINUE_MAX_IDLE) {
+      autoContinueStalled = true;
+      const stuck = queue[0];
+      ctx.ui.notify(
+        `⏹ auto-continue paused: no work on #${stuck.ref} after ${AUTO_CONTINUE_MAX_IDLE} continuations (Esc to stop, /task block ${stuck.ref} to park it)`,
+        "warning"
+      );
+      return;
+    }
+
+    updateUI(ctx);
+    ctx.ui.notify(`▶ #${queue[0].ref} ${queue[0].text}`, "info");
+    return {
+      entries: [{ type: "custom_message", customType: "plan-next", content: autoContinueMessage(queue), display: true }],
+      continue: true,
+    };
+  }
+
+  /**
+   * `agent_before_settle` is the last actionable boundary: if the run is about to
+   * end and the plan still has work, send the agent back with the next task. This
+   * is what makes a task added while the agent is busy (or any task left pending)
+   * get picked up instead of being parked until the user writes again.
+   */
+  const onAgentBeforeSettle = async (event: any, ctx: ExtensionContext) => {
+    try {
+    // Another handler already forced a continuation (e.g. the spec gate): let it.
+    if (event?.continue) return;
+    // A user abort (Esc) is the only stop we never override; errors are retried,
+    // because the user asked for pending work to be completed, period.
+    if (event?.outcome === "aborted") {
+      resetAutoContinueBrake();
+      return;
+    }
+    return autoContinuePayload(ctx);
+    } catch (err) { logError("agent_before_settle", err); }
   };
 
   const onAgentEnd = async (_event: unknown, ctx: ExtensionContext) => {
@@ -2868,7 +3162,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     return false;
   }
 
-  const onAgentSettled = async (_event: unknown, ctx: ExtensionContext) => {
+  const onAgentSettled = async (event: any, ctx: ExtensionContext) => {
     try {
     // El run ha terminado (o se ha abortado): bajar la liveness cuanto antes para
     // que cualquier updateUI posterior pinte paradas —no girando— las in_progress
@@ -2880,7 +3174,10 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     // agent_settled se emite en un `finally` tras CUALQUIER run (éxito, aborto o error).
     // Degradar in_progress → pending incondicionalmente devolvía a pendientes tareas
     // que el agente acababa de completar en cada ejecución normal.
-    const interrupted = lastStopReason === "aborted" || lastStopReason === "error";
+    // `event.aborted` covers aborts that never produced an assistant turn (no
+    // lastStopReason), so a user Esc can never be overridden by the queue fallback.
+    const aborted = event?.aborted === true || lastStopReason === "aborted";
+    const interrupted = aborted || lastStopReason === "error";
     const mentionedPending = detectPendingMentions(lastAssistantText, state.tasks);
     let changed = false;
     const notes: string[] = [];
@@ -2946,6 +3243,27 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     }
     updateUI(ctx);
     if (notes.length > 0) ctx.ui.notify(notes.join(" • "), "info");
+
+    // Last-resort queue enforcement: the run is fully settling while tasks remain
+    // and the boundary could not continue (refused continuation, handler error,
+    // other extension consuming it). Start a fresh run from the settled state;
+    // an explicit abort (Esc) is the only stop we never override.
+    const queue = executableQueue();
+    if (
+      config.autoContinue &&
+      !aborted &&
+      !autoContinueStalled &&
+      queue.length > 0 &&
+      typeof (api as any).sendUserMessage === "function"
+    ) {
+      autoContinueRestart = true;
+      autoContinueSawWork = false;
+      ctx.ui.notify(`↻ resume #${queue[0].ref} ${queue[0].text}`, "info");
+      (api as any).sendUserMessage(autoContinueMessage(queue));
+    } else if (!autoContinueStalled) {
+      // Run ended for good: the next boundary starts clean.
+      resetAutoContinueBrake();
+    }
     lastStopReason = undefined;
     } catch (err) { logError("agent_settled", err); }
   };
@@ -3341,6 +3659,7 @@ export function createPlanRuntime(pi: ExtensionAPI) {
     onBeforeAgentStart,
     onToolResult,
     onTurnEnd,
+    onAgentBeforeSettle,
     onAgentEnd,
     onAgentSettled,
     onSessionShutdown,

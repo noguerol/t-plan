@@ -142,7 +142,7 @@ test("(1b) an explicit planFilePrefix wins over the legacy planFileName", async 
 
 // ───────────────────────────── (2) config surface ───────────────────────────────
 test("(2) DEFAULT_CONFIG has exactly the documented keys", () => {
-  // README "Configuration" table (16 options) -> PlanConfig in src/types.ts.
+  // README "Configuration" table (17 options) -> PlanConfig in src/types.ts.
   const documented = [
     "enabled",
     "autoDetect",
@@ -159,6 +159,7 @@ test("(2) DEFAULT_CONFIG has exactly the documented keys", () => {
     "specMemory",
     "specIngestFiles",
     "specReviewGate",
+    "autoContinue",
     "debug",
   ].sort();
 

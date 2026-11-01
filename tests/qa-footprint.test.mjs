@@ -221,7 +221,7 @@ test("(5) ensurePlanFileGitIgnored writes a 'plan_*.md' pattern line", async () 
 });
 
 // ── (6) the registered contract in src/index.ts is intact ──────────────────────
-test("(6) src/index.ts still registers 2 commands, 7 events, plan_manager + params", async () => {
+test("(6) src/index.ts still registers 2 commands, 8 events, plan_manager + params", async () => {
   const src = await readFile(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf-8");
 
   const required = {
@@ -231,6 +231,7 @@ test("(6) src/index.ts still registers 2 commands, 7 events, plan_manager + para
     "event before_agent_start": 'pi.on("before_agent_start"',
     "event tool_result": 'pi.on("tool_result"',
     "event turn_end": 'pi.on("turn_end"',
+    "event agent_before_settle": 'pi.on("agent_before_settle"',
     "event agent_end": 'pi.on("agent_end"',
     "event agent_settled": 'pi.on("agent_settled"',
     "event session_shutdown": 'pi.on("session_shutdown"',

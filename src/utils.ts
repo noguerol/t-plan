@@ -169,13 +169,14 @@ export function extractPlanTasks(text: string, options: { minLength?: number } =
 
     // Indented continuation lines belong to the task above (spec excerpt, checks,
     // verification evidence) and are never tasks themselves.
-    const metaMatch = line.match(/^\s{2,}[-*]\s+(spec|check|verified)\s*[:：]\s*(.+)$/i);
+    const metaMatch = line.match(/^\s{2,}[-*]\s+(spec|check|verified|user)\s*[:：]\s*(.+)$/i);
     if (metaMatch && tasks.length > 0) {
       const prev = tasks[tasks.length - 1];
       const key = metaMatch[1].toLowerCase();
       const value = metaMatch[2].trim();
       if (key === "spec") prev.spec = value.slice(0, 400);
       else if (key === "check") prev.check = value.split(/\s*\|\s*/).map((s) => s.trim()).filter(Boolean);
+      else if (key === "user") prev.userAdded = /^(true|yes|1)$/i.test(value);
       else if (key === "verified") {
         const m = value.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s*(?:—|-)\s*(.*)$/);
         if (m) {
@@ -489,6 +490,7 @@ export function generatePlanMarkdown(state: PlanState, options: PlanMarkdownOpti
   // acceptance checks and the recorded verification evidence.
   const metaLines = (task: PlanTask): string[] => {
     const out: string[] = [];
+    if (task.userAdded) out.push("  - user: true");
     if (task.spec) out.push(`  - spec: ${task.spec}`);
     if (task.check && task.check.length > 0) out.push(`  - check: ${task.check.join(" | ")}`);
     if (task.verifiedAt) {
@@ -1226,7 +1228,9 @@ export function reconcilePlanTasks(
   for (const task of [...current].sort((a, b) => a.order - b.order)) {
     if (matchedCurrent.has(task.id)) continue;
 
-    if (options.removeMissing && task.status !== "done") {
+    // A task the user added is their intent, not the model's proposal: republishing
+    // a plan that omits it must not erase it (only the user removes it).
+    if (options.removeMissing && task.status !== "done" && !task.userAdded) {
       removed++;
       continue;
     }
@@ -1253,7 +1257,8 @@ const TASK_REMOVAL_PATTERN = /\b(?:discard(?:ed|ing)?|drop(?:ped|ping)?|delete(?
 export function detectRemovedTasks(text: string, tasks: PlanTask[], excludeIds: string[] = []): string[] {
   const removedIds: string[] = [];
   const skip = new Set(excludeIds);
-  const removable = tasks.filter((t) => t.status !== "done" && !skip.has(t.id));
+  // Never auto-remove a task the user added; /task remove is the explicit path.
+  const removable = tasks.filter((t) => t.status !== "done" && !skip.has(t.id) && !t.userAdded);
   if (removable.length === 0) return removedIds;
 
   for (const segment of splitSegments(text)) {

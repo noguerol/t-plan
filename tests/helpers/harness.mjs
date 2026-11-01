@@ -28,6 +28,8 @@ export async function createHarness(options = {}) {
 
   const pi = {
     appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
+    // Used by the agent_settled queue fallback; the harness only records it.
+    sendUserMessage: (content) => sendUserMessageCalls.push(content),
   };
 
   const ctx = {
@@ -106,7 +108,7 @@ export async function createHarness(options = {}) {
   }
 
   async function turnEnd(text, stopReason = "stop", toolResults = []) {
-    await rt.onTurnEnd(
+    return rt.onTurnEnd(
       {
         type: "turn_end",
         turnIndex: 1,
@@ -122,8 +124,16 @@ export async function createHarness(options = {}) {
     );
   }
 
-  async function settle() {
-    await rt.onAgentSettled({ type: "agent_settled" }, ctx);
+  async function settle(aborted = false) {
+    await rt.onAgentSettled({ type: "agent_settled", aborted }, ctx);
+  }
+
+  /** Final actionable boundary: outcome "completed" | "aborted" | "error". */
+  async function beforeSettle(outcome = "completed", extra = {}) {
+    return rt.onAgentBeforeSettle(
+      { type: "agent_before_settle", outcome, entries: [], continue: false, context: {}, ...extra },
+      ctx
+    );
   }
 
   async function planFile() {
@@ -156,5 +166,5 @@ export async function createHarness(options = {}) {
     if (!reuseCwd) await rm(cwd, { recursive: true, force: true });
   }
 
-  return { rt, ctx, pi, entries, notes, inputCalls, sendUserMessageCalls, abortCalls, editCommands, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, planFile, planFiles, stop, cleanup, get uiInput() { return harnessState.uiInput; }, set uiInput(v) { harnessState.uiInput = v; } };
+  return { rt, ctx, pi, entries, notes, inputCalls, sendUserMessageCalls, abortCalls, editCommands, widgets, cwd, sessionId, tool, addTasks, plan, statusByRef, runStart, toolResult, turnEnd, settle, beforeSettle, planFile, planFiles, stop, cleanup, get uiInput() { return harnessState.uiInput; }, set uiInput(v) { harnessState.uiInput = v; } };
 }

@@ -17,6 +17,7 @@ await ensurePeers();
 const CONFIG_KEYS = [
   "enabled", "autoDetect", "showWidget", "widgetPlacement", "planFilePrefix",
   "trackAgents", "trimegisto", "showTimers", "toolEvidence", "debug",
+  "specMemory", "specIngestFiles", "specReviewGate", "autoContinue",
   "animateWidget", "compactTaskLines", "highlightCompleted",
 ];
 
@@ -72,7 +73,7 @@ test("currentValue of each item reflects the live config", async () => {
   try {
     const items = h.rt.configItems();
     const onOff = (v) => (v ? "on" : "off");
-    for (const key of ["enabled", "autoDetect", "showWidget", "trackAgents", "trimegisto", "showTimers", "toolEvidence", "debug", "animateWidget", "compactTaskLines", "highlightCompleted"]) {
+    for (const key of ["enabled", "autoDetect", "showWidget", "trackAgents", "trimegisto", "showTimers", "toolEvidence", "debug", "specMemory", "specIngestFiles", "specReviewGate", "autoContinue", "animateWidget", "compactTaskLines", "highlightCompleted"]) {
       const item = itemById(items, key);
       assert.ok(item.values?.length === 2, `${key} must offer exactly two values`);
       assert.ok(item.values.includes("on") && item.values.includes("off"), `${key} values must be on/off`);

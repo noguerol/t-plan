@@ -255,6 +255,8 @@ test("the review gate is bounded and never drops spec tasks across conclusions",
   const h = await createHarness({ sessionId: "specmem013" });
   try {
     await seed(h);
+    // Isolate the gate: the queue enforcement (auto-continue) is tested separately.
+    h.rt.getConfig().autoContinue = false;
     const before = h.rt.getState().tasks.length;
     const r1 = await h.rt.onTurnEnd(assistantMsg("All done, everything is complete."), h.ctx);
     assert.equal(r1?.continue, true, "first premature conclusion must force a continuation");

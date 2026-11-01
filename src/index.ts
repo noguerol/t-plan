@@ -82,6 +82,7 @@ export default function planExtension(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event, ctx) => (await runtime(pi)).onBeforeAgentStart(event, ctx));
   pi.on("tool_result", async (event, ctx) => (await runtime(pi)).onToolResult(event, ctx));
   pi.on("turn_end", async (event, ctx) => (await runtime(pi)).onTurnEnd(event, ctx));
+  pi.on("agent_before_settle", async (event, ctx) => (await runtime(pi)).onAgentBeforeSettle(event, ctx));
   pi.on("agent_end", async (event, ctx) => (await runtime(pi)).onAgentEnd(event, ctx));
   pi.on("agent_settled", async (event, ctx) => (await runtime(pi)).onAgentSettled(event, ctx));
   pi.on("session_shutdown", async (event, ctx) => (await runtime(pi)).onSessionShutdown(event, ctx));
@@ -93,6 +94,7 @@ export default function planExtension(pi: ExtensionAPI): void {
     promptSnippet: "Plan: add/plan/complete/verify/update/start/block/remove/list/coverage/source/forget.",
     promptGuidelines: [
       "Multi-step work.",
+      "Pending tasks are a queue: work them in plan order.",
       "Complete finished tasks; add new.",
       "Before ending turn, complete every finished task (task_id: \"3\", \"2,3\", \"2-4\" or text).",
       "Use stable #ref; display order varies.",

@@ -56,7 +56,7 @@ test("edit mode: /add appends a new task", async () => {
 test("edit mode: /edit rewrites the selected task text", async () => {
   await withPlan(async (h) => {
     h.uiInput = "Renamed task";
-    h.editCommands.push("/edit", "/cancel");
+    h.editCommands.push("1", "/edit", "/cancel");
     await h.rt.tPlanCommand.handler("edit", h.ctx);
     const plan = await h.plan();
     assert.equal(plan[0].text, "Renamed task");
@@ -66,7 +66,7 @@ test("edit mode: /edit rewrites the selected task text", async () => {
 test("edit mode: /note attaches notes to the selected task", async () => {
   await withPlan(async (h) => {
     h.uiInput = "Needs a changelog entry";
-    h.editCommands.push("/note", "/cancel");
+    h.editCommands.push("1", "/note", "/cancel");
     await h.rt.tPlanCommand.handler("edit", h.ctx);
     const state = h.rt.getState();
     const task = state.tasks.find((t) => t.ref === 1);
@@ -76,7 +76,7 @@ test("edit mode: /note attaches notes to the selected task", async () => {
 
 test("edit mode: /run aborts current run and sends a launch message", async () => {
   await withPlan(async (h) => {
-    h.editCommands.push("/run", "/cancel");
+    h.editCommands.push("1", "/run", "/cancel");
     await h.rt.tPlanCommand.handler("edit", h.ctx);
     assert.equal(h.abortCalls.length, 1, "abort should be called to stop current run");
     assert.match(h.sendUserMessageCalls[0], /^\/t-run 1/);

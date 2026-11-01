@@ -48,6 +48,9 @@ export interface PlanTask {
   check?: string[];        // Acceptance/verification steps ("tests pass", …)
   verifiedAt?: number;     // ms epoch, set by plan_manager verify
   verifyNote?: string;     // Verification evidence recorded by the model
+  userAdded?: boolean;     // Added by the user through /tplan or /task (not by the model).
+                           // A model conclusion must never drop or finalize it: only an
+                           // explicit completion/evidence closes it.
   everTouched?: boolean;   // True once a *per-task* detection path referenced it
                            // (explicit marker, tool evidence, fuzzy completion, manual
                            // edit). Never set in bulk: at plan-conclusion, untouched
@@ -115,6 +118,7 @@ export interface PlanConfig {
   specMemory: boolean;     // Detect/ingest specs + auto-seed backlog + [SPEC] context
   specIngestFiles: boolean; // Ingest spec files merely referenced in a prompt (opt-in, default off)
   specReviewGate: boolean; // Block premature "done" and unverified completion
+  autoContinue: boolean;   // Force the agent to start the next pending task when a run ends
   debug: boolean;          // Log swallowed errors to ~/.pi/agent/t-plan/debug.log
 }
 
@@ -134,6 +138,7 @@ export const DEFAULT_CONFIG: PlanConfig = {
   specMemory: true,
   specIngestFiles: false,
   specReviewGate: true,
+  autoContinue: true,
   debug: false,
 };
 
